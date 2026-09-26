@@ -38,7 +38,10 @@ def main():
             print(type(document))
             print("GetTitle:", type(document.GetTitle))
             print("GetSheetNames:", type(document.GetSheetNames))
-            print("Sheet names:", document.GetSheetNames)   
+            print("Sheet names:", document.GetSheetNames)  
+            print("SaveAs:", type(document.SaveAs))
+            print("SaveAs3:", type(document.SaveAs3))
+            print("Extension:", type(document.Extension)) 
             sheet_names = document.GetSheetNames
             print("Sheets:")
             for sheet_name in sheet_names:
