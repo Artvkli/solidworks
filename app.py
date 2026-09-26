@@ -35,7 +35,11 @@ def main():
             )
 
             print("Opened successfully.")
-            sheet_names = document.GetSheetNames()
+            print(type(document))
+            print("GetTitle:", type(document.GetTitle))
+            print("GetSheetNames:", type(document.GetSheetNames))
+            print("Sheet names:", document.GetSheetNames)   
+            sheet_names = document.GetSheetNames
             print("Sheets:")
             for sheet_name in sheet_names:
                 print("  -", sheet_name)
