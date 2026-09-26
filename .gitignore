@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# IDEs
+.vscode/
+.idea/
+
+# Logs
+logs/
+*.log
+
+# Test/input/output files
+input/
+output/
+
+# Temporary files
+*.tmp
+*.temp
+
+# SOLIDWORKS temporary/backup files
+~$*
+*.bak
+
+# Windows
+Thumbs.db
+Desktop.ini
+
+# Python tooling
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
