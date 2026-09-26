@@ -60,9 +60,22 @@ except ImportError:
 
 try:
     import win32com.client
+    import pythoncom
+    from win32com.client import VARIANT
 except ImportError:
     print("پکیج pywin32 نصب نیست. اجرا کنید: pip install pywin32", file=sys.stderr)
     raise
+
+
+def long_byref(value: int = 0):
+    """
+    یک VARIANT از نوع ByRef Long می‌سازد. چون این اسکریپت از late-binding
+    (win32com.client.Dispatch ساده، نه gencache) استفاده می‌کند، پایتون
+    خودش نمی‌داند کدام پارامترهای COM از نوع ByRef Long (خروجی Errors/Warnings
+    در OpenDoc6, SaveAs3 و ...) هستند؛ پس باید دستی این‌طور بسازیمشان،
+    وگرنه خطای COM "Type mismatch" می‌گیریم.
+    """
+    return VARIANT(pythoncom.VT_BYREF | pythoncom.VT_I4, value)
 
 
 # --------------------------------------------------------------------------- #
@@ -262,7 +275,8 @@ def convert_drawing_one(session: SolidWorksSession, src: Path, dst: Path) -> Ite
     dst.parent.mkdir(parents=True, exist_ok=True)
     model = None
     try:
-        model = app.OpenDoc6(str(src), c.swDocDRAWING, c.swOpenDocOptions_Silent, "", 0, 0)
+        model = app.OpenDoc6(str(src), c.swDocDRAWING, c.swOpenDocOptions_Silent, "",
+                              long_byref(), long_byref())
         if model is None:
             raise RuntimeError("SolidWorks نتوانست فایل را باز کند (فایل خراب یا نسخه ناسازگار؟).")
 
@@ -272,7 +286,8 @@ def convert_drawing_one(session: SolidWorksSession, src: Path, dst: Path) -> Ite
             pass
 
         ok = model.Extension.SaveAs3(
-            str(dst), c.swSaveAsCurrentVersion, c.swSaveAsOptions_Silent, None, None, None
+            str(dst), c.swSaveAsCurrentVersion, c.swSaveAsOptions_Silent,
+            None, long_byref(), long_byref()
         )
         if not ok:
             raise RuntimeError(f"SaveAs3 شکست خورد (کد بازگشتی: {ok}).")
@@ -354,7 +369,8 @@ def run_drawing_batch(args: argparse.Namespace) -> RunSummary:
 
 def open_assembly(session: SolidWorksSession, path: Path):
     c = session.const
-    model = session.app.OpenDoc6(str(path), c.swDocASSEMBLY, c.swOpenDocOptions_Silent, "", 0, 0)
+    model = session.app.OpenDoc6(str(path), c.swDocASSEMBLY, c.swOpenDocOptions_Silent, "",
+                                  long_byref(), long_byref())
     if model is None:
         raise RuntimeError(f"باز کردن اسمبلی ناموفق بود: {path}")
     try:
