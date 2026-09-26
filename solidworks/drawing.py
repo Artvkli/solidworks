@@ -1,4 +1,8 @@
 from pathlib import Path
+
+import pythoncom
+import win32com.client
+
 from solidworks.connection import SolidWorksConnection
 
 
@@ -33,22 +37,37 @@ class SolidWorksDrawing:
             str(drawing_path.parent)
         )
 
-        document_type = 3
-        open_options = 1
+        # SOLIDWORKS constants
+        SW_DOC_DRAWING = 3
+        SW_OPEN_DOC_OPTIONS_SILENT = 1
+
+        # OpenDoc6 output parameters must be passed ByRef
+        errors = win32com.client.VARIANT(
+            pythoncom.VT_BYREF | pythoncom.VT_I4,
+            0
+        )
+
+        warnings = win32com.client.VARIANT(
+            pythoncom.VT_BYREF | pythoncom.VT_I4,
+            0
+        )
 
         self.document = sw.OpenDoc6(
             str(drawing_path),
-            document_type,
-            open_options,
+            SW_DOC_DRAWING,
+            SW_OPEN_DOC_OPTIONS_SILENT,
             "",
-            0,
-            0
+            errors,
+            warnings
         )
 
         if self.document is None:
             raise RuntimeError(
                 f"Could not open drawing: {drawing_path}"
             )
+
+        print("OpenDoc6 errors:", errors)
+        print("OpenDoc6 warnings:", warnings)
 
         return self.document
 
