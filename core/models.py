@@ -1,28 +1,26 @@
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
 
 @dataclass
-class DrawingJob:
+class AssemblyJob:
     source: Path
-    output: Path
-    status: str = "pending"
-    error: Optional[str] = None
+    output_dir: Path
 
 
 @dataclass
-class SheetResult:
-    sheet_name: str
+class SheetMetalComponent:
+    name: str
+    path: Path
+    configuration: str
+    thickness: Optional[float] = None
+
+
+@dataclass
+class ExportResult:
+    component: SheetMetalComponent
     output: Optional[Path]
     success: bool
     skipped: bool = False
-    error: Optional[str] = None
-
-
-@dataclass
-class ConversionResult:
-    source: Path
-    success: bool
-    sheets: list[SheetResult] = field(default_factory=list)
     error: Optional[str] = None

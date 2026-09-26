@@ -7,6 +7,7 @@ class SolidWorksConnection:
         self.app = None
 
     def connect(self):
+
         if self.app is not None:
             return self.app
 
@@ -16,6 +17,7 @@ class SolidWorksConnection:
             )
 
         except Exception as exc:
+
             raise RuntimeError(
                 "Could not connect to SOLIDWORKS. "
                 "Make sure SOLIDWORKS is running."

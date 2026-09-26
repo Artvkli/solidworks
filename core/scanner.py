@@ -1,32 +1,35 @@
 from pathlib import Path
 
 from config import (
-    DRAWING_EXTENSION,
+    ASSEMBLY_EXTENSION,
     OUTPUT_DIR,
-    OUTPUT_EXTENSION,
     RECURSIVE_SCAN,
 )
 
-from core.models import DrawingJob
+from core.models import AssemblyJob
 
 
-class DrawingScanner:
+class AssemblyScanner:
 
     def __init__(self, input_dir: Path):
         self.input_dir = input_dir
 
     def validate(self) -> None:
+
         if not self.input_dir.exists():
             raise FileNotFoundError(
-                f"Input directory does not exist: {self.input_dir}"
+                f"Input directory does not exist: "
+                f"{self.input_dir}"
             )
 
         if not self.input_dir.is_dir():
             raise NotADirectoryError(
-                f"Input path is not a directory: {self.input_dir}"
+                f"Input path is not a directory: "
+                f"{self.input_dir}"
             )
 
     def scan(self) -> list[Path]:
+
         self.validate()
 
         if RECURSIVE_SCAN:
@@ -34,39 +37,41 @@ class DrawingScanner:
         else:
             candidates = self.input_dir.glob("*")
 
-        drawings = [
+        assemblies = [
             path
             for path in candidates
             if (
                 path.is_file()
                 and not path.name.startswith("~$")
-                and path.suffix.lower() == DRAWING_EXTENSION.lower()
+                and path.suffix.lower()
+                == ASSEMBLY_EXTENSION.lower()
             )
         ]
 
-        return sorted(drawings)
+        return sorted(assemblies)
 
-    def create_jobs(self) -> list[DrawingJob]:
-        drawings = self.scan()
+    def create_jobs(self) -> list[AssemblyJob]:
+
+        assemblies = self.scan()
 
         jobs = []
 
-        for drawing in drawings:
+        for assembly in assemblies:
 
-            relative_path = drawing.relative_to(
+            relative = assembly.relative_to(
                 self.input_dir
             )
 
-            output_relative = relative_path.with_suffix(
-                OUTPUT_EXTENSION
+            output_dir = (
+                OUTPUT_DIR
+                / relative.parent
+                / assembly.stem
             )
 
-            output_path = OUTPUT_DIR / output_relative
-
             jobs.append(
-                DrawingJob(
-                    source=drawing,
-                    output=output_path,
+                AssemblyJob(
+                    source=assembly,
+                    output_dir=output_dir,
                 )
             )
 
