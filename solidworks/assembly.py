@@ -10,7 +10,6 @@ class SolidWorksAssembly:
     SW_OPEN_DOC_OPTIONS_SILENT = 1
 
     def __init__(self, connection):
-
         self.connection = connection
         self.document = None
         self.source_path: Path | None = None
@@ -21,14 +20,12 @@ class SolidWorksAssembly:
 
         if not assembly_path.exists():
             raise FileNotFoundError(
-                f"Assembly does not exist: "
-                f"{assembly_path}"
+                f"Assembly does not exist: {assembly_path}"
             )
 
         if assembly_path.suffix.lower() != ".sldasm":
             raise ValueError(
-                f"Unsupported file type: "
-                f"{assembly_path.suffix}"
+                f"Not a SOLIDWORKS assembly: {assembly_path}"
             )
 
         sw = self.connection.app
@@ -38,10 +35,15 @@ class SolidWorksAssembly:
                 "SOLIDWORKS is not connected."
             )
 
-        sw.SetCurrentWorkingDirectory(
-            str(assembly_path.parent)
-        )
+        # Make the assembly directory the current working directory.
+        try:
+            sw.SetCurrentWorkingDirectory(
+                str(assembly_path.parent)
+            )
+        except Exception:
+            pass
 
+        # OpenDoc6 uses ByRef error/warning outputs.
         errors = win32com.client.VARIANT(
             pythoncom.VT_BYREF | pythoncom.VT_I4,
             0,
@@ -63,8 +65,10 @@ class SolidWorksAssembly:
 
         if self.document is None:
             raise RuntimeError(
-                f"Could not open assembly: "
-                f"{assembly_path}"
+                "SOLIDWORKS failed to open assembly: "
+                f"{assembly_path}\n"
+                f"Open errors: {errors.value}\n"
+                f"Open warnings: {warnings.value}"
             )
 
         self.source_path = assembly_path
@@ -78,7 +82,6 @@ class SolidWorksAssembly:
                 "No assembly is open."
             )
 
-        # Resolve lightweight components
         try:
             self.document.ResolveAllLightWeightComponents(
                 False
@@ -93,11 +96,8 @@ class SolidWorksAssembly:
                 "No assembly is open."
             )
 
-        assembly = self.document
-
-        components = assembly.GetComponents(
-            True
-        )
+        # False = include components inside sub-assemblies.
+        components = self.document.GetComponents(False)
 
         if components is None:
             return []
@@ -112,10 +112,13 @@ class SolidWorksAssembly:
         sw = self.connection.app
 
         if sw is not None:
-
             try:
                 title = self.document.GetTitle
-                sw.CloseDoc(title)
+
+                if callable(title):
+                    title = title()
+
+                sw.CloseDoc(str(title))
 
             except Exception:
                 pass

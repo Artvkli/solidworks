@@ -1,49 +1,103 @@
 import logging
+import sys
+from pathlib import Path
 
 from config import (
     INPUT_DIR,
     OUTPUT_DIR,
     LOG_DIR,
-    SKIP_EXISTING,
     CREATE_OUTPUT_DIRS,
-    DXF_SHEET_METAL_OPTIONS,
     DEDUPLICATE_COMPONENTS,
 )
 
 from core.scanner import AssemblyScanner
 
-from solidworks.connection import SolidWorksConnection
-from solidworks.assembly import SolidWorksAssembly
-from solidworks.sheet_metal import SheetMetalProcessor
+from solidworks.connection import (
+    SolidWorksConnection,
+)
+
+from solidworks.assembly import (
+    SolidWorksAssembly,
+)
+
+from solidworks.sheet_metal import (
+    SheetMetalProcessor,
+)
 
 
 def setup_logging():
 
-    if CREATE_OUTPUT_DIRS:
-        LOG_DIR.mkdir(
-            parents=True,
-            exist_ok=True,
-        )
+    LOG_DIR.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
 
-        OUTPUT_DIR.mkdir(
-            parents=True,
-            exist_ok=True,
-        )
+    log_file = (
+        LOG_DIR
+        / "solidworks_exporter.log"
+    )
 
-    logging.basicConfig(
-        level=logging.INFO,
-        format=(
-            "%(asctime)s | "
-            "%(levelname)s | "
-            "%(message)s"
-        ),
-        handlers=[
-            logging.FileHandler(
-                LOG_DIR / "exporter.log",
-                encoding="utf-8",
-            ),
-            logging.StreamHandler(),
-        ],
+    logger = logging.getLogger()
+
+    logger.setLevel(
+        logging.INFO
+    )
+
+    formatter = logging.Formatter(
+        "%(asctime)s | "
+        "%(levelname)s | "
+        "%(message)s"
+    )
+
+    file_handler = logging.FileHandler(
+        log_file,
+        encoding="utf-8",
+    )
+
+    file_handler.setFormatter(
+        formatter
+    )
+
+    console_handler = logging.StreamHandler(
+        sys.stdout
+    )
+
+    console_handler.setFormatter(
+        formatter
+    )
+
+    logger.handlers.clear()
+
+    logger.addHandler(
+        file_handler
+    )
+
+    logger.addHandler(
+        console_handler
+    )
+
+
+def component_key(
+    component,
+    processor,
+):
+
+    path = processor.get_component_path(
+        component
+    )
+
+    configuration = (
+        processor.get_configuration(
+            component
+        )
+    )
+
+    if path is None:
+        return None
+
+    return (
+        str(path.resolve()).lower(),
+        configuration.lower(),
     )
 
 
@@ -51,9 +105,24 @@ def main():
 
     setup_logging()
 
-    print(
-        f"INPUT_DIR = {INPUT_DIR}"
+    logger = logging.getLogger(
+        __name__
     )
+
+    print()
+    print("=" * 70)
+    print("SOLIDWORKS SHEET METAL EXPORTER")
+    print("=" * 70)
+    print()
+
+    logger.info(
+        "INPUT_DIR = %s",
+        INPUT_DIR,
+    )
+
+    # -----------------------------------------------------
+    # Scan assemblies
+    # -----------------------------------------------------
 
     scanner = AssemblyScanner(
         INPUT_DIR
@@ -66,12 +135,20 @@ def main():
     )
 
     if not jobs:
-        print(
-            "No assemblies found."
+
+        logger.warning(
+            "No .SLDASM files found."
         )
+
         return
 
-    connection = SolidWorksConnection()
+    # -----------------------------------------------------
+    # Connect SOLIDWORKS
+    # -----------------------------------------------------
+
+    connection = (
+        SolidWorksConnection()
+    )
 
     connection.connect()
 
@@ -79,21 +156,28 @@ def main():
         "Connected to SOLIDWORKS."
     )
 
-    assembly_manager = SolidWorksAssembly(
-        connection
+    # -----------------------------------------------------
+    # Process
+    # -----------------------------------------------------
+
+    assembly_manager = (
+        SolidWorksAssembly(
+            connection
+        )
     )
 
-    processor = SheetMetalProcessor(
-        connection
+    processor = (
+        SheetMetalProcessor()
     )
 
+    total_assemblies = 0
     total_components = 0
-    sheet_metal_count = 0
-    exported_count = 0
-    skipped_count = 0
-    failed_count = 0
+    total_sheet_metal = 0
+    total_failed = 0
 
     for job in jobs:
+
+        total_assemblies += 1
 
         print()
         print("=" * 70)
@@ -102,33 +186,38 @@ def main():
         )
         print("=" * 70)
 
-        logging.info(
-            "Opening assembly: %s",
-            job.source,
-        )
-
         try:
+
+            logger.info(
+                "Opening assembly: %s",
+                job.source,
+            )
 
             assembly_manager.open(
                 job.source
             )
 
+            # Resolve lightweight components
             assembly_manager.resolve_components()
 
             components = (
                 assembly_manager.get_components()
             )
 
-            total_components += len(
-                components
-            )
-
-            logging.info(
+            logger.info(
                 "Found %d component(s).",
                 len(components),
             )
 
-            processed = set()
+            total_components += len(
+                components
+            )
+
+            # ---------------------------------------------
+            # Deduplication
+            # ---------------------------------------------
+
+            processed_keys = set()
 
             for index, component in enumerate(
                 components,
@@ -137,134 +226,137 @@ def main():
 
                 try:
 
-                    data = (
-                        processor.process_component(
-                            component,
-                            job.output_dir,
-                            DXF_SHEET_METAL_OPTIONS,
+                    name = (
+                        processor
+                        .get_component_name(
+                            component
                         )
                     )
 
-                    if data is None:
-                        continue
-
-                    sheet_metal_count += 1
-
-                    path = data["path"]
-                    configuration = (
-                        data["configuration"]
-                    )
-                    thickness = data["thickness"]
-                    output_path = data["output"]
-
-                    unique_key = (
-                        str(path.resolve()).lower(),
-                        configuration.lower(),
-                    )
-
-                    logging.info(
-                        "[%d/%d] Sheet Metal: %s | "
-                        "Configuration: %s | "
-                        "Thickness: %s",
+                    logger.info(
+                        "[%d/%d] Component: %s",
                         index,
                         len(components),
-                        path.name,
-                        configuration,
-                        thickness,
+                        name,
                     )
 
-                    if (
-                        DEDUPLICATE_COMPONENTS
-                        and unique_key in processed
-                    ):
-
-                        logging.info(
-                            "Duplicate component skipped: %s",
-                            path.name,
+                    path = (
+                        processor
+                        .get_component_path(
+                            component
                         )
-
-                        skipped_count += 1
-                        continue
-
-                    processed.add(unique_key)
-
-                    if (
-                        SKIP_EXISTING
-                        and output_path.exists()
-                    ):
-
-                        logging.info(
-                            "Existing DXF skipped: %s",
-                            output_path,
-                        )
-
-                        skipped_count += 1
-                        continue
-
-                    logging.info(
-                        "Exporting: %s",
-                        output_path,
                     )
 
-                    processor.export_dxf(
-                        data["model"],
+                    logger.info(
+                        "Component path: %s",
                         path,
-                        output_path,
-                        DXF_SHEET_METAL_OPTIONS,
                     )
 
-                    exported_count += 1
+                    # -------------------------------------
+                    # Deduplicate Part + Configuration
+                    # -------------------------------------
 
-                    print(
-                        f"  OK  | "
-                        f"{path.name} | "
-                        f"{thickness} mm | "
-                        f"{output_path}"
+                    if DEDUPLICATE_COMPONENTS:
+
+                        key = component_key(
+                            component,
+                            processor,
+                        )
+
+                        if key is not None:
+
+                            if key in processed_keys:
+
+                                logger.info(
+                                    "Skipping duplicate: %s",
+                                    name,
+                                )
+
+                                continue
+
+                            processed_keys.add(
+                                key
+                            )
+
+                    # -------------------------------------
+                    # Process Sheet Metal
+                    # -------------------------------------
+
+                    result = (
+                        processor
+                        .process_component(
+                            component,
+                            job.output_dir,
+                        )
+                    )
+
+                    if result is None:
+                        continue
+
+                    total_sheet_metal += 1
+
+                    logger.info(
+                        "Sheet Metal part found:"
+                    )
+
+                    logger.info(
+                        "  Name        : %s",
+                        result["name"],
+                    )
+
+                    logger.info(
+                        "  Path        : %s",
+                        result["path"],
+                    )
+
+                    logger.info(
+                        "  Configuration: %s",
+                        result["configuration"],
+                    )
+
+                    logger.info(
+                        "  Thickness   : %.4f mm",
+                        result["thickness_mm"],
                     )
 
                 except Exception as exc:
 
-                    failed_count += 1
+                    total_failed += 1
 
-                    logging.exception(
-                        "Component processing failed."
-                    )
-
-                    print(
-                        f"  ERROR | "
-                        f"Component #{index} | "
-                        f"{exc}"
+                    logger.exception(
+                        "Component processing failed: %s",
+                        exc,
                     )
 
         except Exception as exc:
 
-            failed_count += 1
+            total_failed += 1
 
-            logging.exception(
+            logger.exception(
                 "Assembly processing failed: %s",
-                job.source,
-            )
-
-            print(
-                f"ERROR: {exc}"
+                exc,
             )
 
         finally:
 
             assembly_manager.close()
 
-            logging.info(
+            logger.info(
                 "Assembly closed: %s",
                 job.source,
             )
 
+    # -----------------------------------------------------
+    # Summary
+    # -----------------------------------------------------
+
     print()
     print("=" * 70)
-    print("EXPORT SUMMARY")
+    print("SCAN SUMMARY")
     print("=" * 70)
 
     print(
-        f"Assemblies       : {len(jobs)}"
+        f"Assemblies       : {total_assemblies}"
     )
 
     print(
@@ -272,19 +364,11 @@ def main():
     )
 
     print(
-        f"Sheet Metal      : {sheet_metal_count}"
+        f"Sheet Metal      : {total_sheet_metal}"
     )
 
     print(
-        f"Exported DXF     : {exported_count}"
-    )
-
-    print(
-        f"Skipped          : {skipped_count}"
-    )
-
-    print(
-        f"Failed           : {failed_count}"
+        f"Failed           : {total_failed}"
     )
 
     print("=" * 70)

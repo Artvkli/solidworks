@@ -1,57 +1,27 @@
 from pathlib import Path
+import logging
+
+
+logger = logging.getLogger(__name__)
 
 
 class SheetMetalProcessor:
 
-    SW_EXPORT_TO_DWG_SHEET_METAL = 1
-
-    SHEET_METAL_FEATURE_TYPES = {
-        "sheetmetal",
-        "smbaseflange",
-        "sm-base-flange",
-        "sm3d",
-        "baseflange",
-    }
-
-    def __init__(self, connection):
-        self.connection = connection
-
-    @staticmethod
-    def safe_filename(name: str) -> str:
-
-        invalid = '<>:"/\\|?*'
-
-        for char in invalid:
-            name = name.replace(char, "_")
-
-        name = name.strip().rstrip(".")
-
-        return name or "Part"
-
     def get_component_model(self, component):
-
-        model = None
-
         try:
             value = component.GetModelDoc2
-
-            if callable(value):
-                model = value()
-            else:
-                model = value
-
-        except Exception:
-            pass
-
-        return model
+            return value() if callable(value) else value
+        except Exception as exc:
+            logger.exception(
+                "GetModelDoc2 failed for component: %s",
+                self.get_component_name(component),
+            )
+            return None
 
     def get_component_path(self, component):
-
         try:
             value = component.GetPathName
-
-            if callable(value):
-                value = value()
+            value = value() if callable(value) else value
 
             if value:
                 return Path(str(value))
@@ -61,339 +31,240 @@ class SheetMetalProcessor:
 
         return None
 
-    def get_configuration(self, component) -> str:
+    def get_component_name(self, component):
+        try:
+            value = component.Name2
+            return value() if callable(value) else str(value)
+        except Exception:
+            return "Unknown"
 
+    def get_configuration(self, component):
         try:
             value = component.ReferencedConfiguration
-
-            if callable(value):
-                value = value()
-
-            if value:
-                return str(value)
-
+            return value() if callable(value) else str(value)
         except Exception:
-            pass
+            return ""
 
-        return "Default"
-
-    def get_feature_type(self, feature) -> str:
+    def get_all_features(self, model):
+        features = []
 
         try:
+            first = model.FirstFeature
+            first = first() if callable(first) else first
+        except Exception as exc:
+            logger.exception("FirstFeature failed")
+            return features
+
+        feature = first
+
+        while feature is not None:
+            features.append(feature)
+
+            try:
+                next_feature = feature.GetNextFeature
+                next_feature = (
+                    next_feature()
+                    if callable(next_feature)
+                    else next_feature
+                )
+            except Exception:
+                break
+
+            feature = next_feature
+
+        return features
+
+    def get_feature_type(self, feature):
+        try:
             value = feature.GetTypeName2
-
-            if callable(value):
-                value = value()
-
-            if value:
-                return str(value)
-
+            return value() if callable(value) else str(value)
         except Exception:
             pass
 
         try:
             value = feature.GetTypeName
-
-            if callable(value):
-                value = value()
-
-            if value:
-                return str(value)
-
+            return value() if callable(value) else str(value)
         except Exception:
-            pass
+            return ""
 
-        return ""
-
-    def get_all_features(self, model):
-
-        features = []
-
-        # FirstFeature
+    def get_feature_name(self, feature):
         try:
-
-            value = model.FirstFeature
-
-            if callable(value):
-                feature = value()
-            else:
-                feature = value
-
-            while feature is not None:
-
-                features.append(feature)
-
-                try:
-                    value = feature.GetNextFeature
-
-                    if callable(value):
-                        feature = value()
-                    else:
-                        feature = value
-
-                except Exception:
-                    break
-
-            if features:
-                return features
-
+            value = feature.Name
+            return value() if callable(value) else str(value)
         except Exception:
-            pass
+            return "Unknown"
 
-        # Fallback: FeatureManager.GetFeatures
-        try:
+    def inspect_model(self, model, model_path):
+        logger.info("==============================================")
+        logger.info("MODEL INSPECTION")
+        logger.info("Path: %s", model_path)
+        logger.info("Model type: %s", type(model))
 
-            feature_manager = model.FeatureManager
+        features = self.get_all_features(model)
 
-            value = feature_manager.GetFeatures
+        logger.info("Feature count: %d", len(features))
 
-            if callable(value):
-                result = value(True)
-            else:
-                result = value
+        for index, feature in enumerate(features[:50], start=1):
+            feature_type = self.get_feature_type(feature)
+            feature_name = self.get_feature_name(feature)
 
-            if result:
-                return list(result)
+            logger.info(
+                "FEATURE %02d | name=%s | type=%s",
+                index,
+                feature_name,
+                feature_type,
+            )
 
-        except Exception:
-            pass
+        logger.info("==============================================")
 
         return features
 
     def find_sheet_metal_feature(self, model):
-
         features = self.get_all_features(model)
 
         for feature in features:
+            feature_type = self.get_feature_type(feature)
 
-            feature_type = (
-                self.get_feature_type(feature)
-                .strip()
-                .lower()
-            )
+            normalized = feature_type.strip().lower()
 
-            if feature_type in self.SHEET_METAL_FEATURE_TYPES:
+            if normalized in {
+                "sheetmetal",
+                "smbaseflange",
+                "sm-base-flange",
+                "sm3d",
+                "baseflange",
+            }:
                 return feature
 
         return None
 
-    def is_sheet_metal(self, model) -> bool:
-
-        return (
-            self.find_sheet_metal_feature(model)
-            is not None
-        )
-
-    def get_thickness(self, model):
-
-        feature = self.find_sheet_metal_feature(model)
-
-        if feature is None:
-            return None
-
-        # SheetMetal feature definition
+    def get_thickness(self, feature):
         try:
+            definition = feature.GetDefinition
 
-            value = feature.GetDefinition
+            if callable(definition):
+                definition = definition()
+
+            if definition is None:
+                return None
+
+            value = definition.Thickness
 
             if callable(value):
-                definition = value()
-            else:
-                definition = value
+                value = value()
 
-            if definition is not None:
+            if value is None:
+                return None
 
-                value = definition.Thickness
-
-                if callable(value):
-                    value = value()
-
-                if value is not None:
-                    return float(value)
-
-        except Exception:
-            pass
-
-        # Fallback: scan other SheetMetal-like
-        # feature definitions.
-        for candidate in self.get_all_features(model):
-
-            feature_type = (
-                self.get_feature_type(candidate)
-                .strip()
-                .lower()
-            )
-
-            if feature_type not in self.SHEET_METAL_FEATURE_TYPES:
-                continue
-
-            try:
-
-                value = candidate.GetDefinition
-
-                if callable(value):
-                    definition = value()
-                else:
-                    definition = value
-
-                if definition is None:
-                    continue
-
-                thickness = definition.Thickness
-
-                if callable(thickness):
-                    thickness = thickness()
-
-                if thickness is not None:
-                    return float(thickness)
-
-            except Exception:
-                continue
-
-        return None
-
-    def activate_configuration(
-        self,
-        model,
-        configuration: str,
-    ) -> None:
-
-        try:
-
-            value = model.ShowConfiguration2
-
-            if callable(value):
-                result = value(configuration)
-            else:
-                result = value
-
-            if result is False:
-                raise RuntimeError(
-                    f"Could not activate configuration: "
-                    f"{configuration}"
-                )
+            return float(value)
 
         except Exception as exc:
+            logger.warning(
+                "Could not read thickness: %s",
+                exc,
+            )
+            return None
 
-            raise RuntimeError(
-                f"Could not activate configuration "
-                f"'{configuration}': {exc}"
-            ) from exc
+    def is_sheet_metal(self, model):
+        feature = self.find_sheet_metal_feature(model)
+        return feature is not None
 
-        try:
+    def process_component(self, component, output_root):
+        name = self.get_component_name(component)
 
-            value = model.EditRebuild3
-
-            if callable(value):
-                value()
-
-        except Exception:
-            pass
-
-    def process_component(
-        self,
-        component,
-        output_root: Path,
-        options: int,
-    ):
+        logger.info("----------------------------------------------")
+        logger.info("COMPONENT: %s", name)
 
         path = self.get_component_path(component)
 
         if path is None:
+            logger.warning(
+                "No component path: %s",
+                name,
+            )
             return None
 
+        logger.info("Component path: %s", path)
+
         if path.suffix.lower() != ".sldprt":
+            logger.info(
+                "Skipping non-part component: %s",
+                path,
+            )
             return None
 
         model = self.get_component_model(component)
 
         if model is None:
+            logger.warning(
+                "GetModelDoc2 returned None: %s",
+                path,
+            )
             return None
 
-        configuration = self.get_configuration(
-            component
+        logger.info(
+            "Model object: %s",
+            type(model),
         )
 
-        self.activate_configuration(
-            model,
+        configuration = self.get_configuration(component)
+
+        logger.info(
+            "Configuration: %s",
             configuration,
         )
 
-        if not self.is_sheet_metal(model):
+        if configuration:
+            try:
+                model.ShowConfiguration2(configuration)
+            except Exception as exc:
+                logger.warning(
+                    "ShowConfiguration2 failed: %s",
+                    exc,
+                )
+
+        try:
+            model.EditRebuild3()
+        except Exception:
+            pass
+
+        # IMPORTANT:
+        # Print the actual feature tree before deciding
+        # whether this is sheet metal.
+        self.inspect_model(model, path)
+
+        sheet_feature = self.find_sheet_metal_feature(model)
+
+        if sheet_feature is None:
+            logger.info(
+                "NOT SHEET METAL: %s",
+                path.name,
+            )
             return None
 
-        thickness = self.get_thickness(model)
+        logger.info(
+            "SHEET METAL DETECTED: %s",
+            path.name,
+        )
 
-        name = self.safe_filename(path.stem)
+        thickness = self.get_thickness(sheet_feature)
 
         if thickness is None:
-            thickness_folder = "unknown_thickness"
-        else:
-            thickness_folder = f"{thickness:g}mm"
+            logger.warning(
+                "Could not determine thickness: %s",
+                path.name,
+            )
+            return None
 
-        output_dir = output_root / thickness_folder
-
-        output_path = (
-            output_dir / f"{name}.dxf"
+        logger.info(
+            "Thickness: %.4f mm",
+            thickness * 1000.0,
         )
 
         return {
-            "name": name,
+            "name": path.stem,
             "path": path,
             "configuration": configuration,
-            "thickness": thickness,
             "model": model,
-            "output": output_path,
+            "thickness_m": thickness,
         }
-
-    def export_dxf(
-        self,
-        model,
-        model_path: Path,
-        output_path: Path,
-        options: int,
-    ) -> Path:
-
-        output_path = output_path.resolve()
-
-        output_path.parent.mkdir(
-            parents=True,
-            exist_ok=True,
-        )
-
-        # Alignment matrix
-        alignment = (
-            0.0, 0.0, 0.0,
-            1.0, 0.0, 0.0,
-            0.0, 1.0, 0.0,
-            0.0, 0.0, 1.0,
-        )
-
-        export_to_dwg = model.ExportToDWG2
-
-        success = export_to_dwg(
-            str(output_path),
-            str(model_path),
-            self.SW_EXPORT_TO_DWG_SHEET_METAL,
-            True,
-            alignment,
-            False,
-            False,
-            options,
-            0,
-            None,
-        )
-
-        if not success:
-            raise RuntimeError(
-                "ExportToDWG2 returned False."
-            )
-
-        if not output_path.exists():
-            raise RuntimeError(
-                "SOLIDWORKS reported successful export "
-                "but the DXF file was not created: "
-                f"{output_path}"
-            )
-
-        return output_path
