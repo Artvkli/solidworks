@@ -1,6 +1,6 @@
 from pathlib import Path
 
-import pythoncom
+import pythoncom    
 import win32com.client
 
 from solidworks.connection import SolidWorksConnection
@@ -97,26 +97,18 @@ class SolidWorksDrawing:
                 f"Could not activate sheet: {sheet_name}"
             )
 
-    def export_sheet(
-        self,
-        sheet_name: str,
-        output_path: Path,
-    ) -> Path:
-
+    def export_sheet(self, sheet_name: str, output_path: Path) -> Path:
         if self.document is None:
-            raise RuntimeError(
-                "No drawing is open."
-            )
-
+            raise RuntimeError("No drawing is currently open.")
         output_path = output_path.resolve()
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        result = self.document.ActivateSheet(sheet_name)
 
-        output_path.parent.mkdir(
-            parents=True,
-            exist_ok=True
-        )
-
-        self.activate_sheet(sheet_name)
-
+        if result is False:
+            raise RuntimeError(
+                f"Could not activate sheet: {sheet_name}"
+            )
+        # COM ByRef parameters
         errors = win32com.client.VARIANT(
             pythoncom.VT_BYREF | pythoncom.VT_I4,
             0
@@ -126,31 +118,27 @@ class SolidWorksDrawing:
             pythoncom.VT_BYREF | pythoncom.VT_I4,
             0
         )
-
-        success = self.document.Extension.SaveAs(
+        success = self.document.SaveAs3(
             str(output_path),
-            self.SW_SAVE_AS_CURRENT_VERSION,
-            self.SW_SAVE_AS_SILENT,
-            None,
+            0,
+            1,
             errors,
             warnings
         )
-
         if not success:
             raise RuntimeError(
                 f"SOLIDWORKS failed to export sheet "
-                f"'{sheet_name}'. "
+                f"'{sheet_name}' to '{output_path}'. "
                 f"Errors: {errors}, Warnings: {warnings}"
             )
 
         if not output_path.exists():
             raise RuntimeError(
-                f"Export reported success but output file "
+                f"SOLIDWORKS reported success, but output file "
                 f"was not created: {output_path}"
             )
 
         return output_path
-
     def close(self):
 
         if self.document is None:
