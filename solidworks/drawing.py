@@ -99,6 +99,61 @@ class SolidWorksDrawing:
                 f"Could not activate sheet: {sheet_name}"
             )
 
+    # def export_sheet(
+    #     self,
+    #     sheet_name: str,
+    #     output_path: Path,
+    # ) -> Path:
+
+    #     if self.document is None:
+    #         raise RuntimeError(
+    #             "No drawing is currently open."
+    #         )
+
+    #     output_path = output_path.resolve()
+
+    #     output_path.parent.mkdir(
+    #         parents=True,
+    #         exist_ok=True,
+    #     )
+
+    #     self.activate_sheet(sheet_name)
+
+    #     errors = win32com.client.VARIANT(
+    #         pythoncom.VT_BYREF | pythoncom.VT_I4,
+    #         0
+    #     )
+
+    #     warnings = win32com.client.VARIANT(
+    #         pythoncom.VT_BYREF | pythoncom.VT_I4,
+    #         0
+    #     )
+
+    #     success = self.document.Extension.SaveAs(
+    #         str(output_path),
+    #         self.SW_SAVE_CURRENT_VERSION,
+    #         self.SW_SAVE_SILENT,
+    #         None,
+    #         errors,
+    #         warnings,
+    #     )
+
+    #     if not success:
+    #         raise RuntimeError(
+    #             f"Failed to export sheet '{sheet_name}'. "
+    #             f"Errors: {errors}, "
+    #             f"Warnings: {warnings}"
+    #         )
+
+    #     if not output_path.exists():
+    #         raise RuntimeError(
+    #             f"SOLIDWORKS reported success but output "
+    #             f"was not created: {output_path}"
+    #         )
+
+    #     return output_path
+
+
     def export_sheet(
         self,
         sheet_name: str,
@@ -119,40 +174,20 @@ class SolidWorksDrawing:
 
         self.activate_sheet(sheet_name)
 
-        errors = win32com.client.VARIANT(
-            pythoncom.VT_BYREF | pythoncom.VT_I4,
-            0
-        )
-
-        warnings = win32com.client.VARIANT(
-            pythoncom.VT_BYREF | pythoncom.VT_I4,
-            0
-        )
-
-        success = self.document.Extension.SaveAs(
+        result = self.document.SaveAs3(
             str(output_path),
-            self.SW_SAVE_CURRENT_VERSION,
-            self.SW_SAVE_SILENT,
-            None,
-            errors,
-            warnings,
+            0,
+            1,
         )
-
-        if not success:
-            raise RuntimeError(
-                f"Failed to export sheet '{sheet_name}'. "
-                f"Errors: {errors}, "
-                f"Warnings: {warnings}"
-            )
 
         if not output_path.exists():
             raise RuntimeError(
-                f"SOLIDWORKS reported success but output "
-                f"was not created: {output_path}"
+                f"Failed to export sheet '{sheet_name}'. "
+                f"SaveAs3 result: {result}"
             )
 
         return output_path
-
+    
     def close(self):
 
         if self.document is None:
