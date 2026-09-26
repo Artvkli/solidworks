@@ -38,6 +38,7 @@ class DrawingScanner:
             path
             for path in candidates
             if path.is_file()
+            and not path.name.startswith("~$")
             and path.suffix.lower() == DRAWING_EXTENSION
         ]
 

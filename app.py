@@ -35,7 +35,7 @@ def main():
             )
 
             print("Opened successfully.")
-            print("Title:", document.GetTitle())
+            print("Title:", document.GetTitle)
             print("Output:", job.output)
 
         except Exception as exc:

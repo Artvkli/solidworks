@@ -72,7 +72,7 @@ for filename in drawing_files:
     else:
         print(f"ERROR: Could not save {filename}")
 
-    sw.CloseDoc(drawing.GetTitle())
+    sw.CloseDoc(drawing.GetTitle)
 
 
 print("Finished!")
