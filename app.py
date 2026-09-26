@@ -7,6 +7,7 @@ from solidworks.drawing import SolidWorksDrawing
 def main():
 
     scanner = DrawingScanner(INPUT_DIR)
+    print("INPUT_DIR =", INPUT_DIR)
 
     jobs = scanner.create_jobs()
 
@@ -54,3 +55,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

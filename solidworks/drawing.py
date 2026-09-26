@@ -1,5 +1,4 @@
 from pathlib import Path
-
 from solidworks.connection import SolidWorksConnection
 
 
