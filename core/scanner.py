@@ -37,9 +37,11 @@ class DrawingScanner:
         drawings = [
             path
             for path in candidates
-            if path.is_file()
-            and not path.name.startswith("~$")
-            and path.suffix.lower() == DRAWING_EXTENSION
+            if (
+                path.is_file()
+                and not path.name.startswith("~$")
+                and path.suffix.lower() == DRAWING_EXTENSION.lower()
+            )
         ]
 
         return sorted(drawings)
@@ -50,21 +52,22 @@ class DrawingScanner:
         jobs = []
 
         for drawing in drawings:
+
             relative_path = drawing.relative_to(
                 self.input_dir
             )
 
-            output_relative_path = relative_path.with_suffix(
+            output_relative = relative_path.with_suffix(
                 OUTPUT_EXTENSION
             )
 
-            output_path = OUTPUT_DIR / output_relative_path
+            output_path = OUTPUT_DIR / output_relative
 
-            job = DrawingJob(
-                source=drawing,
-                output=output_path,
+            jobs.append(
+                DrawingJob(
+                    source=drawing,
+                    output=output_path,
+                )
             )
-
-            jobs.append(job)
 
         return jobs

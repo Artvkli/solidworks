@@ -5,31 +5,24 @@ from typing import Optional
 
 @dataclass
 class DrawingJob:
-
     source: Path
     output: Path
-
     status: str = "pending"
     error: Optional[str] = None
 
 
 @dataclass
 class SheetResult:
-
-    name: str
+    sheet_name: str
     output: Optional[Path]
-
     success: bool
-    message: str
+    skipped: bool = False
+    error: Optional[str] = None
 
 
 @dataclass
 class ConversionResult:
-
     source: Path
-    output: Optional[Path]
-
     success: bool
-    message: str
-
     sheets: list[SheetResult] = field(default_factory=list)
+    error: Optional[str] = None
