@@ -7,7 +7,7 @@ INPUT_DIR = BASE_DIR / "input"
 OUTPUT_DIR = BASE_DIR / "output"
 LOG_DIR = BASE_DIR / "logs"
 
-DRAWING_EXTENSION = ".sldasm"
+DRAWING_EXTENSION = ".slddrw"
 OUTPUT_EXTENSION = ".dwg"
 
 SKIP_EXISTING = True
