@@ -42,6 +42,9 @@ def main():
             print("SaveAs:", type(document.SaveAs))
             print("SaveAs3:", type(document.SaveAs3))
             print("Extension:", type(document.Extension)) 
+            print("ActivateSheet:", type(document.ActivateSheet))
+            print("Extension.SaveAs:", type(document.Extension.SaveAs))
+            print("Extension.SaveAs3:", type(document.Extension.SaveAs3))
             sheet_names = document.GetSheetNames
             print("Sheets:")
             for sheet_name in sheet_names:
