@@ -166,8 +166,8 @@ def main():
         )
     )
 
-    processor = (
-        SheetMetalProcessor()
+    processor = SheetMetalProcessor(
+        connection
     )
 
     total_assemblies = 0
