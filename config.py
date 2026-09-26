@@ -7,13 +7,20 @@ INPUT_DIR = BASE_DIR / "input"
 OUTPUT_DIR = BASE_DIR / "output"
 LOG_DIR = BASE_DIR / "logs"
 
+
 DRAWING_EXTENSION = ".slddrw"
 OUTPUT_EXTENSION = ".dwg"
 
-SKIP_EXISTING = True
+
+# Scanner
 RECURSIVE_SCAN = True
+SKIP_EXISTING = True
 
 
-# DWG export configuration
+# Export
 DWG_SAVE_VERSION = 0
 DWG_SAVE_OPTIONS = 1
+
+
+# Runtime
+CREATE_OUTPUT_DIRS = True
