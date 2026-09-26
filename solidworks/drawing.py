@@ -8,9 +8,16 @@ from solidworks.connection import SolidWorksConnection
 
 class SolidWorksDrawing:
 
+    SW_DOC_DRAWING = 3
+    SW_OPEN_DOC_OPTIONS_SILENT = 1
+
+    SW_SAVE_AS_CURRENT_VERSION = 0
+    SW_SAVE_AS_SILENT = 1
+
     def __init__(self, connection: SolidWorksConnection):
         self.connection = connection
         self.document = None
+        self.source_path: Path | None = None
 
     def open(self, drawing_path: Path):
 
@@ -37,11 +44,6 @@ class SolidWorksDrawing:
             str(drawing_path.parent)
         )
 
-        # SOLIDWORKS constants
-        SW_DOC_DRAWING = 3
-        SW_OPEN_DOC_OPTIONS_SILENT = 1
-
-        # OpenDoc6 output parameters must be passed ByRef
         errors = win32com.client.VARIANT(
             pythoncom.VT_BYREF | pythoncom.VT_I4,
             0
@@ -54,8 +56,8 @@ class SolidWorksDrawing:
 
         self.document = sw.OpenDoc6(
             str(drawing_path),
-            SW_DOC_DRAWING,
-            SW_OPEN_DOC_OPTIONS_SILENT,
+            self.SW_DOC_DRAWING,
+            self.SW_OPEN_DOC_OPTIONS_SILENT,
             "",
             errors,
             warnings
@@ -66,10 +68,88 @@ class SolidWorksDrawing:
                 f"Could not open drawing: {drawing_path}"
             )
 
-        print("OpenDoc6 errors:", errors)
-        print("OpenDoc6 warnings:", warnings)
+        self.source_path = drawing_path
 
         return self.document
+
+    def get_sheet_names(self) -> tuple[str, ...]:
+
+        if self.document is None:
+            raise RuntimeError(
+                "No drawing is open."
+            )
+
+        return tuple(self.document.GetSheetNames)
+
+    def activate_sheet(self, sheet_name: str):
+
+        if self.document is None:
+            raise RuntimeError(
+                "No drawing is open."
+            )
+
+        result = self.document.ActivateSheet(
+            sheet_name
+        )
+
+        if result is False:
+            raise RuntimeError(
+                f"Could not activate sheet: {sheet_name}"
+            )
+
+    def export_sheet(
+        self,
+        sheet_name: str,
+        output_path: Path,
+    ) -> Path:
+
+        if self.document is None:
+            raise RuntimeError(
+                "No drawing is open."
+            )
+
+        output_path = output_path.resolve()
+
+        output_path.parent.mkdir(
+            parents=True,
+            exist_ok=True
+        )
+
+        self.activate_sheet(sheet_name)
+
+        errors = win32com.client.VARIANT(
+            pythoncom.VT_BYREF | pythoncom.VT_I4,
+            0
+        )
+
+        warnings = win32com.client.VARIANT(
+            pythoncom.VT_BYREF | pythoncom.VT_I4,
+            0
+        )
+
+        success = self.document.Extension.SaveAs(
+            str(output_path),
+            self.SW_SAVE_AS_CURRENT_VERSION,
+            self.SW_SAVE_AS_SILENT,
+            None,
+            errors,
+            warnings
+        )
+
+        if not success:
+            raise RuntimeError(
+                f"SOLIDWORKS failed to export sheet "
+                f"'{sheet_name}'. "
+                f"Errors: {errors}, Warnings: {warnings}"
+            )
+
+        if not output_path.exists():
+            raise RuntimeError(
+                f"Export reported success but output file "
+                f"was not created: {output_path}"
+            )
+
+        return output_path
 
     def close(self):
 
@@ -78,12 +158,9 @@ class SolidWorksDrawing:
 
         sw = self.connection.app
 
-        if sw is None:
-            self.document = None
-            return
-
-        title = self.document.GetTitle
-
-        sw.CloseDoc(title)
+        if sw is not None:
+            title = self.document.GetTitle
+            sw.CloseDoc(title)
 
         self.document = None
+        self.source_path = None

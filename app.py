@@ -1,4 +1,4 @@
-from config import INPUT_DIR
+from config import INPUT_DIR , OUTPUT_DIR
 from core.scanner import DrawingScanner
 from solidworks.connection import SolidWorksConnection
 from solidworks.drawing import SolidWorksDrawing
@@ -49,6 +49,14 @@ def main():
             print("Sheets:")
             for sheet_name in sheet_names:
                 print("  -", sheet_name)
+            test_output = OUTPUT_DIR / "test.dwg"
+
+            exported = drawing_manager.export_sheet(
+                sheet_names[0],
+                test_output,
+            )
+
+            print("Exported:", exported)
             print("Title:", document.GetTitle)
             print("Output:", job.output)
 
