@@ -82,7 +82,7 @@ class SolidWorksDrawing:
             self.document = None
             return
 
-        title = self.document.
+        title = self.document.GetTitle
 
         sw.CloseDoc(title)
 
