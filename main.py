@@ -23,6 +23,7 @@ sw = win32com.client.GetActiveObject("SldWorks.Application")
 print("Connected to SOLIDWORKS")
 
 
+
 files = os.listdir(INPUT_FOLDER)
 
 drawing_files = [
@@ -30,7 +31,7 @@ drawing_files = [
     if f.lower().endswith(".slddrw")
 ]
 
-
+    
 for filename in drawing_files:
 
     input_path = os.path.join(INPUT_FOLDER, filename)
