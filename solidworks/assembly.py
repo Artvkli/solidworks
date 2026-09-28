@@ -1,4 +1,5 @@
 from pathlib import Path
+import pythoncom
 
 
 class SolidWorksAssembly:
@@ -20,8 +21,11 @@ class SolidWorksAssembly:
             print("Selected file is not a SolidWorks Assembly.")
             return False
 
-        try:
+        print()
+        print("Opening assembly:")
+        print(file_path.name)
 
+        try:
             # SolidWorks document type
             # 2 = Assembly
             document_type = 2
@@ -29,28 +33,31 @@ class SolidWorksAssembly:
             # Open options
             options = 0
 
+            # Error and warning values
+            errors = 0
+            warnings = 0
+
             self.model = self.sw_app.OpenDoc6(
                 str(file_path),
                 document_type,
                 options,
                 "",
-                0,
-                0
+                errors,
+                warnings
             )
 
             if self.model is None:
-                print("Could not open assembly.")
+                print("SolidWorks returned no model.")
                 return False
 
             print()
             print("Assembly opened successfully!")
-            print("File:", file_path)
             print("Title:", self.model.GetTitle())
 
             return True
 
         except Exception as e:
-
+            print()
             print("Error while opening assembly:")
             print(e)
 
@@ -81,7 +88,7 @@ class SolidWorksAssembly:
 
 
 def find_assemblies(input_folder):
-    """Find SolidWorks assemblies inside input folder."""
+    """Find all SolidWorks assemblies inside input folder."""
 
     input_folder = Path(input_folder)
 
@@ -92,7 +99,8 @@ def find_assemblies(input_folder):
     assemblies = [
         file
         for file in input_folder.iterdir()
-        if file.is_file() and file.suffix.lower() == ".sldasm"
+        if file.is_file()
+        and file.suffix.lower() == ".sldasm"
     ]
 
     return sorted(assemblies)
