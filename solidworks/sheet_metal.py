@@ -88,11 +88,19 @@ class SheetMetalDetector:
 
 
     def export_dxf(self, model, output_path):
+        
         """Export the active Flat Pattern as DXF."""
         try:
-            success = model.ExportToDWG2(
+            model_path = model.GetPathName
+
+            print()
+            print("DXF Export")
+            print("Model:", model_path)
+            print("Output:", output_path)
+
+            result = model.ExportToDWG2(
                 str(output_path),
-                model.GetPathName,
+                model_path,
                 1,
                 True,
                 None,
@@ -101,20 +109,21 @@ class SheetMetalDetector:
                 0,
                 None
             )
-    
-            if success:
+
+            print("ExportToDWG2 result:", result)
+
+            if result:
                 print(f"DXF exported: {output_path}")
                 return True
 
-            print("DXF export failed.")
+            print("DXF export returned False.")
             return False
 
         except Exception as e:
             print("Error while exporting DXF:")
+            print(type(e).__name__)
             print(e)
             return False
-    
-
     
     def is_sheet_metal(self, component):
         """Check whether a component is a Sheet Metal part."""
