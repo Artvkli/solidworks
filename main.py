@@ -82,6 +82,15 @@ def main():
     # ----------------------------------------
 
     components = assembly.get_components()
+    quantities = assembly.get_part_quantities()
+
+
+    print()
+    print("Part Quantities")
+    print("=" * 50)
+
+    for item in quantities:
+        print(f"{item['name']} -> Quantity: {item['quantity']}")
     detector = SheetMetalDetector(sw_app)
 
     print()

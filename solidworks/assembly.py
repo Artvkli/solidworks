@@ -144,6 +144,34 @@ class SolidWorksAssembly:
             print(e)
             return []
 
+
+
+    def get_part_quantities(self):
+        
+        """Count occurrences of each part in the assembly."""
+        components = self.get_components()
+
+        quantities = {}
+
+        for component in components:
+            if not component.is_part:
+                continue
+
+            if component.suppressed:
+                continue
+
+            key = str(component.path).lower()
+
+            if key not in quantities:
+                quantities[key] = {
+                    "name": component.path.stem,
+                    "path": component.path,
+                    "quantity": 0,
+                }
+
+            quantities[key]["quantity"] += 1
+
+        return list(quantities.values())
 def find_assemblies(input_folder):
     """Find all SolidWorks assemblies inside input folder."""
 
