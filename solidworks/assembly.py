@@ -1,127 +1,98 @@
 from pathlib import Path
 
-import pythoncom
-import win32com.client
-
 
 class SolidWorksAssembly:
 
-    SW_DOC_ASSEMBLY = 2
-    SW_OPEN_DOC_OPTIONS_SILENT = 1
+    def __init__(self, sw_app):
+        self.sw_app = sw_app
+        self.model = None
 
-    def __init__(self, connection):
-        self.connection = connection
-        self.document = None
-        self.source_path: Path | None = None
+    def open(self, file_path):
+        """Open a SolidWorks assembly."""
 
-    def open(self, assembly_path: Path):
+        file_path = Path(file_path)
 
-        assembly_path = assembly_path.resolve()
+        if not file_path.exists():
+            print(f"File not found: {file_path}")
+            return False
 
-        if not assembly_path.exists():
-            raise FileNotFoundError(
-                f"Assembly does not exist: {assembly_path}"
-            )
-
-        if assembly_path.suffix.lower() != ".sldasm":
-            raise ValueError(
-                f"Not a SOLIDWORKS assembly: {assembly_path}"
-            )
-
-        sw = self.connection.app
-
-        if sw is None:
-            raise RuntimeError(
-                "SOLIDWORKS is not connected."
-            )
-
-        # Make the assembly directory the current working directory.
-        try:
-            sw.SetCurrentWorkingDirectory(
-                str(assembly_path.parent)
-            )
-        except Exception:
-            pass
-
-        # OpenDoc6 uses ByRef error/warning outputs.
-        errors = win32com.client.VARIANT(
-            pythoncom.VT_BYREF | pythoncom.VT_I4,
-            0,
-        )
-
-        warnings = win32com.client.VARIANT(
-            pythoncom.VT_BYREF | pythoncom.VT_I4,
-            0,
-        )
-
-        self.document = sw.OpenDoc6(
-            str(assembly_path),
-            self.SW_DOC_ASSEMBLY,
-            self.SW_OPEN_DOC_OPTIONS_SILENT,
-            "",
-            errors,
-            warnings,
-        )
-
-        if self.document is None:
-            raise RuntimeError(
-                "SOLIDWORKS failed to open assembly: "
-                f"{assembly_path}\n"
-                f"Open errors: {errors.value}\n"
-                f"Open warnings: {warnings.value}"
-            )
-
-        self.source_path = assembly_path
-
-        return self.document
-
-    def resolve_components(self):
-
-        if self.document is None:
-            raise RuntimeError(
-                "No assembly is open."
-            )
+        if file_path.suffix.lower() != ".sldasm":
+            print("Selected file is not a SolidWorks Assembly.")
+            return False
 
         try:
-            self.document.ResolveAllLightWeightComponents(
-                False
+
+            # SolidWorks document type
+            # 2 = Assembly
+            document_type = 2
+
+            # Open options
+            options = 0
+
+            self.model = self.sw_app.OpenDoc6(
+                str(file_path),
+                document_type,
+                options,
+                "",
+                0,
+                0
             )
-        except Exception:
-            pass
+
+            if self.model is None:
+                print("Could not open assembly.")
+                return False
+
+            print()
+            print("Assembly opened successfully!")
+            print("File:", file_path)
+            print("Title:", self.model.GetTitle())
+
+            return True
+
+        except Exception as e:
+
+            print("Error while opening assembly:")
+            print(e)
+
+            return False
 
     def get_components(self):
+        """Get all components from the assembly."""
 
-        if self.document is None:
-            raise RuntimeError(
-                "No assembly is open."
-            )
-
-        # False = include components inside sub-assemblies.
-        components = self.document.GetComponents(False)
-
-        if components is None:
+        if self.model is None:
+            print("No assembly is open.")
             return []
 
-        return list(components)
+        try:
 
-    def close(self):
+            components = self.model.GetComponents(True)
 
-        if self.document is None:
-            return
+            if components is None:
+                return []
 
-        sw = self.connection.app
+            return list(components)
 
-        if sw is not None:
-            try:
-                title = self.document.GetTitle
+        except Exception as e:
 
-                if callable(title):
-                    title = title()
+            print("Error while reading components:")
+            print(e)
 
-                sw.CloseDoc(str(title))
+            return []
 
-            except Exception:
-                pass
 
-        self.document = None
-        self.source_path = None
+def find_assemblies(input_folder):
+    """Find SolidWorks assemblies inside input folder."""
+
+    input_folder = Path(input_folder)
+
+    if not input_folder.exists():
+        print(f"Input folder does not exist: {input_folder}")
+        return []
+
+    assemblies = [
+        file
+        for file in input_folder.iterdir()
+        if file.is_file() and file.suffix.lower() == ".sldasm"
+    ]
+
+    return sorted(assemblies)
