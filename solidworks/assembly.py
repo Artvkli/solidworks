@@ -1,33 +1,32 @@
+# assembly.py
 
 from pathlib import Path
-
 import pythoncom
 import win32com.client
 
-
-LINE = "=" * 60
 
 SW_DOC_PART = 1
 SW_DOC_ASSEMBLY = 2
 
 
 class Component:
-
     def __init__(
         self,
         name,
         path,
         component_type,
         sw_component=None,
+        suppression=None,
+        lightweight=False,
+        configuration=None,
     ):
         self.name = name
-        self.path = Path(path)
+        self.path = path
         self.component_type = component_type
         self.sw_component = sw_component
-
-        self.suppression = None
-        self.lightweight = False
-        self.configuration = None
+        self.suppression = suppression
+        self.lightweight = lightweight
+        self.configuration = configuration
 
     @property
     def is_part(self):
@@ -35,385 +34,287 @@ class Component:
 
     @property
     def is_assembly(self):
-        return self.component_type == "ASSEMBLY"
+        return self.component_type == "SUB-ASSEMBLY"
 
     @property
     def suppressed(self):
-        return self.suppression == 0
+        return self.suppression in (0, 1)
 
 
 class SolidWorksAssembly:
-
     def __init__(self, sw_app):
-
         self.sw_app = sw_app
         self.model = None
+        self.file_path = None
 
-    # =====================================================
-    # COM HELPERS
-    # =====================================================
+    # ---------------------------------------------------------
+    # COM helper
+    # ---------------------------------------------------------
 
-    def _get(self, obj, name, default=None):
+    @staticmethod
+    def _read(obj, name, default=None):
+        """
+        Safely read either:
+        - COM method
+        - COM property
+        """
 
         if obj is None:
             return default
 
         try:
-
             value = getattr(obj, name)
-
-            if callable(value):
-
-                try:
-                    return value()
-
-                except TypeError:
-                    return value
-
-            return value
-
         except Exception:
             return default
 
-    # =====================================================
+        try:
+            if callable(value):
+                return value()
+            return value
+        except Exception:
+            return default
+
+    # ---------------------------------------------------------
     # OPEN ASSEMBLY
-    # =====================================================
+    # ---------------------------------------------------------
 
     def open(self, file_path):
 
         file_path = Path(file_path)
 
         if not file_path.exists():
-
-            print(
-                "File not found:",
-                file_path
-            )
-
-            return False
+            raise FileNotFoundError(file_path)
 
         if file_path.suffix.lower() != ".sldasm":
+            raise ValueError("Selected file is not a SolidWorks assembly.")
 
-            print(
-                "Not an SLDASM file:",
-                file_path
-            )
-
-            return False
+        self.file_path = str(file_path)
 
         print()
-        print(LINE)
+        print("=" * 60)
         print("OPEN ASSEMBLY")
-        print(LINE)
+        print("=" * 60)
 
+        # Check if already open
         try:
+            self.model = self.sw_app.GetOpenDocumentByName(str(file_path))
+        except Exception:
+            self.model = None
 
-            # ---------------------------------------------
-            # Already open?
-            # ---------------------------------------------
-
-            try:
-
-                model = (
-                    self.sw_app
-                    .GetOpenDocumentByName(
-                        str(file_path)
-                    )
-                )
-
-            except Exception:
-
-                model = None
-
-            if model is not None:
-
-                self.model = model
-
-                print(
-                    "Assembly already open."
-                )
-
-            else:
-
-                errors = win32com.client.VARIANT(
-                    pythoncom.VT_BYREF | pythoncom.VT_I4,
-                    0
-                )
-
-                warnings = win32com.client.VARIANT(
-                    pythoncom.VT_BYREF | pythoncom.VT_I4,
-                    0
-                )
-
-                self.model = (
-                    self.sw_app.OpenDoc6(
-                        str(file_path),
-                        SW_DOC_ASSEMBLY,
-                        0,
-                        "",
-                        errors,
-                        warnings,
-                    )
-                )
-
-                if self.model is None:
-
-                    print(
-                        "Could not open assembly."
-                    )
-
-                    print(
-                        "Errors:",
-                        errors.value
-                    )
-
-                    print(
-                        "Warnings:",
-                        warnings.value
-                    )
-
-                    return False
-
-            # ---------------------------------------------
-            # Resolve lightweight
-            # ---------------------------------------------
-
-            print(
-                "Resolving lightweight components..."
-            )
+        # Open if not already open
+        if self.model is None:
+            errors = 0
+            warnings = 0
 
             try:
-
-                self.model.ResolveAllLightweightComponents(
-                    False
+                self.model = self.sw_app.OpenDoc6(
+                    str(file_path),
+                    SW_DOC_ASSEMBLY,
+                    1,
+                    "",
+                    errors,
+                    warnings,
                 )
-
             except Exception as e:
+                raise RuntimeError(f"Could not open assembly:\n{e}")
 
-                print(
-                    "Resolve warning:",
-                    e
-                )
+        if self.model is None:
+            raise RuntimeError("SolidWorks returned None while opening assembly.")
 
-            print(
-                "Assembly opened successfully."
+        # Resolve lightweight components
+        try:
+            print("Resolving lightweight components...")
+
+            resolve_method = getattr(
+                self.model,
+                "ResolveAllLightweightComponents",
+                None,
             )
 
-            return True
+            if callable(resolve_method):
+                resolve_method(False)
 
         except Exception as e:
+            print(f"Warning resolving lightweight components: {e}")
 
-            print(
-                "Assembly open error:"
-            )
+        print("Assembly opened successfully.")
 
-            print(e)
+        return self.model
 
-            return False
-
-    # =====================================================
+    # ---------------------------------------------------------
     # GET COMPONENTS
-    # =====================================================
+    # ---------------------------------------------------------
 
     def get_components(self):
 
         if self.model is None:
-            return []
+            raise RuntimeError("Assembly is not open.")
+
+        print()
+        print("=" * 60)
+        print("SCANNING COMPONENTS")
+        print("=" * 60)
 
         components = []
 
         try:
+            sw_components = self.model.GetComponents(False)
+        except Exception as e:
+            raise RuntimeError(f"GetComponents failed: {e}")
 
-            print()
-            print(LINE)
-            print("SCANNING COMPONENTS")
-            print(LINE)
-
-            # False = include all levels
-            sw_components = (
-                self.model.GetComponents(False)
-            )
-
-            if sw_components is None:
-                return []
-
-            for sw_component in sw_components:
-
-                try:
-
-                    path = (
-                        sw_component.GetPathName()
-                    )
-
-                    if not path:
-                        continue
-
-                    path = Path(path)
-
-                    extension = (
-                        path.suffix.lower()
-                    )
-
-                    if extension == ".sldprt":
-
-                        component_type = "PART"
-
-                    elif extension == ".sldasm":
-
-                        component_type = "ASSEMBLY"
-
-                    else:
-
-                        continue
-
-                    # -------------------------------------
-                    # Suppression
-                    # -------------------------------------
-
-                    try:
-
-                        suppression = (
-                            sw_component
-                            .GetSuppression()
-                        )
-
-                    except Exception:
-
-                        suppression = None
-
-                    # -------------------------------------
-                    # Lightweight
-                    # -------------------------------------
-
-                    try:
-
-                        lightweight = bool(
-                            sw_component
-                            .IsLightWeight
-                        )
-
-                    except Exception:
-
-                        lightweight = False
-
-                    # -------------------------------------
-                    # Configuration
-                    # -------------------------------------
-
-                    try:
-
-                        configuration = (
-                            sw_component
-                            .ReferencedConfiguration
-                        )
-
-                    except Exception:
-
-                        configuration = None
-
-                    # -------------------------------------
-                    # Component
-                    # -------------------------------------
-
-                    component = Component(
-                        name=(
-                            self._get(
-                                sw_component,
-                                "Name2",
-                                path.stem
-                            )
-                        ),
-                        path=path,
-                        component_type=component_type,
-                        sw_component=sw_component,
-                    )
-
-                    component.suppression = (
-                        suppression
-                    )
-
-                    component.lightweight = (
-                        lightweight
-                    )
-
-                    component.configuration = (
-                        configuration
-                    )
-
-                    components.append(
-                        component
-                    )
-
-                except Exception as e:
-
-                    print(
-                        "Component error:",
-                        e
-                    )
-
-            print()
-            print(
-                "Components found:",
-                len(components)
-            )
-
+        if sw_components is None:
+            print("No components found.")
             return components
 
-        except Exception as e:
+        for sw_component in sw_components:
+            try:
+                # ---------------------------------------------
+                # Name
+                # ---------------------------------------------
 
-            print(
-                "Component scan error:",
-                e
-            )
+                name = self._read(sw_component, "Name2", "")
 
-            return []
+                if not name:
+                    name = self._read(sw_component, "Name", "")
 
-    # =====================================================
+                # ---------------------------------------------
+                # Path
+                # ---------------------------------------------
+
+                path = self._read(sw_component, "GetPathName", "")
+
+                if path is None:
+                    path = ""
+
+                path = str(path)
+
+                # ---------------------------------------------
+                # Suppression
+                # ---------------------------------------------
+
+                suppression = self._read(sw_component, "GetSuppression", None)
+
+                # ---------------------------------------------
+                # Lightweight
+                # ---------------------------------------------
+
+                lightweight = False
+
+                try:
+                    lightweight_value = self._read(sw_component, "IsLightweight", False)
+
+                    lightweight = bool(lightweight_value)
+
+                except Exception:
+                    lightweight = False
+
+                # ---------------------------------------------
+                # Referenced configuration
+                # ---------------------------------------------
+
+                configuration = self._read(sw_component, "ReferencedConfiguration", "")
+
+                # ---------------------------------------------
+                # Determine component type
+                # ---------------------------------------------
+
+                extension = Path(path).suffix.lower()
+
+                if extension == ".sldprt":
+                    component_type = "PART"
+
+                elif extension == ".sldasm":
+                    component_type = "SUB-ASSEMBLY"
+
+                else:
+                    # If extension isn't available, try model doc
+                    model_doc = None
+
+                    try:
+                        get_model = getattr(sw_component, "GetModelDoc2", None)
+
+                        if callable(get_model):
+                            model_doc = get_model()
+
+                    except Exception:
+                        model_doc = None
+
+                    if model_doc is not None:
+                        try:
+                            doc_type = self._read(model_doc, "GetType", None)
+
+                            if doc_type == SW_DOC_PART:
+                                component_type = "PART"
+
+                            elif doc_type == SW_DOC_ASSEMBLY:
+                                component_type = "SUB-ASSEMBLY"
+
+                            else:
+                                component_type = "UNKNOWN"
+
+                        except Exception:
+                            component_type = "UNKNOWN"
+
+                    else:
+                        component_type = "UNKNOWN"
+
+                component = Component(
+                    name=name,
+                    path=path,
+                    component_type=component_type,
+                    sw_component=sw_component,
+                    suppression=suppression,
+                    lightweight=lightweight,
+                    configuration=configuration,
+                )
+
+                components.append(component)
+
+            except Exception as e:
+                print(f"Component error: {e}")
+
+        print()
+        print(f"Total components found: {len(components)}")
+
+        return components
+
+    # ---------------------------------------------------------
     # UNIQUE PARTS
-    # =====================================================
+    # ---------------------------------------------------------
 
-    def get_unique_part_quantities(
-        self,
-        components=None
-    ):
+    def get_unique_part_quantities(self, components=None):
 
         if components is None:
             components = self.get_components()
 
-        grouped = {}
+        unique = {}
 
         for component in components:
-
             if not component.is_part:
                 continue
 
-            key = (
-                str(component.path).lower()
-            )
+            if not component.path:
+                continue
 
-            if key not in grouped:
+            # IMPORTANT:
+            # Configuration is included because one SLDPRT can
+            # contain several different configurations.
+            key = (component.path.lower(), str(component.configuration or "").lower())
 
-                grouped[key] = {
-                    "name": component.path.stem,
+            if key not in unique:
+                unique[key] = {
+                    "name": component.name,
                     "path": component.path,
+                    "configuration": component.configuration,
                     "quantity": 0,
                     "components": [],
                 }
 
-            grouped[key]["quantity"] += 1
+            unique[key]["quantity"] += 1
+            unique[key]["components"].append(component)
 
-            grouped[key]["components"].append(
-                component
-            )
+        return list(unique.values())
 
-        return list(
-            grouped.values()
-        )
-
-
-# =========================================================
-# FIND ASSEMBLIES
-# =========================================================
 
 def find_assemblies(input_folder):
 
@@ -422,15 +323,4 @@ def find_assemblies(input_folder):
     if not input_folder.exists():
         return []
 
-    return sorted(
-        [
-            file
-            for file in input_folder.iterdir()
-            if (
-                file.is_file()
-                and file.suffix.lower() == ".sldasm"
-                and not file.name.startswith("~$")
-            )
-        ]
-    )
-
+    return sorted(input_folder.glob("*.SLDASM"))
