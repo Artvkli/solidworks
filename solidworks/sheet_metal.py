@@ -4,15 +4,25 @@ from pathlib import Path
 import win32com.client
 
 
+# =========================================================
+# SOLIDWORKS CONSTANTS
+# =========================================================
+
 SW_DOC_PART = 1
 SW_SOLID_BODY = 0
 
+# ExportToDWG2 Action
 SW_EXPORT_SHEET_METAL = 1
 
-# Flat geometry = 1
-# Bend lines   = 4
-# Total        = 5
+# Sheet Metal options:
+# Bit 1 = Flat pattern geometry
+# Bit 3 = Bend lines
+# 1 + 4 = 5
 SW_SHEET_METAL_OPTIONS = 5
+
+# Suppression state
+SW_SUPPRESS = 0
+SW_RESOLVE = 2
 
 
 class SheetMetalDetector:
@@ -24,9 +34,9 @@ class SheetMetalDetector:
 
         self._opened_models = {}
 
-    # =========================================================
+    # =====================================================
     # SAFE COM READ
-    # =========================================================
+    # =====================================================
 
     @staticmethod
     def _read(obj, name, default=None):
@@ -36,6 +46,7 @@ class SheetMetalDetector:
 
         try:
             value = getattr(obj, name)
+
         except Exception:
             return default
 
@@ -48,35 +59,56 @@ class SheetMetalDetector:
         except Exception:
             return default
 
-    # =========================================================
+    # =====================================================
+    # SAFE COM CALL
+    # =====================================================
+
+    @staticmethod
+    def _call(obj, name, *args, default=None):
+
+        if obj is None:
+            return default
+
+        try:
+            method = getattr(obj, name)
+
+        except Exception:
+            return default
+
+        try:
+            if callable(method):
+                return method(*args)
+
+            return default
+
+        except Exception:
+            return default
+
+    # =====================================================
     # GET MODEL FROM COMPONENT
-    # =========================================================
+    # =====================================================
 
     def get_model_from_component(self, component):
 
         sw_component = component.sw_component
 
-        # -----------------------------------------------------
-        # 1. Best option:
-        #    GetModelDoc2()
-        # -----------------------------------------------------
+        # -------------------------------------------------
+        # 1. GetModelDoc2
+        # -------------------------------------------------
 
         if sw_component is not None:
             try:
-                get_model = getattr(sw_component, "GetModelDoc2", None)
+                model = self._call(sw_component, "GetModelDoc2")
 
-                if callable(get_model):
-                    model = get_model()
-
-                    if model is not None:
-                        return model
+                if model is not None:
+                    return model
 
             except Exception:
                 pass
 
-        # -----------------------------------------------------
-        # 2. Try original path
-        # -----------------------------------------------------
+        # -------------------------------------------------
+        # 2. Original referenced path
+        # -------------------------------------------------
 
         original_path = Path(component.path)
 
@@ -86,35 +118,31 @@ class SheetMetalDetector:
             if model is not None:
                 return model
 
-        # -----------------------------------------------------
-        # 3. Search next to assembly
-        # -----------------------------------------------------
+        # -------------------------------------------------
+        # 3. Search beside assembly
+        # -------------------------------------------------
 
         if self.assembly_path:
             assembly_folder = self.assembly_path.parent
 
-            filename = original_path.name
-
-            candidate = assembly_folder / filename
+            candidate = assembly_folder / original_path.name
 
             if candidate.exists():
-                print(f"Using local part:\n  {candidate}")
+                print(f"Found local part:\n  {candidate}")
 
                 model = self.open_part(candidate)
 
                 if model is not None:
                     return model
 
-        # -----------------------------------------------------
-        # 4. Recursive search inside assembly folder
-        # -----------------------------------------------------
+        # -------------------------------------------------
+        # 4. Recursive search
+        # -------------------------------------------------
 
         if self.assembly_path:
             assembly_folder = self.assembly_path.parent
 
             filename = original_path.name
-
-            print(f"Searching for:\n  {filename}")
 
             try:
                 matches = list(assembly_folder.rglob(filename))
@@ -125,34 +153,44 @@ class SheetMetalDetector:
             if matches:
                 candidate = matches[0]
 
-                print(f"Found:\n  {candidate}")
+                print(f"Found part:\n  {candidate}")
 
                 model = self.open_part(candidate)
 
                 if model is not None:
                     return model
 
+        # -------------------------------------------------
+        # Nothing found
+        # -------------------------------------------------
+
+        print(f"Could not find model for:\n  {component.name}")
+
         return None
 
-    # =========================================================
+    # =====================================================
     # OPEN PART
-    # =========================================================
+    # =====================================================
 
     def open_part(self, part_path):
 
         part_path = Path(part_path)
 
         if not part_path.exists():
-            print(f"Part does not exist: {part_path}")
+            print(f"Part does not exist:\n  {part_path}")
 
             return None
 
         key = str(part_path).lower()
 
+        # Already opened by scanner
         if key in self._opened_models:
             return self._opened_models[key]
 
-        # Already open in SolidWorks
+        # -------------------------------------------------
+        # Check SolidWorks opened documents
+        # -------------------------------------------------
+
         try:
             model = self.sw_app.GetOpenDocumentByName(str(part_path))
 
@@ -164,7 +202,10 @@ class SheetMetalDetector:
         except Exception:
             pass
 
+        # -------------------------------------------------
         # Open part
+        # -------------------------------------------------
+
         try:
             errors = 0
             warnings = 0
@@ -179,13 +220,50 @@ class SheetMetalDetector:
                 return model
 
         except Exception as e:
-            print(f"Could not open part:\n  {part_path}\n  Error: {e}")
+            print(f"Open part error:\n  {part_path}\n  {e}")
 
         return None
 
-    # =========================================================
+    # =====================================================
+    # ACTIVATE MODEL
+    # =====================================================
+
+    def activate_model(self, model):
+
+        try:
+            title = self._read(model, "GetTitle", "")
+
+            if not title:
+                return False
+
+            errors = 0
+
+            result = self.sw_app.ActivateDoc3(title, True, 2)
+
+            return result is not None
+
+        except Exception as e:
+            print(f"Warning: ActivateDoc3 failed: {e}")
+
+            return False
+
+    # =====================================================
+    # REBUILD MODEL
+    # =====================================================
+
+    def rebuild_model(self, model):
+
+        try:
+            result = self._call(model, "ForceRebuild3", False)
+
+            return result
+
+        except Exception:
+            return None
+
+    # =====================================================
     # GET BODIES
-    # =========================================================
+    # =====================================================
 
     def get_bodies(self, model):
 
@@ -202,9 +280,9 @@ class SheetMetalDetector:
 
             return []
 
-    # =========================================================
+    # =====================================================
     # GET SHEET METAL BODIES
-    # =========================================================
+    # =====================================================
 
     def get_sheet_metal_bodies(self, model):
 
@@ -214,9 +292,7 @@ class SheetMetalDetector:
 
         for body in bodies:
             try:
-                is_sheet = body.IsSheetMetal()
-
-                if is_sheet:
+                if body.IsSheetMetal():
                     result.append(body)
 
             except Exception:
@@ -224,9 +300,9 @@ class SheetMetalDetector:
 
         return result
 
-    # =========================================================
-    # FEATURES
-    # =========================================================
+    # =====================================================
+    # FEATURE ITERATOR
+    # =====================================================
 
     def iter_features(self, model):
 
@@ -238,15 +314,16 @@ class SheetMetalDetector:
 
                 try:
                     feature = feature.GetNextFeature()
+
                 except Exception:
                     break
 
         except Exception:
             return
 
-    # =========================================================
+    # =====================================================
     # FIND FEATURE
-    # =========================================================
+    # =====================================================
 
     def find_feature(self, model, type_name):
 
@@ -264,17 +341,48 @@ class SheetMetalDetector:
 
         return None
 
-    # =========================================================
-    # SHEET METAL FEATURE
-    # =========================================================
+    # =====================================================
+    # GET SHEET METAL FEATURE
+    # =====================================================
 
     def get_sheet_metal_feature(self, model):
 
         return self.find_feature(model, "SheetMetal")
 
-    # =========================================================
-    # IS SHEET METAL
-    # =========================================================
+    # =====================================================
+    # GET FLAT PATTERN
+    # =====================================================
+
+    def get_flat_pattern(self, model):
+
+        return self.find_feature(model, "FlatPattern")
+
+    # =====================================================
+    # ACTIVATE / UNSUPPRESS FLAT PATTERN
+    # =====================================================
+
+    def activate_flat_pattern(self, model):
+
+        flat_pattern = self.get_flat_pattern(model)
+
+        if flat_pattern is None:
+            return False
+
+        # -------------------------------------------------
+        # Try unsuppress
+        # -------------------------------------------------
+
+        try:
+            result = flat_pattern.SetSuppression2(SW_RESOLVE)
+
+            return bool(result)
+
+        except Exception:
+            return True
+
+    # =====================================================
+    # CHECK SHEET METAL
+    # =====================================================
 
     def is_sheet_metal(self, component):
 
@@ -284,22 +392,22 @@ class SheetMetalDetector:
         model = self.get_model_from_component(component)
 
         if model is None:
-            print("Could not obtain ModelDoc2")
-
             return False
 
-        # -----------------------------------------------------
-        # Method 1: Body.IsSheetMetal()
-        # -----------------------------------------------------
+        # -------------------------------------------------
+        # Method 1:
+        # Body.IsSheetMetal()
+        # -------------------------------------------------
 
         sheet_bodies = self.get_sheet_metal_bodies(model)
 
         if sheet_bodies:
             return True
 
-        # -----------------------------------------------------
-        # Method 2: SheetMetal feature
-        # -----------------------------------------------------
+        # -------------------------------------------------
+        # Method 2:
+        # SheetMetal feature
+        # -------------------------------------------------
 
         feature = self.get_sheet_metal_feature(model)
 
@@ -308,9 +416,9 @@ class SheetMetalDetector:
 
         return False
 
-    # =========================================================
-    # THICKNESS
-    # =========================================================
+    # =====================================================
+    # GET THICKNESS
+    # =====================================================
 
     def get_thickness(self, component):
 
@@ -332,11 +440,9 @@ class SheetMetalDetector:
 
             thickness = getattr(definition, "Thickness", None)
 
-            if thickness is not None:
+            if callable(thickness):
                 try:
-                    if callable(thickness):
-                        thickness = thickness()
-
+                    thickness = thickness()
                 except Exception:
                     pass
 
@@ -345,26 +451,38 @@ class SheetMetalDetector:
         except Exception:
             return None
 
-    # =========================================================
-    # FLAT PATTERN
-    # =========================================================
-
-    def get_flat_pattern(self, model):
-
-        return self.find_feature(model, "FlatPattern")
-
-    # =========================================================
+    # =====================================================
     # EXPORT DWG
-    # =========================================================
+    # =====================================================
 
     def export_dwg(self, component, output_path):
+
+        # -------------------------------------------------
+        # Get model
+        # -------------------------------------------------
 
         model = self.get_model_from_component(component)
 
         if model is None:
-            print("Could not obtain model for export.")
+            print("Could not obtain ModelDoc2.")
 
             return False
+
+        # -------------------------------------------------
+        # Activate document
+        # -------------------------------------------------
+
+        self.activate_model(model)
+
+        # -------------------------------------------------
+        # Rebuild
+        # -------------------------------------------------
+
+        self.rebuild_model(model)
+
+        # -------------------------------------------------
+        # Verify Sheet Metal body
+        # -------------------------------------------------
 
         sheet_bodies = self.get_sheet_metal_bodies(model)
 
@@ -373,48 +491,156 @@ class SheetMetalDetector:
 
             return False
 
-        # -----------------------------------------------------
-        # Get actual model path
-        # -----------------------------------------------------
+        print(f"Sheet Metal bodies: {len(sheet_bodies)}")
+
+        # -------------------------------------------------
+        # Get model path
+        # -------------------------------------------------
 
         model_path = self._read(model, "GetPathName", "")
 
         if not model_path:
             model_path = component.path
 
-        # -----------------------------------------------------
+        model_path = str(model_path)
+
+        # -------------------------------------------------
+        # Make sure output folder exists
+        # -------------------------------------------------
+
+        output_path = Path(output_path)
+
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # -------------------------------------------------
+        # Flat Pattern
+        # -------------------------------------------------
+
+        flat_pattern = self.get_flat_pattern(model)
+
+        if flat_pattern is not None:
+            print("FlatPattern feature found.")
+
+            try:
+                self.activate_flat_pattern(model)
+
+            except Exception as e:
+                print(f"Warning activating FlatPattern: {e}")
+
+        else:
+            print("Warning: FlatPattern feature not found.")
+
+        # -------------------------------------------------
+        # Alignment
+        #
+        # 12 values:
+        #
+        # Origin
+        # X axis
+        # Y axis
+        # Normal
+        # -------------------------------------------------
+
+        alignment = (0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0)
+
+        # -------------------------------------------------
+        # Sheet Metal Options
+        #
+        # Flat Pattern = 1
+        # Bend Lines   = 4
+        #
+        # Total = 5
+        # -------------------------------------------------
+
+        sheet_metal_options = SW_SHEET_METAL_OPTIONS
+
+        print()
+        print("DWG EXPORT")
+
+        print("-" * 40)
+
+        print(f"Model:")
+
+        print(f"  {model_path}")
+
+        print(f"Output:")
+
+        print(f"  {output_path}")
+
+        print(f"Options:")
+
+        print(f"  {sheet_metal_options}")
+
+        # -------------------------------------------------
         # Export
-        # -----------------------------------------------------
+        # -------------------------------------------------
 
         try:
-            output_path = Path(output_path)
-
-            output_path.parent.mkdir(parents=True, exist_ok=True)
-
             result = model.ExportToDWG2(
                 str(output_path),
-                str(model_path),
+                model_path,
                 SW_EXPORT_SHEET_METAL,
                 True,
-                None,
+                alignment,
                 False,
                 False,
-                SW_SHEET_METAL_OPTIONS,
+                sheet_metal_options,
                 None,
             )
 
-            print(f"Export result: {result}")
+            print(f"ExportToDWG2 result: {result}")
 
-            return bool(result)
+            # -------------------------------------------------
+            # Check output
+            # -------------------------------------------------
 
-        except Exception as e:
-            print(f"Export DWG error:\n  {e}")
+            if result and output_path.exists():
+                try:
+                    file_size = output_path.stat().st_size
+
+                    print("DWG created successfully.")
+
+                    print(f"File size: {file_size:,} bytes")
+
+                except Exception:
+                    print("DWG created successfully.")
+
+                return True
+
+            # -------------------------------------------------
+            # Some SolidWorks versions can create the file
+            # while returning False.
+            # -------------------------------------------------
+
+            if output_path.exists():
+                try:
+                    file_size = output_path.stat().st_size
+
+                    if file_size > 0:
+                        print("DWG file exists despite False result.")
+
+                        print(f"File size: {file_size:,} bytes")
+
+                        return True
+
+                except Exception:
+                    pass
+
+            print("SolidWorks returned False and no valid DWG was created.")
 
             return False
 
-    # =========================================================
-    # SAFE OUTPUT NAME
-    # =========================================================
+        except Exception as e:
+            print()
+            print("ExportToDWG2 exception:")
+
+            print(f"  {e}")
+
+            return False
+
+    # =====================================================
+    # UNIQUE OUTPUT PATH
+    # =====================================================
 
     @staticmethod
     def unique_output_path(output_folder, part_name):
@@ -438,9 +664,9 @@ class SheetMetalDetector:
 
             counter += 1
 
-    # =========================================================
-    # SCAN AND EXPORT
-    # =========================================================
+    # =====================================================
+    # SCAN + EXPORT
+    # =====================================================
 
     def scan_and_export(self, components, unique_parts, output_folder):
 
@@ -453,39 +679,45 @@ class SheetMetalDetector:
         non_sheet_metal = 0
         failed = 0
 
+        total = len(unique_parts)
+
         print()
         print("=" * 60)
-        print("SHEET METAL SCAN")
+        print("SHEET METAL SCANNER")
         print("=" * 60)
-
-        total = len(unique_parts)
 
         for index, part in enumerate(unique_parts, start=1):
             print()
             print("-" * 60)
+
             print(f"[{index}/{total}]")
+
             print(f"Part: {part['name']}")
+
             print(f"Quantity: {part['quantity']}")
+
+            # -------------------------------------------------
+            # Representative component
+            # -------------------------------------------------
 
             component = part["components"][0]
 
             try:
-                # -------------------------------------------------
-                # Show original path
-                # -------------------------------------------------
+                print("Referenced path:")
 
-                print(f"Referenced path:\n  {component.path}")
+                print(f"  {component.path}")
 
                 # -------------------------------------------------
-                # Find model
+                # Get model
                 # -------------------------------------------------
 
                 model = self.get_model_from_component(component)
 
                 if model is None:
-                    print("Result: FAILED - model not found")
+                    print("Result: FAILED - MODEL NOT FOUND")
 
                     failed += 1
+
                     continue
 
                 # -------------------------------------------------
@@ -498,6 +730,7 @@ class SheetMetalDetector:
                     print("Result: NOT SHEET METAL")
 
                     non_sheet_metal += 1
+
                     continue
 
                 # -------------------------------------------------
@@ -516,20 +749,24 @@ class SheetMetalDetector:
 
                 if thickness is not None:
                     try:
-                        print(f"Thickness: {float(thickness) * 1000:.3f} mm")
+                        thickness_mm = float(thickness) * 1000.0
+
+                        print(f"Thickness: {thickness_mm:.3f} mm")
 
                     except Exception:
                         print(f"Thickness: {thickness}")
 
                 # -------------------------------------------------
-                # Output name
+                # Output filename
                 # -------------------------------------------------
 
                 part_name = Path(component.path).stem
 
                 output_path = self.unique_output_path(output_folder, part_name)
 
-                print(f"Exporting:\n  {output_path}")
+                print("Exporting:")
+
+                print(f"  {output_path}")
 
                 # -------------------------------------------------
                 # Export
@@ -550,7 +787,7 @@ class SheetMetalDetector:
             except Exception as e:
                 failed += 1
 
-                print(f"ERROR: {e}")
+                print(f"Component processing error: {e}")
 
         # =====================================================
         # FINAL REPORT
