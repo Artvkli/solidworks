@@ -1,7 +1,7 @@
 from pathlib import Path
 
-from connection import SolidWorksConnection
-from assembly import SolidWorksAssembly, find_assemblies
+from solidworks.connection import SolidWorksConnection
+from solidworks.assembly import SolidWorksAssembly, find_assemblies
 
 
 def main():
