@@ -1,29 +1,21 @@
 import win32com.client
 
 
-class SolidWorksConnection:
+def connect_to_solidworks():
+    try:
+        # اتصال به SolidWorks در حال اجرا
+        sw = win32com.client.GetActiveObject("SldWorks.Application")
 
-    def __init__(self):
-        self.app = None
+        print("Connected to SolidWorks successfully!")
+        print("SolidWorks version:", sw.RevisionNumber())
 
-    def connect(self):
+        return sw
 
-        if self.app is not None:
-            return self.app
+    except Exception as e:
+        print("Could not connect to SolidWorks.")
+        print("Error:", e)
+        return None
 
-        try:
-            self.app = win32com.client.GetActiveObject(
-                "SldWorks.Application"
-            )
 
-        except Exception as exc:
-
-            raise RuntimeError(
-                "Could not connect to SOLIDWORKS. "
-                "Make sure SOLIDWORKS is running."
-            ) from exc
-
-        return self.app
-
-    def is_connected(self) -> bool:
-        return self.app is not None
+if __name__ == "__main__":
+    connect_to_solidworks()
