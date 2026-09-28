@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pythoncom
 import win32com.client
-from component import Component
+from solidworks.component import Component
 
 class SolidWorksAssembly:
 
@@ -82,7 +82,7 @@ class SolidWorksAssembly:
             return False
 
     def get_components(self):
-        
+
         if self.model is None:
             print("No assembly is open.")
             return []
