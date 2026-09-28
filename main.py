@@ -116,8 +116,8 @@ def main():
                 if activated:
                     print(f"[FLAT PATTERN ACTIVE] {component.name}")
 
-                    output_file = output_folder / f"{component.name}.dxf"
-            
+                    output_file = output_folder / f"{component.name}.dwg"
+
                     exported = detector.export_dxf(
                         model,
                         output_file
@@ -127,7 +127,7 @@ def main():
                         print(f"[DXF SUCCESS] {output_file}")
                     else:
                         print(f"[DXF FAILED] {component.name}")
-            
+
                 else:
                     print(f"[FLAT PATTERN ACTIVATION FAILED] {component.name}")
             else:
