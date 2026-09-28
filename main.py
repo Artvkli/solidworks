@@ -91,6 +91,10 @@ def main():
     sheet_metal_parts = []
     non_sheet_metal_parts = []
 
+    print()
+    print("Sheet Metal Detection")
+    print("=" * 50)
+
     for component in components:
 
         if not component.is_part:
@@ -99,13 +103,21 @@ def main():
         if component.suppressed:
             continue
 
-        is_sheet_metal = detector.is_sheet_metal(component)
+        thickness = detector.get_thickness(component)
 
-        if is_sheet_metal:
+        if thickness is not None:
+
             sheet_metal_parts.append(component)
+    
+            thickness_mm = thickness * 1000
+
             print(f"[SHEET METAL] {component.name}")
+            print(f"Thickness: {thickness_mm:.3f} mm")
+
         else:
+
             non_sheet_metal_parts.append(component)
+
             print(f"[NORMAL PART] {component.name}")
 
     print()

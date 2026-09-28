@@ -30,10 +30,32 @@ class SheetMetalDetector:
 
         return model
 
+    def find_sheet_metal_feature(self, model):
+        """Find the Sheet Metal feature in a part."""
+
+        feature = model.FirstFeature
+
+        while feature is not None:
+
+            try:
+                feature_type = feature.GetTypeName2
+
+                if feature_type:
+                    if feature_type.lower() == "sheetmetal":
+                        return feature
+
+            except Exception:
+                pass
+
+            try:
+                feature = feature.GetNextFeature
+            except Exception:
+                break
+
+        return None
+
     def is_sheet_metal(self, component):
-        """
-        Check whether a SolidWorks part is a Sheet Metal part.
-        """
+        """Check whether a component is a Sheet Metal part."""
 
         if not component.is_part:
             return False
@@ -48,30 +70,46 @@ class SheetMetalDetector:
                 print(f"Could not open part: {component.name}")
                 return False
 
-            feature = model.FirstFeature
+            feature = self.find_sheet_metal_feature(model)
 
-            while feature is not None:
-
-                try:
-                    feature_type = feature.GetTypeName2
-
-                    if feature_type:
-                        feature_type = feature_type.lower()
-
-                        if feature_type == "sheetmetal":
-                            return True
-
-                except Exception:
-                    pass
-
-                try:
-                    feature = feature.GetNextFeature
-                except Exception:
-                    break
-
-            return False
+            return feature is not None
 
         except Exception as e:
             print(f"Could not inspect part: {component.name}")
             print(e)
             return False
+
+    def get_thickness(self, component):
+        """Get Sheet Metal thickness in meters."""
+
+        if not component.is_part:
+            return None
+
+        if component.suppressed:
+            return None
+
+        try:
+            model = self.open_part(component.path)
+
+            if model is None:
+                print(f"Could not open part: {component.name}")
+                return None
+
+            feature = self.find_sheet_metal_feature(model)
+
+            if feature is None:
+                return None
+
+            feature_data = feature.GetDefinition
+
+            if feature_data is None:
+                return None
+
+            thickness = feature_data.Thickness
+
+            return thickness
+
+        except Exception as e:
+            print(f"Could not read thickness: {component.name}")
+            print(e)
+            return None
