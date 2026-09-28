@@ -1,5 +1,7 @@
 from pathlib import Path
+
 import pythoncom
+import win32com.client
 
 
 class SolidWorksAssembly:
@@ -23,7 +25,7 @@ class SolidWorksAssembly:
 
         print()
         print("Opening assembly:")
-        print(file_path.name)
+        print(file_path)
 
         try:
             # SolidWorks document type
@@ -33,9 +35,17 @@ class SolidWorksAssembly:
             # Open options
             options = 0
 
-            # Error and warning values
-            errors = 0
-            warnings = 0
+            # OpenDoc6 expects Errors and Warnings
+            # as ByRef 32-bit integers.
+            errors = win32com.client.VARIANT(
+                pythoncom.VT_BYREF | pythoncom.VT_I4,
+                0
+            )
+
+            warnings = win32com.client.VARIANT(
+                pythoncom.VT_BYREF | pythoncom.VT_I4,
+                0
+            )
 
             self.model = self.sw_app.OpenDoc6(
                 str(file_path),
@@ -47,16 +57,24 @@ class SolidWorksAssembly:
             )
 
             if self.model is None:
-                print("SolidWorks returned no model.")
+                print("SolidWorks did not return a model.")
+
+                print("Errors:", errors.value)
+                print("Warnings:", warnings.value)
+
                 return False
 
             print()
             print("Assembly opened successfully!")
             print("Title:", self.model.GetTitle())
 
+            print("Errors:", errors.value)
+            print("Warnings:", warnings.value)
+
             return True
 
         except Exception as e:
+
             print()
             print("Error while opening assembly:")
             print(e)
