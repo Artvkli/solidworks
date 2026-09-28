@@ -106,9 +106,14 @@ def main():
         thickness = detector.get_thickness(component)
 
         if thickness is not None:
-
+            model = detector.open_part(component.path)
+            flat_pattern = detector.find_flat_pattern_feature(model)
+            if flat_pattern is not None:
+                print(f"[FLAT PATTERN FOUND] {component.name}")
+            else:
+                print(f"[NO FLAT PATTERN] {component.name}")
             sheet_metal_parts.append(component)
-    
+
             thickness_mm = thickness * 1000
 
             print(f"[SHEET METAL] {component.name}")

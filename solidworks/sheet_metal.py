@@ -53,6 +53,29 @@ class SheetMetalDetector:
                 break
 
         return None
+    
+    def find_flat_pattern_feature(self, model):
+
+        """Find the Flat Pattern feature in a part."""
+        feature = model.FirstFeature
+
+        while feature is not None:
+            try:
+                feature_type = feature.GetTypeName2
+
+                if feature_type:
+                    if feature_type.lower() == "flatpattern":
+                        return feature
+
+            except Exception:
+                pass
+
+            try:
+                feature = feature.GetNextFeature
+            except Exception:
+                break
+
+        return None
 
     def is_sheet_metal(self, component):
         """Check whether a component is a Sheet Metal part."""
