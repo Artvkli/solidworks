@@ -1,69 +1,132 @@
+from pathlib import Path
+
 import pythoncom
 import win32com.client
 
+from solidworks.utils import com_value
+
 
 class SheetMetalDetector:
+    # Feature type names that mark a part as sheet metal
+    SHEET_METAL_TYPES = {"sheetmetal", "smbaseflange", "flatpattern"}
+
     def __init__(self, sw_app):
         self.sw_app = sw_app
+        self._opened_by_us = set()
+
+    # ------------------------------------------------------------------
+    # Open / close
+    # ------------------------------------------------------------------
 
     def open_part(self, part_path):
-        """Open a SolidWorks part."""
+        """Open a SolidWorks part (or reuse it if already open)."""
+
+        part_path = str(part_path)
+
+        # Already open (e.g. loaded with the assembly)?
+        try:
+            model = self.sw_app.GetOpenDocumentByName(part_path)
+        except Exception:
+            model = None
+
+        if model is not None:
+            return model
 
         errors = win32com.client.VARIANT(pythoncom.VT_BYREF | pythoncom.VT_I4, 0)
-
         warnings = win32com.client.VARIANT(pythoncom.VT_BYREF | pythoncom.VT_I4, 0)
 
-        model = self.sw_app.OpenDoc6(str(part_path), 1, 0, "", errors, warnings)
+        model = self.sw_app.OpenDoc6(part_path, 1, 0, "", errors, warnings)
 
+        if model is None:
+            print(f"OpenDoc6 failed. Errors: {errors.value}")
+            return None
+
+        self._opened_by_us.add(part_path.lower())
         return model
 
-    def find_sheet_metal_feature(self, model):
-        """Find the Sheet Metal feature in a part."""
+    def close_part(self, model):
+        """Close a part only if this class opened it."""
 
-        feature = model.FirstFeature
+        if model is None:
+            return
+
+        path = com_value(model, "GetPathName") or ""
+
+        if path.lower() not in self._opened_by_us:
+            return
+
+        try:
+            self.sw_app.CloseDoc(path)
+            self._opened_by_us.discard(path.lower())
+        except Exception as e:
+            print("Could not close part:", e)
+
+    def activate_document(self, model):
+        """Make the part the active document (needed for export)."""
+
+        try:
+            title = Path(com_value(model, "GetPathName")).name
+
+            errors = win32com.client.VARIANT(pythoncom.VT_BYREF | pythoncom.VT_I4, 0)
+
+            self.sw_app.ActivateDoc3(title, False, 0, errors)
+            return True
+
+        except Exception as e:
+            print("Could not activate document:", e)
+            return False
+
+    # ------------------------------------------------------------------
+    # Feature search
+    # ------------------------------------------------------------------
+
+    def _iter_features(self, model):
+        feature = com_value(model, "FirstFeature")
 
         while feature is not None:
-            try:
-                feature_type = feature.GetTypeName2
+            yield feature
+            feature = com_value(feature, "GetNextFeature")
 
-                if feature_type:
-                    if feature_type.lower() == "sheetmetal":
-                        return feature
+    def _find_feature(self, model, type_name):
+        type_name = type_name.lower()
 
-            except Exception:
-                pass
-
-            try:
-                feature = feature.GetNextFeature
-            except Exception:
-                break
+        for feature in self._iter_features(model):
+            t = (com_value(feature, "GetTypeName2") or "").lower()
+            if t == type_name:
+                return feature
 
         return None
+
+    def find_sheet_metal_feature(self, model):
+        return self._find_feature(model, "SheetMetal")
 
     def find_flat_pattern_feature(self, model):
-        """Find the Flat Pattern feature in a part."""
-        feature = model.FirstFeature
+        return self._find_feature(model, "FlatPattern")
 
-        while feature is not None:
-            try:
-                feature_type = feature.GetTypeName2
+    def is_sheet_metal_model(self, model):
+        for feature in self._iter_features(model):
+            t = (com_value(feature, "GetTypeName2") or "").lower()
+            if t in self.SHEET_METAL_TYPES:
+                return True
+        return False
 
-                if feature_type:
-                    if feature_type.lower() == "flatpattern":
-                        return feature
+    def print_features(self, model):
+        """Debug helper: print every feature name and type."""
 
-            except Exception:
-                pass
+        for feature in self._iter_features(model):
+            print(
+                com_value(feature, "Name"),
+                "|",
+                com_value(feature, "GetTypeName2"),
+            )
 
-            try:
-                feature = feature.GetNextFeature
-            except Exception:
-                break
-
-        return None
+    # ------------------------------------------------------------------
+    # Flat pattern
+    # ------------------------------------------------------------------
 
     def activate_flat_pattern(self, model):
-        """Activate the Flat Pattern feature."""
+        """Unsuppress the Flat Pattern feature (current configuration)."""
+
         flat_pattern = self.find_flat_pattern_feature(model)
 
         if flat_pattern is None:
@@ -71,9 +134,11 @@ class SheetMetalDetector:
             return False
 
         try:
-            success = flat_pattern.SetSuppression2(1, 2, None)
+            # 1 = swUnSuppressFeature, 1 = swThisConfiguration
+            success = flat_pattern.SetSuppression2(1, 1, None)
 
             if success:
+                model.EditRebuild3()
                 print("Flat Pattern activated.")
                 return True
 
@@ -85,54 +150,86 @@ class SheetMetalDetector:
             print(e)
             return False
 
+    def deactivate_flat_pattern(self, model):
+        """Suppress the Flat Pattern again (leave the part as it was)."""
 
+        flat_pattern = self.find_flat_pattern_feature(model)
 
-    def export_dxf(self, model, output_path):
-        
-        """Export the active Flat Pattern as DXF."""
+        if flat_pattern is None:
+            return
+
         try:
-            model_path = model.GetPathName
+            # 0 = swSuppressFeature, 1 = swThisConfiguration
+            flat_pattern.SetSuppression2(0, 1, None)
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------------
+    # Export
+    # ------------------------------------------------------------------
+
+    def export_dxf(self, model, output_path, sheet_metal_options=1):
+        """
+        Export the active Flat Pattern to DWG/DXF.
+
+        sheet_metal_options (bit mask):
+            1 = geometry, 2 = hidden edges, 4 = bend lines,
+            8 = sketches, 16 = forming tools
+        """
+
+        try:
+            model_path = com_value(model, "GetPathName")
 
             print()
-            print("DXF Export")
+            print("DWG Export")
             print("Model:", model_path)
             print("Output:", output_path)
+
+            if not self.activate_document(model):
+                return False
+
+            # Identity alignment: origin + X axis + Y axis
+            alignment = win32com.client.VARIANT(
+                pythoncom.VT_ARRAY | pythoncom.VT_R8,
+                [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0],
+            )
 
             result = model.ExportToDWG2(
                 str(output_path),
                 model_path,
-                1,
-                True,
+                1,  # swExportToDWG_ExportSheetMetal
+                True,  # single file
+                alignment,
+                False,
+                False,
+                sheet_metal_options,
                 None,
-                False,
-                False,
-                0,
-                None
             )
 
             print("ExportToDWG2 result:", result)
 
             if result:
-                print(f"DXF exported: {output_path}")
+                print(f"DWG exported: {output_path}")
                 return True
 
-            print("DXF export returned False.")
+            print("DWG export returned False.")
             return False
 
         except Exception as e:
-            print("Error while exporting DXF:")
+            print("Error while exporting DWG:")
             print(type(e).__name__)
             print(e)
             return False
-    
+
+    # ------------------------------------------------------------------
+    # Component helpers
+    # ------------------------------------------------------------------
+
     def is_sheet_metal(self, component):
-        """Check whether a component is a Sheet Metal part."""
-
-        if not component.is_part:
+        if not component.is_part or component.suppressed:
             return False
 
-        if component.suppressed:
-            return False
+        model = None
 
         try:
             model = self.open_part(component.path)
@@ -141,23 +238,23 @@ class SheetMetalDetector:
                 print(f"Could not open part: {component.name}")
                 return False
 
-            feature = self.find_sheet_metal_feature(model)
-
-            return feature is not None
+            return self.is_sheet_metal_model(model)
 
         except Exception as e:
             print(f"Could not inspect part: {component.name}")
             print(e)
             return False
 
+        finally:
+            self.close_part(model)
+
     def get_thickness(self, component):
-        """Get Sheet Metal thickness in meters."""
+        """Get Sheet Metal thickness in meters (None if not sheet metal)."""
 
-        if not component.is_part:
+        if not component.is_part or component.suppressed:
             return None
 
-        if component.suppressed:
-            return None
+        model = None
 
         try:
             model = self.open_part(component.path)
@@ -166,21 +263,29 @@ class SheetMetalDetector:
                 print(f"Could not open part: {component.name}")
                 return None
 
-            feature = self.find_sheet_metal_feature(model)
+            # Try the Sheet-Metal feature first, then the Base-Flange
+            for type_name in ("SheetMetal", "SMBaseFlange"):
+                feature = self._find_feature(model, type_name)
 
-            if feature is None:
-                return None
+                if feature is None:
+                    continue
 
-            feature_data = feature.GetDefinition
+                data = com_value(feature, "GetDefinition")
 
-            if feature_data is None:
-                return None
+                if data is None:
+                    continue
 
-            thickness = feature_data.Thickness
+                thickness = com_value(data, "Thickness")
 
-            return thickness
+                if thickness:
+                    return float(thickness)
+
+            return None
 
         except Exception as e:
             print(f"Could not read thickness: {component.name}")
             print(e)
             return None
+
+        finally:
+            self.close_part(model)

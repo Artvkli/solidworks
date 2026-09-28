@@ -2,10 +2,12 @@ from pathlib import Path
 
 import pythoncom
 import win32com.client
+
 from solidworks.component import Component
+from solidworks.utils import com_value
+
 
 class SolidWorksAssembly:
-
     def __init__(self, sw_app):
         self.sw_app = sw_app
         self.model = None
@@ -28,24 +30,11 @@ class SolidWorksAssembly:
         print(file_path)
 
         try:
-            # SolidWorks document type
-            # 2 = Assembly
-            document_type = 2
-
-            # Open options
+            document_type = 2  # swDocASSEMBLY
             options = 0
 
-            # OpenDoc6 expects Errors and Warnings
-            # as ByRef 32-bit integers.
-            errors = win32com.client.VARIANT(
-                pythoncom.VT_BYREF | pythoncom.VT_I4,
-                0
-            )
-
-            warnings = win32com.client.VARIANT(
-                pythoncom.VT_BYREF | pythoncom.VT_I4,
-                0
-            )
+            errors = win32com.client.VARIANT(pythoncom.VT_BYREF | pythoncom.VT_I4, 0)
+            warnings = win32com.client.VARIANT(pythoncom.VT_BYREF | pythoncom.VT_I4, 0)
 
             self.model = self.sw_app.OpenDoc6(
                 str(file_path),
@@ -53,42 +42,45 @@ class SolidWorksAssembly:
                 options,
                 "",
                 errors,
-                warnings
+                warnings,
             )
 
             if self.model is None:
                 print("SolidWorks did not return a model.")
-
                 print("Errors:", errors.value)
                 print("Warnings:", warnings.value)
-
                 return False
 
             print()
             print("Assembly opened successfully!")
-            print("Title:", self.model.GetTitle)
-
+            print("Title:", com_value(self.model, "GetTitle"))
             print("Errors:", errors.value)
             print("Warnings:", warnings.value)
+
+            # Lightweight components hide their features/definitions.
+            try:
+                self.model.ResolveAllLightweightComponents(False)
+            except Exception as e:
+                print("Could not resolve lightweight components:", e)
 
             return True
 
         except Exception as e:
-
             print()
             print("Error while opening assembly:")
             print(e)
-
             return False
 
     def get_components(self):
+        """Return ALL components (including those inside sub-assemblies)."""
 
         if self.model is None:
             print("No assembly is open.")
             return []
 
         try:
-            sw_components = self.model.GetComponents(True)
+            # False = all levels (TopLevelOnly = False)
+            sw_components = self.model.GetComponents(False)
 
             if sw_components is None:
                 return []
@@ -96,42 +88,33 @@ class SolidWorksAssembly:
             components = []
 
             for sw_component in sw_components:
-
                 try:
-                    name = sw_component.Name2
-                    path = sw_component.GetPathName
+                    name = com_value(sw_component, "Name2")
+                    path = com_value(sw_component, "GetPathName")
 
                     if not path:
                         continue
 
                     path = Path(path)
-
                     extension = path.suffix.lower()
 
                     if extension == ".sldprt":
                         component_type = "PART"
-
                     elif extension == ".sldasm":
                         component_type = "ASSEMBLY"
-
                     else:
                         continue
 
-                    suppressed = False
+                    suppressed = bool(com_value(sw_component, "IsSuppressed", False))
 
-                    try:
-                        suppressed = sw_component.IsSuppressed
-                    except Exception:
-                        pass
-
-                    component = Component(
-                        name=name,
-                        path=path,
-                        component_type=component_type,
-                        suppressed=suppressed
+                    components.append(
+                        Component(
+                            name=name,
+                            path=path,
+                            component_type=component_type,
+                            suppressed=suppressed,
+                        )
                     )
-
-                    components.append(component)
 
                 except Exception as e:
                     print("Could not process component:")
@@ -144,13 +127,11 @@ class SolidWorksAssembly:
             print(e)
             return []
 
-
-
-
-    def get_unique_part_quantities(self):
-        
+    def get_unique_part_quantities(self, components=None):
         """Group active part instances by their source file."""
-        components = self.get_components()
+
+        if components is None:
+            components = self.get_components()
 
         grouped = {}
 
@@ -173,8 +154,6 @@ class SolidWorksAssembly:
             grouped[key]["quantity"] += 1
 
         return list(grouped.values())
-
-
 
 
 def find_assemblies(input_folder):
