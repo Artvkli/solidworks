@@ -9,24 +9,11 @@ class SheetMetalDetector:
     def open_part(self, part_path):
         """Open a SolidWorks part."""
 
-        errors = win32com.client.VARIANT(
-            pythoncom.VT_BYREF | pythoncom.VT_I4,
-            0
-        )
+        errors = win32com.client.VARIANT(pythoncom.VT_BYREF | pythoncom.VT_I4, 0)
 
-        warnings = win32com.client.VARIANT(
-            pythoncom.VT_BYREF | pythoncom.VT_I4,
-            0
-        )
+        warnings = win32com.client.VARIANT(pythoncom.VT_BYREF | pythoncom.VT_I4, 0)
 
-        model = self.sw_app.OpenDoc6(
-            str(part_path),
-            1,
-            0,
-            "",
-            errors,
-            warnings
-        )
+        model = self.sw_app.OpenDoc6(str(part_path), 1, 0, "", errors, warnings)
 
         return model
 
@@ -36,7 +23,6 @@ class SheetMetalDetector:
         feature = model.FirstFeature
 
         while feature is not None:
-
             try:
                 feature_type = feature.GetTypeName2
 
@@ -53,9 +39,8 @@ class SheetMetalDetector:
                 break
 
         return None
-    
-    def find_flat_pattern_feature(self, model):
 
+    def find_flat_pattern_feature(self, model):
         """Find the Flat Pattern feature in a part."""
         feature = model.FirstFeature
 
@@ -76,6 +61,29 @@ class SheetMetalDetector:
                 break
 
         return None
+
+    def activate_flat_pattern(self, model):
+        """Activate the Flat Pattern feature."""
+        flat_pattern = self.find_flat_pattern_feature(model)
+
+        if flat_pattern is None:
+            print("Flat Pattern feature not found.")
+            return False
+
+        try:
+            success = flat_pattern.SetSuppression2(1, 2, None)
+
+            if success:
+                print("Flat Pattern activated.")
+                return True
+
+            print("Could not activate Flat Pattern.")
+            return False
+
+        except Exception as e:
+            print("Error while activating Flat Pattern:")
+            print(e)
+            return False
 
     def is_sheet_metal(self, component):
         """Check whether a component is a Sheet Metal part."""

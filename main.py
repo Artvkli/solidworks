@@ -110,6 +110,13 @@ def main():
             flat_pattern = detector.find_flat_pattern_feature(model)
             if flat_pattern is not None:
                 print(f"[FLAT PATTERN FOUND] {component.name}")
+
+                activated = detector.activate_flat_pattern(model)
+
+                if activated:
+                    print(f"[FLAT PATTERN ACTIVE] {component.name}")
+                else:
+                    print(f"[FLAT PATTERN ACTIVATION FAILED] {component.name}")
             else:
                 print(f"[NO FLAT PATTERN] {component.name}")
             sheet_metal_parts.append(component)
