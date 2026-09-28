@@ -3,30 +3,39 @@ from pathlib import Path
 from solidworks.connection import SolidWorksConnection
 from solidworks.assembly import SolidWorksAssembly, find_assemblies
 from solidworks.sheet_metal import SheetMetalDetector
-from solidworks.autocad import AutoCADExporter
+
+
+LINE = "=" * 60
+THIN_LINE = "-" * 60
+
+
+# ---------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------
+
+
+def print_header(title):
+    print()
+    print(LINE)
+    print(title)
+    print(LINE)
 
 
 def format_thickness(thickness_mm):
-    """1.500 -> 1.5mm | 2.000 -> 2mm | 15.000 -> 15mm"""
+    """Format thickness for grouping/output filename."""
 
-    value = f"{thickness_mm:.3f}".rstrip("0").rstrip(".")
-    return f"{value}mm"
+    if thickness_mm is None:
+        return None
+
+    if abs(thickness_mm - round(thickness_mm)) < 0.0001:
+        return f"{int(round(thickness_mm))}mm"
+
+    text = f"{thickness_mm:.3f}".rstrip("0").rstrip(".")
+    return f"{text}mm"
 
 
-def header(title):
-    print()
-    print("=" * 60)
-    print(title)
-    print("=" * 60)
-
-
-def main():
-
-    header("SolidWorks Automation")
-
-    # --------------------------------------------------
-    # Project paths
-    # --------------------------------------------------
+def setup_folders():
+    """Create and return (input, output, temp) folders."""
 
     project_folder = Path(__file__).parent
 
@@ -34,35 +43,41 @@ def main():
     output_folder = project_folder / "output"
     temp_folder = output_folder / "_temp"
 
-    input_folder.mkdir(exist_ok=True)
-    output_folder.mkdir(exist_ok=True)
-    temp_folder.mkdir(exist_ok=True)
+    for folder in (input_folder, output_folder, temp_folder):
+        folder.mkdir(exist_ok=True)
 
-    # --------------------------------------------------
-    # Connect to SolidWorks
-    # --------------------------------------------------
+    return input_folder, output_folder, temp_folder
+
+
+# ---------------------------------------------------------
+# Steps
+# ---------------------------------------------------------
+
+
+def connect_to_solidworks():
+    print()
+    print("Connecting to SolidWorks...")
 
     connection = SolidWorksConnection()
 
     if not connection.connect():
         print()
         print("Program stopped.")
-        return
+        return None
 
-    sw_app = connection.get_application()
+    return connection.get_application()
 
-    # --------------------------------------------------
-    # Find assemblies
-    # --------------------------------------------------
 
+def select_assembly(input_folder):
     assemblies = find_assemblies(input_folder)
 
     if not assemblies:
         print()
         print("No SLDASM files found.")
+        print()
         print("Please put a SolidWorks Assembly inside:")
         print(input_folder)
-        return
+        return None
 
     print()
     print("Assemblies found:")
@@ -70,209 +85,256 @@ def main():
     for index, assembly_file in enumerate(assemblies, start=1):
         print(f"{index}. {assembly_file.name}")
 
-    # --------------------------------------------------
-    # Open first assembly
-    # --------------------------------------------------
-
+    # Select first assembly
     assembly_file = assemblies[0]
 
-    assembly = SolidWorksAssembly(sw_app)
+    print()
+    print("Selected assembly:")
+    print(assembly_file)
 
-    if not assembly.open(assembly_file):
-        return
+    return assembly_file
 
-    # --------------------------------------------------
-    # Components
-    # --------------------------------------------------
 
-    components = assembly.get_components()
+def print_component_summary(components):
+    part_count = 0
+    assembly_count = 0
+    suppressed_count = 0
+    lightweight_count = 0
 
-    header("Component Types")
+    for component in components:
+        if component.is_part:
+            part_count += 1
+        elif component.is_assembly:
+            assembly_count += 1
 
-    part_count = sum(1 for c in components if c.is_part)
-    assembly_count = sum(1 for c in components if c.is_assembly)
+        if getattr(component, "suppressed", False):
+            suppressed_count += 1
 
-    print("Total components:", len(components))
-    print("PART:", part_count)
-    print("ASSEMBLY:", assembly_count)
+        if getattr(component, "lightweight", False):
+            lightweight_count += 1
 
-    # --------------------------------------------------
-    # Collect unique Sheet Metal parts
-    # --------------------------------------------------
+    print_header("Component Summary")
+    print()
+    print("Total components :", len(components))
+    print("PART             :", part_count)
+    print("ASSEMBLY         :", assembly_count)
+    print("SUPPRESSED       :", suppressed_count)
+    print("LIGHTWEIGHT      :", lightweight_count)
 
-    detector = SheetMetalDetector(sw_app)
 
-    header("Collecting Sheet Metal Parts")
+def find_representative(components, part_path):
+    """Find one actual component instance for the given part file."""
 
-    components_by_path = {
-        str(c.path).lower(): c for c in components if c.is_part and not c.suppressed
-    }
+    target = str(part_path).lower()
 
-    sheet_metal_data = []
+    for component in components:
+        if component.is_part and str(component.path).lower() == target:
+            return component
 
-    for item in assembly.get_unique_part_quantities(components):
-        component = components_by_path.get(str(item["path"]).lower())
+    return None
 
-        if component is None:
+
+def print_part_info(representative, checked, total, part_name, part_path, quantity):
+    print()
+    print(THIN_LINE)
+    print(f"Checking {checked}/{total}")
+    print("Part:", part_name)
+    print("Path:", part_path)
+    print("QTY :", quantity)
+    print("Suppression:", getattr(representative, "suppression", None))
+    print("Suppressed:", getattr(representative, "suppressed", False))
+    print("Lightweight:", getattr(representative, "lightweight", False))
+    print("Configuration:", getattr(representative, "configuration", None))
+
+
+def collect_sheet_metal_parts(detector, components, unique_parts):
+    print_header("Collecting Sheet Metal Parts")
+
+    sheet_metal_parts = []
+
+    for checked, item in enumerate(unique_parts, start=1):
+        part_path = Path(item["path"])
+        part_name = item["name"]
+        quantity = item["quantity"]
+
+        representative = find_representative(components, part_path)
+
+        if representative is None:
+            print()
+            print("[SKIP] Could not find component instance:")
+            print(part_name)
             continue
 
-        thickness = detector.get_thickness(component)
+        print_part_info(
+            representative,
+            checked,
+            len(unique_parts),
+            part_name,
+            part_path,
+            quantity,
+        )
+
+        # Detect Sheet Metal
+        try:
+            is_sheet_metal = detector.is_sheet_metal(representative)
+        except Exception as e:
+            print()
+            print("[ERROR] Sheet Metal detection failed:")
+            print(e)
+            continue
+
+        if not is_sheet_metal:
+            print("Result: NOT Sheet Metal")
+            continue
+
+        print("Result: >>> SHEET METAL <<<")
+
+        # Read Thickness
+        try:
+            thickness = detector.get_thickness(representative)
+        except Exception as e:
+            print()
+            print("[ERROR] Thickness detection failed:")
+            print(e)
+            thickness = None
 
         if thickness is None:
-            print(f"{item['name']} | not sheet metal (skipped)")
+            print("Thickness: FAILED")
             continue
 
-        thickness_mm = thickness * 1000
+        thickness_mm = thickness * 1000.0
+        thickness_name = format_thickness(thickness_mm)
 
-        sheet_metal_data.append(
+        print("Thickness:", f"{thickness_mm:.3f} mm")
+        print("Group:", thickness_name)
+
+        sheet_metal_parts.append(
             {
-                "name": item["name"],
-                "path": item["path"],
-                "quantity": item["quantity"],
-                "thickness": thickness_mm,
+                "name": part_name,
+                "path": part_path,
+                "quantity": quantity,
+                "thickness": thickness,
+                "thickness_mm": thickness_mm,
+                "thickness_name": thickness_name,
+                "component": representative,
             }
         )
 
-        print(f"{item['name']} | {thickness_mm:.3f} mm | QTY: {item['quantity']}")
+    return sheet_metal_parts
 
-    if not sheet_metal_data:
-        print()
-        print("No Sheet Metal parts found.")
-        return
 
-    # --------------------------------------------------
-    # Group by thickness
-    # --------------------------------------------------
+def print_sheet_metal_summary(sheet_metal_parts):
+    print()
+    print_header("Sheet Metal Summary")
 
-    groups = {}
+    print()
+    print("Sheet Metal unique parts:", len(sheet_metal_parts))
 
-    for item in sheet_metal_data:
-        key = round(item["thickness"], 3)
-        groups.setdefault(key, []).append(item)
+    total_instances = 0
 
-    header("Sheet Metal Groups")
-
-    for thickness, parts in sorted(groups.items()):
-        print()
-        print(f"[{format_thickness(thickness)}]")
-
-        for part in parts:
-            print(f"  {part['name']} | QTY: {part['quantity']}")
-
-    # --------------------------------------------------
-    # Export temporary DWGs
-    # --------------------------------------------------
-
-    header("Exporting Flat Patterns")
-
-    for thickness, parts in sorted(groups.items()):
-        thickness_name = format_thickness(thickness)
-        thickness_folder = temp_folder / thickness_name
-        thickness_folder.mkdir(parents=True, exist_ok=True)
+    for part in sheet_metal_parts:
+        total_instances += part["quantity"]
 
         print()
-        print("-" * 60)
-        print(f"Thickness Group: {thickness_name}")
-        print("-" * 60)
-
-        for part in parts:
-            print()
-            print("Part:", part["name"])
-            print("QTY:", part["quantity"])
-
-            model = detector.open_part(part["path"])
-
-            if model is None:
-                print("[FAILED] Could not open part.")
-                continue
-
-            try:
-                if detector.find_flat_pattern_feature(model) is None:
-                    print("[NO FLAT PATTERN]")
-                    continue
-
-                print("[FLAT PATTERN FOUND]")
-
-                if not detector.activate_flat_pattern(model):
-                    print("[FLAT PATTERN ACTIVATION FAILED]")
-                    continue
-
-                print("[FLAT PATTERN ACTIVE]")
-
-                output_file = thickness_folder / f"{part['name']}.dwg"
-
-                if detector.export_dxf(model, output_file):
-                    print("[EXPORT SUCCESS]")
-                    print(output_file)
-                else:
-                    print("[EXPORT FAILED]")
-
-                detector.deactivate_flat_pattern(model)
-
-            finally:
-                detector.close_part(model)
-
-    # --------------------------------------------------
-    # Connect to AutoCAD
-    # --------------------------------------------------
-
-    header("Creating Final DWG Files")
-
-    autocad = AutoCADExporter()
-
-    if not autocad.connect():
-        print()
-        print("AutoCAD connection failed.")
-        print("Temporary DWGs were created, but final DWGs were not created.")
-        return
-
-    for thickness, parts in sorted(groups.items()):
-        thickness_name = format_thickness(thickness)
-        thickness_folder = temp_folder / thickness_name
-        final_dwg = output_folder / f"{thickness_name}.dwg"
-
-        print()
-        print("-" * 60)
-        print(f"Creating: {final_dwg}")
-        print("-" * 60)
-
-        final_parts = []
-
-        for part in parts:
-            temp_dwg = thickness_folder / f"{part['name']}.dwg"
-
-            if not temp_dwg.exists():
-                print("[SKIP] Temporary DWG not found:")
-                print(temp_dwg)
-                continue
-
-            final_parts.append(
-                {
-                    "name": part["name"],
-                    "dwg_path": temp_dwg,
-                    "quantity": part["quantity"],
-                }
-            )
-
-        if not final_parts:
-            print("[SKIP] No exported parts.")
-            continue
-
-        success = autocad.create_thickness_dwg(
-            final_dwg,
-            final_parts,
-            spacing=100.0,
+        print(
+            f"{part['name']} | QTY={part['quantity']} | {part['thickness_mm']:.3f} mm"
         )
 
-        print()
-        if success:
-            print("[FINAL DWG SUCCESS]")
-            print(final_dwg)
-        else:
-            print("[FINAL DWG FAILED]")
-            print(thickness_name)
+    print()
+    print("Total Sheet Metal instances:", total_instances)
 
-    header("Program finished.")
+
+def group_by_thickness(sheet_metal_parts):
+    grouped = {}
+
+    for part in sheet_metal_parts:
+        grouped.setdefault(part["thickness_name"], []).append(part)
+
+    print_header("Thickness Groups")
+
+    for thickness_name, parts in grouped.items():
+        print()
+        print(thickness_name)
+
+        for part in parts:
+            print(f"  - {part['name']} | QTY={part['quantity']}")
+
+    return grouped
+
+
+# ---------------------------------------------------------
+# Main
+# ---------------------------------------------------------
+
+
+def main():
+    print(LINE)
+    print("SolidWorks Sheet Metal Automation")
+    print(LINE)
+
+    input_folder, output_folder, temp_folder = setup_folders()
+
+    sw_app = connect_to_solidworks()
+    if sw_app is None:
+        return
+
+    assembly_file = select_assembly(input_folder)
+    if assembly_file is None:
+        return
+
+    # Open Assembly
+    assembly = SolidWorksAssembly(sw_app)
+
+    if not assembly.open(assembly_file):
+        print()
+        print("Could not open assembly.")
+        return
+
+    # Read Components
+    components = assembly.get_components()
+
+    if not components:
+        print()
+        print("No components found in assembly.")
+        return
+
+    print_component_summary(components)
+
+    # Group unique PART files
+    unique_parts = assembly.get_unique_part_quantities(components)
+
+    print_header("Unique PART Files")
+    print()
+    print("Unique parts:", len(unique_parts))
+
+    # Sheet Metal Detection
+    detector = SheetMetalDetector(sw_app)
+    sheet_metal_parts = collect_sheet_metal_parts(detector, components, unique_parts)
+
+    if not sheet_metal_parts:
+        print()
+        print_header("Sheet Metal Summary")
+        print()
+        print("No Sheet Metal parts found.")
+        print()
+        print("Important:")
+        print("The assembly was scanned successfully,")
+        print("but no detected Sheet Metal feature was returned.")
+        return
+
+    print_sheet_metal_summary(sheet_metal_parts)
+    grouped_by_thickness = group_by_thickness(sheet_metal_parts)
+
+    # Current stage finished
+    print_header("Sheet Metal Detection Finished")
+
+    print()
+    print("Detected parts:", len(sheet_metal_parts))
+    print("Thickness groups:", len(grouped_by_thickness))
+
+    print()
+    print("Next stage:")
+    print("Flat Pattern detection and DWG export.")
 
 
 if __name__ == "__main__":
