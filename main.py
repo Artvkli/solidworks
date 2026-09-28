@@ -101,385 +101,418 @@ def main():
 
     components = assembly.get_components()
 
-    print()
-    print("Total components:", len(components))
-
-    # --------------------------------------------------
-    # Sheet Metal Detector
-    # --------------------------------------------------
-
-    detector = SheetMetalDetector(sw_app)
 
     print()
     print("=" * 60)
-    print("Collecting Sheet Metal Parts")
+    print("Component Types")
     print("=" * 60)
 
-    sheet_metal_data = []
+    part_count = 0
+    assembly_count = 0
 
-    # --------------------------------------------------
-    # Collect unique Sheet Metal parts
-    # --------------------------------------------------
+    for component in components:
 
-    for item in assembly.get_unique_part_quantities():
+        if component.is_part:
+            part_count += 1
 
-        component = next(
-            (
-                c
-                for c in components
-                if c.is_part
-                and not c.suppressed
-                and str(c.path).lower()
-                == str(item["path"]).lower()
-            ),
-            None,
-        )
+        elif component.is_assembly:
+            assembly_count += 1
 
-        if component is None:
-            continue
+    print("PART:", part_count)
+    print("ASSEMBLY:", assembly_count)
 
-        # ----------------------------------------------
-        # Get thickness
-        # ----------------------------------------------
+    print()
+    print("First 20 components:")
 
-        thickness = detector.get_thickness(component)
-
-        if thickness is None:
-            continue
-
-        thickness_mm = thickness * 1000
-
-        data = {
-            "name": item["name"],
-            "path": item["path"],
-            "quantity": item["quantity"],
-            "thickness": thickness_mm,
-        }
-
-        sheet_metal_data.append(data)
+    for component in components[:20]:
 
         print(
-            f"{item['name']} | "
-            f"{thickness_mm:.3f} mm | "
-            f"QTY: {item['quantity']}"
+            f"{component.name} | "
+            f"{component.component_type} | "
+            f"suppressed={component.suppressed}"
         )
 
-    # --------------------------------------------------
-    # Check Sheet Metal
-    # --------------------------------------------------
 
-    if not sheet_metal_data:
 
-        print()
-        print("No Sheet Metal parts found.")
+#     print()
+#     print("Total components:", len(components))
 
-        return
+#     # --------------------------------------------------
+#     # Sheet Metal Detector
+#     # --------------------------------------------------
 
-    # --------------------------------------------------
-    # Group by thickness
-    # --------------------------------------------------
+#     detector = SheetMetalDetector(sw_app)
 
-    groups = {}
+#     print()
+#     print("=" * 60)
+#     print("Collecting Sheet Metal Parts")
+#     print("=" * 60)
 
-    for item in sheet_metal_data:
+#     sheet_metal_data = []
 
-        thickness_key = round(
-            item["thickness"],
-            3
-        )
+#     # --------------------------------------------------
+#     # Collect unique Sheet Metal parts
+#     # --------------------------------------------------
 
-        if thickness_key not in groups:
-            groups[thickness_key] = []
+#     for item in assembly.get_unique_part_quantities():
 
-        groups[thickness_key].append(item)
+#         component = next(
+#             (
+#                 c
+#                 for c in components
+#                 if c.is_part
+#                 and not c.suppressed
+#                 and str(c.path).lower()
+#                 == str(item["path"]).lower()
+#             ),
+#             None,
+#         )
 
-    # --------------------------------------------------
-    # Show groups
-    # --------------------------------------------------
+#         if component is None:
+#             continue
 
-    print()
-    print("=" * 60)
-    print("Sheet Metal Groups")
-    print("=" * 60)
+#         # ----------------------------------------------
+#         # Get thickness
+#         # ----------------------------------------------
 
-    for thickness, parts in sorted(
-        groups.items()
-    ):
+#         thickness = detector.get_thickness(component)
 
-        thickness_name = format_thickness(
-            thickness
-        )
+#         if thickness is None:
+#             continue
 
-        print()
-        print(f"[{thickness_name}]")
+#         thickness_mm = thickness * 1000
 
-        for part in parts:
+#         data = {
+#             "name": item["name"],
+#             "path": item["path"],
+#             "quantity": item["quantity"],
+#             "thickness": thickness_mm,
+#         }
 
-            print(
-                f"  {part['name']} | "
-                f"QTY: {part['quantity']}"
-            )
+#         sheet_metal_data.append(data)
 
-    # --------------------------------------------------
-    # Export temporary DWGs
-    # --------------------------------------------------
+#         print(
+#             f"{item['name']} | "
+#             f"{thickness_mm:.3f} mm | "
+#             f"QTY: {item['quantity']}"
+#         )
 
-    print()
-    print("=" * 60)
-    print("Exporting Flat Patterns")
-    print("=" * 60)
+#     # --------------------------------------------------
+#     # Check Sheet Metal
+#     # --------------------------------------------------
 
-    for thickness, parts in sorted(
-        groups.items()
-    ):
+#     if not sheet_metal_data:
 
-        thickness_name = format_thickness(
-            thickness
-        )
+#         print()
+#         print("No Sheet Metal parts found.")
 
-        thickness_folder = (
-            temp_folder / thickness_name
-        )
+#         return
 
-        thickness_folder.mkdir(
-            parents=True,
-            exist_ok=True
-        )
+#     # --------------------------------------------------
+#     # Group by thickness
+#     # --------------------------------------------------
 
-        print()
-        print("-" * 60)
-        print(
-            f"Thickness Group: "
-            f"{thickness_name}"
-        )
-        print("-" * 60)
+#     groups = {}
 
-        for part in parts:
+#     for item in sheet_metal_data:
 
-            print()
-            print("Part:", part["name"])
-            print("QTY:", part["quantity"])
+#         thickness_key = round(
+#             item["thickness"],
+#             3
+#         )
 
-            # ------------------------------------------
-            # Open part
-            # ------------------------------------------
+#         if thickness_key not in groups:
+#             groups[thickness_key] = []
 
-            model = detector.open_part(
-                part["path"]
-            )
+#         groups[thickness_key].append(item)
 
-            if model is None:
+#     # --------------------------------------------------
+#     # Show groups
+#     # --------------------------------------------------
 
-                print(
-                    "[FAILED] "
-                    "Could not open part."
-                )
+#     print()
+#     print("=" * 60)
+#     print("Sheet Metal Groups")
+#     print("=" * 60)
 
-                continue
+#     for thickness, parts in sorted(
+#         groups.items()
+#     ):
 
-            # ------------------------------------------
-            # Find Flat Pattern
-            # ------------------------------------------
+#         thickness_name = format_thickness(
+#             thickness
+#         )
 
-            flat_pattern = (
-                detector.find_flat_pattern_feature(
-                    model
-                )
-            )
+#         print()
+#         print(f"[{thickness_name}]")
 
-            if flat_pattern is None:
+#         for part in parts:
 
-                print(
-                    "[NO FLAT PATTERN]"
-                )
+#             print(
+#                 f"  {part['name']} | "
+#                 f"QTY: {part['quantity']}"
+#             )
 
-                continue
+#     # --------------------------------------------------
+#     # Export temporary DWGs
+#     # --------------------------------------------------
 
-            print(
-                "[FLAT PATTERN FOUND]"
-            )
+#     print()
+#     print("=" * 60)
+#     print("Exporting Flat Patterns")
+#     print("=" * 60)
 
-            # ------------------------------------------
-            # Activate Flat Pattern
-            # ------------------------------------------
+#     for thickness, parts in sorted(
+#         groups.items()
+#     ):
 
-            activated = (
-                detector.activate_flat_pattern(
-                    model
-                )
-            )
+#         thickness_name = format_thickness(
+#             thickness
+#         )
 
-            if not activated:
+#         thickness_folder = (
+#             temp_folder / thickness_name
+#         )
 
-                print(
-                    "[FLAT PATTERN "
-                    "ACTIVATION FAILED]"
-                )
+#         thickness_folder.mkdir(
+#             parents=True,
+#             exist_ok=True
+#         )
 
-                continue
+#         print()
+#         print("-" * 60)
+#         print(
+#             f"Thickness Group: "
+#             f"{thickness_name}"
+#         )
+#         print("-" * 60)
 
-            print(
-                "[FLAT PATTERN ACTIVE]"
-            )
+#         for part in parts:
 
-            # ------------------------------------------
-            # Temporary DWG
-            # ------------------------------------------
+#             print()
+#             print("Part:", part["name"])
+#             print("QTY:", part["quantity"])
 
-            output_file = (
-                thickness_folder
-                / f"{part['name']}.dwg"
-            )
+#             # ------------------------------------------
+#             # Open part
+#             # ------------------------------------------
 
-            # ------------------------------------------
-            # Export
-            # ------------------------------------------
+#             model = detector.open_part(
+#                 part["path"]
+#             )
 
-            exported = detector.export_dxf(
-                model,
-                output_file
-            )
+#             if model is None:
 
-            if exported:
+#                 print(
+#                     "[FAILED] "
+#                     "Could not open part."
+#                 )
 
-                print(
-                    "[EXPORT SUCCESS]"
-                )
-                print(
-                    output_file
-                )
+#                 continue
 
-            else:
+#             # ------------------------------------------
+#             # Find Flat Pattern
+#             # ------------------------------------------
 
-                print(
-                    "[EXPORT FAILED]"
-                )
+#             flat_pattern = (
+#                 detector.find_flat_pattern_feature(
+#                     model
+#                 )
+#             )
 
-    # --------------------------------------------------
-    # Connect to AutoCAD
-    # --------------------------------------------------
+#             if flat_pattern is None:
 
-    print()
-    print("=" * 60)
-    print("Creating Final DWG Files")
-    print("=" * 60)
+#                 print(
+#                     "[NO FLAT PATTERN]"
+#                 )
 
-    autocad = AutoCADExporter()
+#                 continue
 
-    if not autocad.connect():
+#             print(
+#                 "[FLAT PATTERN FOUND]"
+#             )
 
-        print()
-        print(
-            "AutoCAD connection failed."
-        )
+#             # ------------------------------------------
+#             # Activate Flat Pattern
+#             # ------------------------------------------
 
-        print(
-            "Temporary DWGs were created, "
-            "but final DWGs were not created."
-        )
+#             activated = (
+#                 detector.activate_flat_pattern(
+#                     model
+#                 )
+#             )
 
-        return
+#             if not activated:
 
-    # --------------------------------------------------
-    # Create final DWG for each thickness
-    # --------------------------------------------------
+#                 print(
+#                     "[FLAT PATTERN "
+#                     "ACTIVATION FAILED]"
+#                 )
 
-    for thickness, parts in sorted(
-        groups.items()
-    ):
+#                 continue
 
-        thickness_name = format_thickness(
-            thickness
-        )
+#             print(
+#                 "[FLAT PATTERN ACTIVE]"
+#             )
 
-        thickness_folder = (
-            temp_folder / thickness_name
-        )
+#             # ------------------------------------------
+#             # Temporary DWG
+#             # ------------------------------------------
 
-        final_dwg = (
-            output_folder
-            / f"{thickness_name}.dwg"
-        )
+#             output_file = (
+#                 thickness_folder
+#                 / f"{part['name']}.dwg"
+#             )
 
-        print()
-        print("-" * 60)
-        print(
-            f"Creating: {final_dwg}"
-        )
-        print("-" * 60)
+#             # ------------------------------------------
+#             # Export
+#             # ------------------------------------------
 
-        final_parts = []
+#             exported = detector.export_dxf(
+#                 model,
+#                 output_file
+#             )
 
-        for part in parts:
+#             if exported:
 
-            temp_dwg = (
-                thickness_folder
-                / f"{part['name']}.dwg"
-            )
+#                 print(
+#                     "[EXPORT SUCCESS]"
+#                 )
+#                 print(
+#                     output_file
+#                 )
 
-            if not temp_dwg.exists():
+#             else:
 
-                print(
-                    "[SKIP] Temporary DWG "
-                    "not found:"
-                )
+#                 print(
+#                     "[EXPORT FAILED]"
+#                 )
 
-                print(temp_dwg)
+#     # --------------------------------------------------
+#     # Connect to AutoCAD
+#     # --------------------------------------------------
 
-                continue
+#     print()
+#     print("=" * 60)
+#     print("Creating Final DWG Files")
+#     print("=" * 60)
 
-            final_parts.append(
-                {
-                    "name": part["name"],
-                    "dwg_path": temp_dwg,
-                    "quantity": part["quantity"],
-                }
-            )
+#     autocad = AutoCADExporter()
 
-        if not final_parts:
+#     if not autocad.connect():
 
-            print(
-                "[SKIP] No exported parts."
-            )
+#         print()
+#         print(
+#             "AutoCAD connection failed."
+#         )
 
-            continue
+#         print(
+#             "Temporary DWGs were created, "
+#             "but final DWGs were not created."
+#         )
 
-        success = (
-            autocad.create_thickness_dwg(
-                final_dwg,
-                final_parts,
-                spacing=100.0
-            )
-        )
+#         return
 
-        if success:
+#     # --------------------------------------------------
+#     # Create final DWG for each thickness
+#     # --------------------------------------------------
 
-            print()
-            print(
-                "[FINAL DWG SUCCESS]"
-            )
+#     for thickness, parts in sorted(
+#         groups.items()
+#     ):
 
-            print(final_dwg)
+#         thickness_name = format_thickness(
+#             thickness
+#         )
 
-        else:
+#         thickness_folder = (
+#             temp_folder / thickness_name
+#         )
 
-            print()
-            print(
-                "[FINAL DWG FAILED]"
-            )
+#         final_dwg = (
+#             output_folder
+#             / f"{thickness_name}.dwg"
+#         )
 
-            print(thickness_name)
+#         print()
+#         print("-" * 60)
+#         print(
+#             f"Creating: {final_dwg}"
+#         )
+#         print("-" * 60)
 
-    # --------------------------------------------------
-    # Final
-    # --------------------------------------------------
+#         final_parts = []
 
-    print()
-    print("=" * 60)
-    print("Program finished.")
-    print("=" * 60)
+#         for part in parts:
 
+#             temp_dwg = (
+#                 thickness_folder
+#                 / f"{part['name']}.dwg"
+#             )
 
-if __name__ == "__main__":
-    main()
+#             if not temp_dwg.exists():
+
+#                 print(
+#                     "[SKIP] Temporary DWG "
+#                     "not found:"
+#                 )
+
+#                 print(temp_dwg)
+
+#                 continue
+
+#             final_parts.append(
+#                 {
+#                     "name": part["name"],
+#                     "dwg_path": temp_dwg,
+#                     "quantity": part["quantity"],
+#                 }
+#             )
+
+#         if not final_parts:
+
+#             print(
+#                 "[SKIP] No exported parts."
+#             )
+
+#             continue
+
+#         success = (
+#             autocad.create_thickness_dwg(
+#                 final_dwg,
+#                 final_parts,
+#                 spacing=100.0
+#             )
+#         )
+
+#         if success:
+
+#             print()
+#             print(
+#                 "[FINAL DWG SUCCESS]"
+#             )
+
+#             print(final_dwg)
+
+#         else:
+
+#             print()
+#             print(
+#                 "[FINAL DWG FAILED]"
+#             )
+
+#             print(thickness_name)
+
+#     # --------------------------------------------------
+#     # Final
+#     # --------------------------------------------------
+
+#     print()
+#     print("=" * 60)
+#     print("Program finished.")
+#     print("=" * 60)
+
+
+# if __name__ == "__main__":
+#     main()
 
