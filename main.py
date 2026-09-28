@@ -4,12 +4,12 @@ from pathlib import Path
 import pythoncom
 import win32com.client
 
-from assembly import (
+from solidworks.assembly import (
     SolidWorksAssembly,
     find_assemblies,
 )
 
-from sheet_metal import (
+from solidworks.sheet_metal import (
     SheetMetalDetector,
 )
 
