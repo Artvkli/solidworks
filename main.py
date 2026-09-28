@@ -94,20 +94,7 @@ def main():
         print("Path:", component.path)
         print("Suppressed:", component.suppressed)
 
-    part_count = sum(
-        1 for component in components
-        if component.is_part
-    )
-
-    assembly_count = sum(
-        1 for component in components
-        if component.is_assembly
-    )
-
-    print()
-    print("Summary:")
-    print("Parts:", part_count)
-    print("Sub-Assemblies:", assembly_count)
+    
     
 if __name__ == "__main__":
     main()
