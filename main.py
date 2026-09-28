@@ -2,7 +2,7 @@ from pathlib import Path
 
 from solidworks.connection import SolidWorksConnection
 from solidworks.assembly import SolidWorksAssembly, find_assemblies
-
+from solidworks.sheet_metal import SheetMetalDetector
 
 def main():
 
@@ -82,47 +82,38 @@ def main():
     # ----------------------------------------
 
     components = assembly.get_components()
+    detector = SheetMetalDetector(sw_app)
 
     print()
-    print("Number of components:", len(components))
-    print()
+    print("Sheet Metal Detection")
+    print("=" * 50)
+
+    sheet_metal_parts = []
+    non_sheet_metal_parts = []
 
     for component in components:
-        print("-" * 40)
-        print("Name:", component.name)
-        print("Type:", component.component_type)
-        print("Path:", component.path)
-        print("Suppressed:", component.suppressed)
 
+        if not component.is_part:
+            continue
 
+        if component.suppressed:
+            continue
 
-    active_parts = [
-        component
-        for component in components
-        if component.is_part and not component.suppressed
-    ]
+        is_sheet_metal = detector.is_sheet_metal(component)
 
-    suppressed_parts = [
-        component
-        for component in components
-        if component.is_part and component.suppressed
-    ]
-
-    sub_assemblies = [
-        component
-        for component in components
-        if component.is_assembly
-    ]
+        if is_sheet_metal:
+            sheet_metal_parts.append(component)
+            print(f"[SHEET METAL] {component.name}")
+        else:
+            non_sheet_metal_parts.append(component)
+            print(f"[NORMAL PART] {component.name}")
 
     print()
-    print("Summary:")
-    print("Total components:", len(components))
-    print("Active parts:", len(active_parts))
-    print("Suppressed parts:", len(suppressed_parts))
-    print("Sub-assemblies:", len(sub_assemblies))
+    print("Sheet Metal Summary:")
+    print("Sheet Metal parts:", len(sheet_metal_parts))
+    print("Normal parts:", len(non_sheet_metal_parts))
+    
 
-    print()
-    print("Program finished.")  
     
     
 if __name__ == "__main__":
