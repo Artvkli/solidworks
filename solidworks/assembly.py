@@ -66,7 +66,7 @@ class SolidWorksAssembly:
 
             print()
             print("Assembly opened successfully!")
-            print("Title:", self.model.GetTitle())
+            print("Title:", self.model.GetTitle)
 
             print("Errors:", errors.value)
             print("Warnings:", warnings.value)
