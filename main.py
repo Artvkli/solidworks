@@ -95,7 +95,7 @@ def main():
 
             print("-" * 40)
             print("Name:", component.Name2)
-            print("Path:", component.GetPathName())
+            print("Path:", component.GetPathName)
 
         except Exception as e:
 

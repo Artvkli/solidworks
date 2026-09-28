@@ -119,6 +119,7 @@ def find_assemblies(input_folder):
         for file in input_folder.iterdir()
         if file.is_file()
         and file.suffix.lower() == ".sldasm"
+        and not file.name.startswith("~$")
     ]
 
     return sorted(assemblies)
