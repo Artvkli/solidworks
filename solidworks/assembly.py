@@ -4,74 +4,136 @@ from pathlib import Path
 import pythoncom
 import win32com.client
 
-from solidworks.component import Component
-from solidworks.utils import com_value
+
+LINE = "=" * 60
+
+SW_DOC_PART = 1
+SW_DOC_ASSEMBLY = 2
+
+
+class Component:
+
+    def __init__(
+        self,
+        name,
+        path,
+        component_type,
+        sw_component=None,
+    ):
+        self.name = name
+        self.path = Path(path)
+        self.component_type = component_type
+        self.sw_component = sw_component
+
+        self.suppression = None
+        self.lightweight = False
+        self.configuration = None
+
+    @property
+    def is_part(self):
+        return self.component_type == "PART"
+
+    @property
+    def is_assembly(self):
+        return self.component_type == "ASSEMBLY"
+
+    @property
+    def suppressed(self):
+        return self.suppression == 0
 
 
 class SolidWorksAssembly:
 
     def __init__(self, sw_app):
+
         self.sw_app = sw_app
         self.model = None
 
-    # --------------------------------------------------
-    # Open Assembly
-    # --------------------------------------------------
+    # =====================================================
+    # COM HELPERS
+    # =====================================================
+
+    def _get(self, obj, name, default=None):
+
+        if obj is None:
+            return default
+
+        try:
+
+            value = getattr(obj, name)
+
+            if callable(value):
+
+                try:
+                    return value()
+
+                except TypeError:
+                    return value
+
+            return value
+
+        except Exception:
+            return default
+
+    # =====================================================
+    # OPEN ASSEMBLY
+    # =====================================================
 
     def open(self, file_path):
-        """Open a SolidWorks assembly."""
 
         file_path = Path(file_path)
 
         if not file_path.exists():
-            print(f"File not found: {file_path}")
+
+            print(
+                "File not found:",
+                file_path
+            )
+
             return False
 
         if file_path.suffix.lower() != ".sldasm":
+
             print(
-                "Selected file is not a SolidWorks Assembly."
+                "Not an SLDASM file:",
+                file_path
             )
+
             return False
 
         print()
-        print("Opening assembly:")
-        print(file_path)
+        print(LINE)
+        print("OPEN ASSEMBLY")
+        print(LINE)
 
         try:
 
-            # ------------------------------------------
-            # Check if already open
-            # ------------------------------------------
-
-            existing_model = None
+            # ---------------------------------------------
+            # Already open?
+            # ---------------------------------------------
 
             try:
-                existing_model = (
-                    self.sw_app.GetOpenDocumentByName(
+
+                model = (
+                    self.sw_app
+                    .GetOpenDocumentByName(
                         str(file_path)
                     )
                 )
+
             except Exception:
-                existing_model = None
 
-            if existing_model is not None:
+                model = None
 
-                print()
+            if model is not None:
+
+                self.model = model
+
                 print(
-                    "Assembly is already open "
-                    "in SolidWorks."
+                    "Assembly already open."
                 )
 
-                self.model = existing_model
-
             else:
-
-                # --------------------------------------
-                # Open document
-                # --------------------------------------
-
-                document_type = 2
-                options = 0
 
                 errors = win32com.client.VARIANT(
                     pythoncom.VT_BYREF | pythoncom.VT_I4,
@@ -83,21 +145,21 @@ class SolidWorksAssembly:
                     0
                 )
 
-                self.model = self.sw_app.OpenDoc6(
-                    str(file_path),
-                    document_type,
-                    options,
-                    "",
-                    errors,
-                    warnings
+                self.model = (
+                    self.sw_app.OpenDoc6(
+                        str(file_path),
+                        SW_DOC_ASSEMBLY,
+                        0,
+                        "",
+                        errors,
+                        warnings,
+                    )
                 )
 
                 if self.model is None:
 
-                    print()
                     print(
-                        "SolidWorks did not return "
-                        "a model."
+                        "Could not open assembly."
                     )
 
                     print(
@@ -112,151 +174,81 @@ class SolidWorksAssembly:
 
                     return False
 
-                print()
-                print(
-                    "Assembly opened successfully!"
-                )
+            # ---------------------------------------------
+            # Resolve lightweight
+            # ---------------------------------------------
 
-                print(
-                    "Errors:",
-                    errors.value
-                )
-
-                print(
-                    "Warnings:",
-                    warnings.value
-                )
-
-            # ------------------------------------------
-            # Title
-            # ------------------------------------------
-
-            print(
-                "Title:",
-                com_value(
-                    self.model,
-                    "GetTitle"
-                )
-            )
-
-            # ------------------------------------------
-            # Resolve lightweight components
-            # ------------------------------------------
-
-            print()
             print(
                 "Resolving lightweight components..."
             )
 
             try:
 
-                result = (
-                    self.model
-                    .ResolveAllLightweightComponents(
-                        False
-                    )
-                )
-
-                print(
-                    "Resolve result:",
-                    result
+                self.model.ResolveAllLightweightComponents(
+                    False
                 )
 
             except Exception as e:
 
                 print(
-                    "Could not resolve "
-                    "lightweight components:"
+                    "Resolve warning:",
+                    e
                 )
 
-                print(e)
+            print(
+                "Assembly opened successfully."
+            )
 
             return True
 
         except Exception as e:
 
-            print()
             print(
-                "Error while opening assembly:"
+                "Assembly open error:"
             )
 
             print(e)
 
             return False
 
-    # --------------------------------------------------
-    # Get All Components
-    # --------------------------------------------------
+    # =====================================================
+    # GET COMPONENTS
+    # =====================================================
 
     def get_components(self):
-        """
-        Return all components from all levels
-        of the assembly.
-        """
 
         if self.model is None:
-
-            print(
-                "No assembly is open."
-            )
-
             return []
+
+        components = []
 
         try:
 
             print()
-            print(
-                "Reading assembly components..."
-            )
+            print(LINE)
+            print("SCANNING COMPONENTS")
+            print(LINE)
 
-            # False means:
-            # include components from
-            # subassemblies as well.
+            # False = include all levels
             sw_components = (
                 self.model.GetComponents(False)
             )
 
             if sw_components is None:
-
-                print(
-                    "SolidWorks returned "
-                    "no components."
-                )
-
                 return []
-
-            components = []
 
             for sw_component in sw_components:
 
                 try:
 
-                    # ----------------------------------
-                    # Name
-                    # ----------------------------------
-
-                    name = com_value(
-                        sw_component,
-                        "Name2"
-                    )
-
-                    # ----------------------------------
-                    # Path
-                    # ----------------------------------
-
-                    path = com_value(
-                        sw_component,
-                        "GetPathName"
+                    path = (
+                        sw_component.GetPathName()
                     )
 
                     if not path:
                         continue
 
                     path = Path(path)
-
-                    # ----------------------------------
-                    # Component Type
-                    # ----------------------------------
 
                     extension = (
                         path.suffix.lower()
@@ -274,24 +266,24 @@ class SolidWorksAssembly:
 
                         continue
 
-                    # ----------------------------------
+                    # -------------------------------------
                     # Suppression
-                    # ----------------------------------
+                    # -------------------------------------
 
                     try:
 
                         suppression = (
                             sw_component
-                            .GetSuppression
+                            .GetSuppression()
                         )
 
                     except Exception:
 
                         suppression = None
 
-                    # ----------------------------------
+                    # -------------------------------------
                     # Lightweight
-                    # ----------------------------------
+                    # -------------------------------------
 
                     try:
 
@@ -304,9 +296,9 @@ class SolidWorksAssembly:
 
                         lightweight = False
 
-                    # ----------------------------------
-                    # Referenced configuration
-                    # ----------------------------------
+                    # -------------------------------------
+                    # Configuration
+                    # -------------------------------------
 
                     try:
 
@@ -319,24 +311,21 @@ class SolidWorksAssembly:
 
                         configuration = None
 
-                    # ----------------------------------
-                    # Component object
-                    # ----------------------------------
+                    # -------------------------------------
+                    # Component
+                    # -------------------------------------
 
                     component = Component(
-                        name=name,
+                        name=(
+                            self._get(
+                                sw_component,
+                                "Name2",
+                                path.stem
+                            )
+                        ),
                         path=path,
                         component_type=component_type,
-                        suppressed=(
-                            suppression == 0
-                        )
-                    )
-
-                    # Attach additional runtime
-                    # information.
-
-                    component.sw_component = (
-                        sw_component
+                        sw_component=sw_component,
                     )
 
                     component.suppression = (
@@ -357,17 +346,14 @@ class SolidWorksAssembly:
 
                 except Exception as e:
 
-                    print()
                     print(
-                        "Could not process "
-                        "component:"
+                        "Component error:",
+                        e
                     )
-
-                    print(e)
 
             print()
             print(
-                "Components collected:",
+                "Components found:",
                 len(components)
             )
 
@@ -375,94 +361,24 @@ class SolidWorksAssembly:
 
         except Exception as e:
 
-            print()
             print(
-                "Error while reading "
-                "components:"
+                "Component scan error:",
+                e
             )
-
-            print(e)
 
             return []
 
-    # --------------------------------------------------
-    # Part Components
-    # --------------------------------------------------
-
-    def get_part_components(
-        self,
-        components=None
-    ):
-        """
-        Return all PART components.
-        """
-
-        if components is None:
-
-            components = (
-                self.get_components()
-            )
-
-        parts = []
-
-        for component in components:
-
-            if not component.is_part:
-                continue
-
-            parts.append(component)
-
-        return parts
-
-    # --------------------------------------------------
-    # Assembly Components
-    # --------------------------------------------------
-
-    def get_assembly_components(
-        self,
-        components=None
-    ):
-        """
-        Return all SUBASSEMBLY components.
-        """
-
-        if components is None:
-
-            components = (
-                self.get_components()
-            )
-
-        assemblies = []
-
-        for component in components:
-
-            if not component.is_assembly:
-                continue
-
-            assemblies.append(component)
-
-        return assemblies
-
-    # --------------------------------------------------
-    # Unique Parts
-    # --------------------------------------------------
+    # =====================================================
+    # UNIQUE PARTS
+    # =====================================================
 
     def get_unique_part_quantities(
         self,
         components=None
     ):
-        """
-        Group PART instances by source file.
-
-        Quantity = number of occurrences
-        in the complete assembly tree.
-        """
 
         if components is None:
-
-            components = (
-                self.get_components()
-            )
+            components = self.get_components()
 
         grouped = {}
 
@@ -471,68 +387,50 @@ class SolidWorksAssembly:
             if not component.is_part:
                 continue
 
-            key = str(
-                component.path
-            ).lower()
+            key = (
+                str(component.path).lower()
+            )
 
             if key not in grouped:
 
                 grouped[key] = {
-                    "name": (
-                        component.path.stem
-                    ),
-                    "path": (
-                        component.path
-                    ),
+                    "name": component.path.stem,
+                    "path": component.path,
                     "quantity": 0,
                     "components": [],
                 }
 
-            grouped[key][
-                "quantity"
-            ] += 1
+            grouped[key]["quantity"] += 1
 
-            grouped[key][
-                "components"
-            ].append(component)
+            grouped[key]["components"].append(
+                component
+            )
 
         return list(
             grouped.values()
         )
 
 
-# ======================================================
-# Find Assemblies
-# ======================================================
+# =========================================================
+# FIND ASSEMBLIES
+# =========================================================
 
 def find_assemblies(input_folder):
 
-    input_folder = Path(
-        input_folder
-    )
+    input_folder = Path(input_folder)
 
     if not input_folder.exists():
-
-        print(
-            f"Input folder does not exist: "
-            f"{input_folder}"
-        )
-
         return []
 
-    assemblies = [
-
-        file
-
-        for file in input_folder.iterdir()
-
-        if (
-            file.is_file()
-            and file.suffix.lower()
-            == ".sldasm"
-            and not file.name.startswith("~$")
-        )
-    ]
-
-    return sorted(assemblies)
+    return sorted(
+        [
+            file
+            for file in input_folder.iterdir()
+            if (
+                file.is_file()
+                and file.suffix.lower() == ".sldasm"
+                and not file.name.startswith("~$")
+            )
+        ]
+    )
 
