@@ -82,27 +82,51 @@ def main():
     # ----------------------------------------
 
     components = assembly.get_components()
-    quantities = assembly.get_part_quantities()
-
-
     print()
-    print("Part Quantities")
+
+
+    print("Sheet Metal Parts")
     print("=" * 50)
 
-    for item in quantities:
-        print(f"{item['name']} -> Quantity: {item['quantity']}")
-    detector = SheetMetalDetector(sw_app)
+    sheet_metal_data = []
 
-    print()
-    print("Sheet Metal Detection")
-    print("=" * 50)
+    for item in assembly.get_unique_part_quantities():
+        component = next(
+            (
+                c
+                for c in components
+                if c.is_part
+                and not c.suppressed
+                and str(c.path).lower() == str(item["path"]).lower()
+            ),
+            None,
+        )
 
-    sheet_metal_parts = []
-    non_sheet_metal_parts = []
-
-    print()
-    print("Sheet Metal Detection")
-    print("=" * 50)
+        if component is None:
+            continue
+        
+        thickness = detector.get_thickness(component)
+    
+        if thickness is None:
+            continue
+        
+        thickness_mm = thickness * 1000
+    
+        sheet_metal_data.append(
+            {
+                "name": item["name"],
+                "path": item["path"],
+                "quantity": item["quantity"],
+                "thickness": thickness_mm,
+            }
+        )
+    
+        print(
+            f"{item['name']} | "
+            f"Thickness: {thickness_mm:.3f} mm | "
+            f"Quantity: {item['quantity']}"
+        )
+    
 
     for component in components:
 

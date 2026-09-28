@@ -146,12 +146,13 @@ class SolidWorksAssembly:
 
 
 
-    def get_part_quantities(self):
+
+    def get_unique_part_quantities(self):
         
-        """Count occurrences of each part in the assembly."""
+        """Group active part instances by their source file."""
         components = self.get_components()
 
-        quantities = {}
+        grouped = {}
 
         for component in components:
             if not component.is_part:
@@ -162,16 +163,20 @@ class SolidWorksAssembly:
 
             key = str(component.path).lower()
 
-            if key not in quantities:
-                quantities[key] = {
+            if key not in grouped:
+                grouped[key] = {
                     "name": component.path.stem,
                     "path": component.path,
                     "quantity": 0,
                 }
 
-            quantities[key]["quantity"] += 1
+            grouped[key]["quantity"] += 1
 
-        return list(quantities.values())
+        return list(grouped.values())
+
+
+
+
 def find_assemblies(input_folder):
     """Find all SolidWorks assemblies inside input folder."""
 
