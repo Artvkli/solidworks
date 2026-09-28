@@ -11,6 +11,7 @@ class AutoCADExporter:
 
     def connect(self):
         """Connect to AutoCAD."""
+
         try:
             try:
                 self.app = win32com.client.GetActiveObject(
@@ -34,6 +35,7 @@ class AutoCADExporter:
 
     def _point(self, x, y, z=0.0):
         """Create AutoCAD point."""
+
         return win32com.client.VARIANT(
             pythoncom.VT_ARRAY | pythoncom.VT_R8,
             (float(x), float(y), float(z))
@@ -41,6 +43,7 @@ class AutoCADExporter:
 
     def create_dwg(self, output_path):
         """Create a new DWG document."""
+
         try:
             document = self.app.Documents.Add()
 
@@ -88,10 +91,10 @@ class AutoCADExporter:
             min_point, max_point = entity.GetBoundingBox()
 
             return (
-                min_point[0],
-                min_point[1],
-                max_point[0],
-                max_point[1]
+                float(min_point[0]),
+                float(min_point[1]),
+                float(max_point[0]),
+                float(max_point[1])
             )
 
         except Exception as e:
@@ -104,7 +107,8 @@ class AutoCADExporter:
         document,
         x,
         y,
-        quantity
+        quantity,
+        text_height=10.0
     ):
         """Add QTY text under a part."""
 
@@ -116,8 +120,15 @@ class AutoCADExporter:
             text = model_space.AddText(
                 f"QTY: {quantity}",
                 text_point,
-                10.0
+                text_height
             )
+
+            # Center the text approximately
+            try:
+                text.Alignment = 1
+                text.TextAlignmentPoint = text_point
+            except Exception:
+                pass
 
             return text
 
@@ -130,13 +141,17 @@ class AutoCADExporter:
         self,
         output_path,
         parts,
-        spacing=100.0
+        spacing=100.0,
+        qty_gap=20.0
     ):
         """
         Create one DWG for one thickness.
 
+        Parts are placed horizontally based on
+        their real bounding-box dimensions.
+
         Each unique part is inserted once.
-        Quantity is written underneath.
+        Quantity is written underneath it.
         """
 
         document = self.create_dwg(output_path)
@@ -152,17 +167,21 @@ class AutoCADExporter:
 
                 dwg_path = part["dwg_path"]
                 quantity = part["quantity"]
+                name = part["name"]
 
                 print()
-                print("Adding:", part["name"])
+                print("Adding:", name)
                 print("QTY:", quantity)
 
                 if not os.path.exists(dwg_path):
+
                     print("[MISSING DWG]")
+                    print(dwg_path)
+
                     continue
 
                 # --------------------------------------
-                # Insert part DWG
+                # Insert part
                 # --------------------------------------
 
                 block = self.insert_dwg(
@@ -173,45 +192,70 @@ class AutoCADExporter:
                 )
 
                 if block is None:
+
                     print("[INSERT FAILED]")
+
                     continue
 
                 # --------------------------------------
-                # Get dimensions
+                # Get real dimensions
                 # --------------------------------------
 
                 extents = self.get_extents(block)
 
                 if extents is None:
+
                     print("[EXTENTS FAILED]")
+
                     continue
 
                 min_x, min_y, max_x, max_y = extents
 
                 width = max_x - min_x
+                height = max_y - min_y
+
+                print(
+                    f"Size: "
+                    f"{width:.2f} x "
+                    f"{height:.2f}"
+                )
 
                 # --------------------------------------
-                # Add Quantity
+                # Calculate center
                 # --------------------------------------
 
-                text_x = current_x
-                text_y = min_y - 20.0
+                center_x = (
+                    min_x + max_x
+                ) / 2.0
+
+                # --------------------------------------
+                # Add QTY under the part
+                # --------------------------------------
+
+                text_y = (
+                    min_y
+                    - qty_gap
+                )
 
                 self.add_qty_text(
                     document,
-                    text_x,
+                    center_x,
                     text_y,
                     quantity
                 )
 
                 # --------------------------------------
-                # Move next part
+                # Move next part to the right
+                # based on actual width
                 # --------------------------------------
 
-                current_x += width + spacing
+                current_x = (
+                    max_x
+                    + spacing
+                )
 
             # ------------------------------------------
-            # Save
+            # Save final DWG
             # ------------------------------------------
 
             document.Save()
@@ -225,7 +269,10 @@ class AutoCADExporter:
         except Exception as e:
 
             print()
-            print("Error while creating thickness DWG:")
+            print(
+                "Error while creating "
+                "thickness DWG:"
+            )
             print(e)
 
             return False
