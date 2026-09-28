@@ -7,7 +7,7 @@ def connect_to_solidworks():
         sw = win32com.client.GetActiveObject("SldWorks.Application")
 
         print("Connected to SolidWorks successfully!")
-        print("SolidWorks version:", sw.RevisionNumber())
+        print("SolidWorks version:", sw.RevisionNumber)
 
         return sw
 
