@@ -94,6 +94,35 @@ def main():
         print("Path:", component.path)
         print("Suppressed:", component.suppressed)
 
+
+
+    active_parts = [
+        component
+        for component in components
+        if component.is_part and not component.suppressed
+    ]
+
+    suppressed_parts = [
+        component
+        for component in components
+        if component.is_part and component.suppressed
+    ]
+
+    sub_assemblies = [
+        component
+        for component in components
+        if component.is_assembly
+    ]
+
+    print()
+    print("Summary:")
+    print("Total components:", len(components))
+    print("Active parts:", len(active_parts))
+    print("Suppressed parts:", len(suppressed_parts))
+    print("Sub-assemblies:", len(sub_assemblies))
+
+    print()
+    print("Program finished.")  
     
     
 if __name__ == "__main__":
