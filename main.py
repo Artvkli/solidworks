@@ -85,26 +85,29 @@ def main():
 
     print()
     print("Number of components:", len(components))
-
     print()
-    print("Components:")
 
     for component in components:
+        print("-" * 40)
+        print("Name:", component.name)
+        print("Type:", component.component_type)
+        print("Path:", component.path)
+        print("Suppressed:", component.suppressed)
 
-        try:
+    part_count = sum(
+        1 for component in components
+        if component.is_part
+    )
 
-            print("-" * 40)
-            print("Name:", component.Name2)
-            print("Path:", component.GetPathName)
-
-        except Exception as e:
-
-            print("Could not read component:")
-            print(e)
+    assembly_count = sum(
+        1 for component in components
+        if component.is_assembly
+    )
 
     print()
-    print("Program finished.")
-
-
+    print("Summary:")
+    print("Parts:", part_count)
+    print("Sub-Assemblies:", assembly_count)
+    
 if __name__ == "__main__":
     main()

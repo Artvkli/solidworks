@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pythoncom
 import win32com.client
-
+from component import Component
 
 class SolidWorksAssembly:
 
@@ -82,28 +82,67 @@ class SolidWorksAssembly:
             return False
 
     def get_components(self):
-        """Get all components from the assembly."""
-
+        
         if self.model is None:
             print("No assembly is open.")
             return []
 
         try:
+            sw_components = self.model.GetComponents(True)
 
-            components = self.model.GetComponents(True)
-
-            if components is None:
+            if sw_components is None:
                 return []
 
-            return list(components)
+            components = []
+
+            for sw_component in sw_components:
+
+                try:
+                    name = sw_component.Name2
+                    path = sw_component.GetPathName
+
+                    if not path:
+                        continue
+
+                    path = Path(path)
+
+                    extension = path.suffix.lower()
+
+                    if extension == ".sldprt":
+                        component_type = "PART"
+
+                    elif extension == ".sldasm":
+                        component_type = "ASSEMBLY"
+
+                    else:
+                        continue
+
+                    suppressed = False
+
+                    try:
+                        suppressed = sw_component.IsSuppressed
+                    except Exception:
+                        pass
+
+                    component = Component(
+                        name=name,
+                        path=path,
+                        component_type=component_type,
+                        suppressed=suppressed
+                    )
+
+                    components.append(component)
+
+                except Exception as e:
+                    print("Could not process component:")
+                    print(e)
+
+            return components
 
         except Exception as e:
-
             print("Error while reading components:")
             print(e)
-
             return []
-
 
 def find_assemblies(input_folder):
     """Find all SolidWorks assemblies inside input folder."""
