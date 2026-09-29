@@ -22,6 +22,30 @@ SW_TN_SHEET_METAL = "SheetMetal"  # swTnSheetMetal
 
 MAX_FEATURES = 100000  # safety guard against endless loops
 MAX_DEBUG_PARTS = 3  # how many failed parts print diagnostic lines
+API_GIVE_UP_AFTER = (
+    5  # stop trying the SolidWorks thickness API after this many misses in a row
+)
+
+# Used only when thickness is estimated from geometry (volume / surface area).
+# Edit this list to match the gauges you actually use.
+STANDARD_THICKNESSES_MM = (
+    0.5,
+    0.6,
+    0.7,
+    0.8,
+    1.0,
+    1.2,
+    1.5,
+    2.0,
+    2.5,
+    3.0,
+    4.0,
+    5.0,
+    6.0,
+    8.0,
+    10.0,
+)
+SNAP_TOLERANCE = 0.08  # estimate must be within 8 % of a standard gauge to snap to it
 
 
 class SheetMetalDetector:
@@ -33,6 +57,10 @@ class SheetMetalDetector:
         self._opened_models = {}
         self._opened_by_us = []  # titles of documents this class opened
         self.last_debug = []
+        self.last_thickness_source = ""
+        self.last_thickness_raw_mm = None
+        self._api_fail_streak = 0
+        self._api_ever_worked = False
 
     # =====================================================
     # SAFE COM HELPERS
@@ -360,7 +388,7 @@ class SheetMetalDetector:
 
         return None
 
-    def _find_thickness(self, model, feature, features, debug):
+    def _find_thickness_api(self, model, feature, features, debug):
         # 1. SheetMetalFeatureData.Thickness
         if feature is not None:
             value = self._thickness_from_definition(model, feature)
@@ -402,6 +430,58 @@ class SheetMetalDetector:
         debug.append("display dimensions -> nothing found")
         return None
 
+    @staticmethod
+    def snap_thickness_mm(raw_mm):
+        nearest = min(STANDARD_THICKNESSES_MM, key=lambda v: abs(v - raw_mm))
+        if abs(nearest - raw_mm) / nearest <= SNAP_TOLERANCE:
+            return nearest
+        return round(raw_mm, 2)
+
+    def _estimate_thickness(self, model, debug):
+        """thickness ~= 2 * Volume / SurfaceArea  (a sheet has two big faces)."""
+        extension = self._obj(model, "Extension")
+
+        mass = None
+        for name in ("CreateMassProperty2", "CreateMassProperty"):
+            mass = self._call(extension, name)
+            if mass is not None:
+                break
+
+        volume = self._positive(self._read(mass, "Volume"))
+        area = self._positive(self._read(mass, "SurfaceArea"))
+        debug.append(f"mass properties: volume={volume} m3, surface area={area} m2")
+
+        if not volume or not area:
+            return None
+
+        raw_mm = 2.0 * volume / area * 1000.0
+        self.last_thickness_raw_mm = round(raw_mm, 3)
+        return self.snap_thickness_mm(raw_mm) / 1000.0
+
+    def _find_thickness(self, model, feature, features, debug):
+        use_api = self._api_ever_worked or self._api_fail_streak < API_GIVE_UP_AFTER
+
+        if use_api:
+            value = self._find_thickness_api(model, feature, features, debug)
+            if value:
+                self._api_ever_worked = True
+                self._api_fail_streak = 0
+                self.last_thickness_source = "SolidWorks"
+                self.last_thickness_raw_mm = round(value * 1000.0, 4)
+                return value
+            self._api_fail_streak += 1
+        else:
+            debug.append(
+                "SolidWorks thickness API skipped (it failed on the first parts)"
+            )
+
+        estimated = self._estimate_thickness(model, debug)
+        if estimated:
+            self.last_thickness_source = "estimated"
+            return estimated
+
+        return None
+
     # =====================================================
     # ANALYZE ONE MODEL -> (is_sheet_metal, thickness_m)
     # =====================================================
@@ -409,6 +489,8 @@ class SheetMetalDetector:
     def analyze_model(self, model):
         debug = []
         self.last_debug = debug
+        self.last_thickness_source = ""
+        self.last_thickness_raw_mm = None
 
         doc_type = self._call(model, "GetType")
         if doc_type is not None and doc_type != SW_DOC_PART:
@@ -526,12 +608,18 @@ class SheetMetalDetector:
                         "quantity": part["quantity"],
                         "thickness": thickness_mm,
                         "method": method,
+                        "thickness_source": self.last_thickness_source,
+                        "thickness_raw_mm": self.last_thickness_raw_mm,
                         "component": component,
                         "model": model,
                     }
                 )
 
-                extra = f", {thickness_mm:.3f} mm" if thickness_mm is not None else ""
+                extra = (
+                    f", {thickness_mm:.3f} mm [{self.last_thickness_source}, raw {self.last_thickness_raw_mm}]"
+                    if thickness_mm is not None
+                    else ""
+                )
                 print(f"{label} -> SHEET METAL ({method}){extra}")
 
             except Exception as e:
@@ -638,10 +726,24 @@ class SheetMetalDetector:
                         ["TOTAL", result["sheet_metal"], result["total_quantity"]]
                     )
                     writer.writerow([])
-                    writer.writerow(["Thickness (mm)", "Part", "Quantity"])
+                    writer.writerow(
+                        [
+                            "Thickness (mm)",
+                            "Part",
+                            "Quantity",
+                            "Thickness source",
+                            "Raw value (mm)",
+                        ]
+                    )
                     for item in sorted(rows, key=lambda i: (i["thickness"], i["name"])):
                         writer.writerow(
-                            [item["thickness"], item["name"], item["quantity"]]
+                            [
+                                item["thickness"],
+                                item["name"],
+                                item["quantity"],
+                                item.get("thickness_source", ""),
+                                item.get("thickness_raw_mm", ""),
+                            ]
                         )
                 else:
                     writer.writerow(["Part", "Quantity", "Detected by"])

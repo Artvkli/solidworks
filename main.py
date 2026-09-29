@@ -7,7 +7,25 @@ import win32com.client
 
 from solidworks.assembly import SolidWorksAssembly, find_assemblies
 from solidworks.dwg_exporter import DwgExporter
+from solidworks.thickness_dwg import ThicknessDwgBuilder
 from solidworks.sheet_metal import SheetMetalDetector
+
+
+# =========================================================
+# SETTINGS
+# =========================================================
+
+# Put every part as many times as its quantity into the drawing?
+#   False -> each part once, with a label "xN" (recommended for checking)
+#   True  -> N copies of each part (for cutting)
+REPEAT_BY_QUANTITY = False
+
+# Full path of ODAFileConverter.exe (only needed if it is not found automatically)
+ODA_CONVERTER_PATH = None
+
+# Gap between parts and maximum row width (in the DXF units, normally mm)
+PART_GAP = 20.0
+MAX_ROW_WIDTH = 6000.0
 
 
 # =========================================================
@@ -153,7 +171,9 @@ def main():
     # Sheet metal scan + CSV export
     # -----------------------------------------------------
 
-    detector = SheetMetalDetector(sw_app, assembly_path=assembly_path)
+    detector = SheetMetalDetector(
+        sw_app, assembly_path=assembly_path, read_thickness=True
+    )
 
     try:
         result = detector.scan_and_export(unique_parts, output_folder)
@@ -167,21 +187,30 @@ def main():
         return
 
     # -----------------------------------------------------
-    # DWG export (flat patterns)
+    # One drawing per thickness
     # -----------------------------------------------------
 
-    dwg_result = None
+    drawing_result = None
     exporter = DwgExporter(sw_app, assembly_path=assembly_path)
+    builder = ThicknessDwgBuilder(
+        exporter,
+        gap=PART_GAP,
+        max_row_width=MAX_ROW_WIDTH,
+        repeat_by_quantity=REPEAT_BY_QUANTITY,
+        oda_path=ODA_CONVERTER_PATH,
+    )
 
     try:
-        dwg_result = exporter.export_all(
-            result["sheet_metal_parts"], output_folder / "DWG"
+        drawing_result = builder.build(
+            result["sheet_metal_parts"],
+            output_folder / "by_thickness",
+            base_name=assembly_path.stem,
         )
 
     except Exception as e:
         print()
         print("=" * 60)
-        print("DWG EXPORT FAILED")
+        print("DRAWING EXPORT FAILED")
         print("=" * 60)
         print(e)
 
@@ -203,9 +232,9 @@ def main():
     print(f"Not sheet metal: {result['not_sheet_metal']}")
     print(f"Failed: {result['failed']}")
 
-    if dwg_result is not None:
-        print(f"DWG exported: {dwg_result['exported']}")
-        print(f"DWG failed: {dwg_result['failed']}")
+    if drawing_result is not None:
+        print(f"Drawings created: {len(drawing_result['files'])}")
+        print(f"Parts not exported: {len(drawing_result['failed_parts'])}")
 
     print()
     print("Output folder:")
