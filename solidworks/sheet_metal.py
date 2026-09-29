@@ -1,14 +1,26 @@
+import csv
 from pathlib import Path
+
+try:
+    import pythoncom
+    from win32com.client import VARIANT
+except ImportError:  # allows importing the file outside Windows
+    pythoncom = None
+    VARIANT = None
 
 # =========================================================
 # SOLIDWORKS CONSTANTS
 # =========================================================
 
 SW_DOC_PART = 1
+SW_DOC_ASSEMBLY = 2
 SW_SOLID_BODY = 0
 
-# Suppression
-SW_RESOLVE = 2
+SW_OPEN_SILENT = 1
+SW_OPEN_READONLY = 2
+
+# swTnSheetMetal
+SW_TN_SHEET_METAL = "SheetMetal"
 
 
 class SheetMetalDetector:
@@ -18,19 +30,18 @@ class SheetMetalDetector:
         self._opened_models = {}
 
     # =====================================================
-    # SAFE READ
+    # SAFE HELPERS
     # =====================================================
 
     @staticmethod
     def _read(obj, name, default=None):
+        """Read a scalar property (str / float / int). Calls it if it is a method."""
         if obj is None:
             return default
-
         try:
             value = getattr(obj, name)
         except Exception:
             return default
-
         try:
             if callable(value):
                 return value()
@@ -38,26 +49,18 @@ class SheetMetalDetector:
         except Exception:
             return default
 
-    # =====================================================
-    # SAFE CALL
-    # =====================================================
-
     @staticmethod
     def _call(obj, name, *args, default=None):
+        """Call a COM method safely."""
         if obj is None:
             return default
-
         try:
             method = getattr(obj, name)
-        except Exception:
-            return default
-
-        try:
             if callable(method):
-                return method(*args)
+                result = method(*args)
+                return default if result is None else result
         except Exception:
             pass
-
         return default
 
     # =====================================================
@@ -65,55 +68,37 @@ class SheetMetalDetector:
     # =====================================================
 
     def get_model_from_component(self, component):
-        sw_component = component.sw_component
-
-        # -------------------------------------------------
-        # 1. GetModelDoc2
-        # -------------------------------------------------
-
+        # 1. Directly from the resolved component
+        sw_component = getattr(component, "sw_component", None)
         if sw_component is not None:
-            try:
-                model = self._call(sw_component, "GetModelDoc2")
-                if model is not None:
-                    return model
-            except Exception:
-                pass
+            model = self._call(sw_component, "GetModelDoc2")
+            if model is not None:
+                return model
 
-        # -------------------------------------------------
+        path_value = getattr(component, "path", None)
+        if not path_value:
+            return None
+        original_path = Path(path_value)
+
         # 2. Original path
-        # -------------------------------------------------
-
-        original_path = Path(component.path)
-
         if original_path.exists():
             model = self.open_part(original_path)
             if model is not None:
                 return model
 
-        # -------------------------------------------------
-        # 3. Same folder as assembly
-        # -------------------------------------------------
-
         if self.assembly_path:
+            # 3. Same folder as assembly
             candidate = self.assembly_path.parent / original_path.name
-
             if candidate.exists():
-                print(f"Found local part:\n  {candidate}")
-
                 model = self.open_part(candidate)
                 if model is not None:
                     return model
 
-        # -------------------------------------------------
-        # 4. Recursive search
-        # -------------------------------------------------
-
-        if self.assembly_path:
+            # 4. Recursive search
             try:
                 matches = list(self.assembly_path.parent.rglob(original_path.name))
             except Exception:
                 matches = []
-
             if matches:
                 model = self.open_part(matches[0])
                 if model is not None:
@@ -129,255 +114,173 @@ class SheetMetalDetector:
         part_path = Path(part_path)
 
         if not part_path.exists():
-            print(f"Part does not exist:\n  {part_path}")
+            print(f"Part does not exist: {part_path}")
             return None
 
         key = str(part_path).lower()
-
         if key in self._opened_models:
             return self._opened_models[key]
 
-        # -------------------------------------------------
-        # Already open
-        # -------------------------------------------------
-
+        # Already open in SolidWorks?
         try:
             model = self.sw_app.GetOpenDocumentByName(str(part_path))
-
             if model is not None:
                 self._opened_models[key] = model
                 return model
         except Exception:
             pass
 
-        # -------------------------------------------------
-        # Open
-        # -------------------------------------------------
-
+        # Open (errors / warnings must be passed ByRef through COM)
         try:
-            errors = 0
-            warnings = 0
+            if VARIANT is not None:
+                errors = VARIANT(pythoncom.VT_BYREF | pythoncom.VT_I4, 0)
+                warnings = VARIANT(pythoncom.VT_BYREF | pythoncom.VT_I4, 0)
+            else:
+                errors = 0
+                warnings = 0
 
             model = self.sw_app.OpenDoc6(
                 str(part_path),
                 SW_DOC_PART,
-                1,
+                SW_OPEN_SILENT | SW_OPEN_READONLY,
                 "",
                 errors,
                 warnings,
             )
-
             if model is not None:
                 self._opened_models[key] = model
                 return model
 
         except Exception as e:
-            print(f"Open part error:\n  {part_path}\n  {e}")
+            print(f"Open part error: {part_path}\n  {e}")
 
         return None
 
     # =====================================================
-    # REBUILD
-    # =====================================================
-
-    def rebuild_model(self, model):
-        try:
-            return self._call(model, "ForceRebuild3", False)
-        except Exception:
-            return None
-
-    # =====================================================
-    # GET BODIES
+    # BODIES
     # =====================================================
 
     def get_bodies(self, model):
         try:
             bodies = model.GetBodies2(SW_SOLID_BODY, False)
-
-            if bodies is None:
-                return []
-
-            return list(bodies)
-
-        except Exception as e:
-            print(f"GetBodies2 error: {e}")
+            return list(bodies) if bodies else []
+        except Exception:
             return []
-
-    # =====================================================
-    # SHEET METAL BODIES
-    # =====================================================
 
     def get_sheet_metal_bodies(self, model):
         result = []
-
         for body in self.get_bodies(model):
             try:
                 if body.IsSheetMetal():
                     result.append(body)
             except Exception:
                 pass
-
         return result
 
     # =====================================================
-    # RECURSIVE FEATURE WALK
-    # =====================================================
-
-    def walk_features(self, feature, level=0):
-        current = feature
-
-        while current is not None:
-            yield current
-
-            # ---------------------------------------------
-            # Sub features
-            # ---------------------------------------------
-
-            try:
-                sub_feature = current.GetFirstSubFeature()
-            except Exception:
-                sub_feature = None
-
-            if sub_feature is not None:
-                yield from self.walk_features(sub_feature, level + 1)
-
-            # ---------------------------------------------
-            # Next feature
-            # ---------------------------------------------
-
-            try:
-                current = current.GetNextFeature()
-            except Exception:
-                current = None
-
-    # =====================================================
-    # ALL FEATURES
+    # FEATURES
     # =====================================================
 
     def iter_features(self, model):
-        try:
-            first = model.FirstFeature
-        except Exception:
-            first = None
+        """Walk the top level of the FeatureManager tree."""
+        first = self._call(model, "FirstFeature")
 
-        if first is not None:
-            yield from self.walk_features(first)
+        if first is None:
+            # some wrappers expose it as a property
+            try:
+                first = model.FirstFeature
+            except Exception:
+                first = None
 
-    # =====================================================
-    # FIND FEATURE
-    # =====================================================
+        current = first
+        while current is not None:
+            yield current
+            current = self._call(current, "GetNextFeature")
 
     def find_feature(self, model, type_name):
         wanted = type_name.lower()
-
         for feature in self.iter_features(model):
+            feature_type = self._call(feature, "GetTypeName2")
+            if feature_type and str(feature_type).lower() == wanted:
+                return feature
+        return None
+
+    def get_sheet_metal_feature(self, model):
+        return self.find_feature(model, SW_TN_SHEET_METAL)
+
+    # =====================================================
+    # THICKNESS (meters)
+    # =====================================================
+
+    def _thickness_from_feature(self, model, feature):
+        if feature is None:
+            return None
+
+        # Method 1: SheetMetalFeatureData.Thickness
+        definition = self._call(feature, "GetDefinition")
+        value = self._read(definition, "Thickness")
+        try:
+            value = float(value)
+            if value > 0:
+                return value
+        except Exception:
+            pass
+
+        # Method 2: dimension "Thickness@<feature name>"
+        name = self._read(feature, "Name")
+        if name:
             try:
-                feature_type = feature.GetTypeName2()
-
-                if not feature_type:
-                    continue
-
-                if feature_type.lower() == wanted:
-                    return feature
-
+                dimension = model.Parameter(f"Thickness@{name}")
+                value = float(self._read(dimension, "SystemValue"))
+                if value > 0:
+                    return value
             except Exception:
                 pass
 
         return None
 
     # =====================================================
-    # SHEET METAL FEATURE
+    # ANALYZE ONE MODEL -> (is_sheet_metal, thickness_m)
     # =====================================================
 
-    def get_sheet_metal_feature(self, model):
-        return self.find_feature(model, "SheetMetal")
-
-    # =====================================================
-    # IS SHEET METAL
-    # =====================================================
-
-    def is_sheet_metal(self, component):
-        if not component.is_part:
-            return False
-
-        model = self.get_model_from_component(component)
-
-        if model is None:
-            return False
-
-        # -------------------------------------------------
-        # First method: Sheet Metal Bodies
-        # -------------------------------------------------
-
-        bodies = self.get_sheet_metal_bodies(model)
-
-        if bodies:
-            return True
-
-        # -------------------------------------------------
-        # Second method: SheetMetal Feature
-        # -------------------------------------------------
+    def analyze_model(self, model):
+        doc_type = self._call(model, "GetType")
+        if doc_type is not None and doc_type != SW_DOC_PART:
+            return False, None
 
         feature = self.get_sheet_metal_feature(model)
 
-        return feature is not None
+        is_sm = feature is not None
+        if not is_sm:
+            is_sm = bool(self.get_sheet_metal_bodies(model))
 
-    # =====================================================
-    # THICKNESS
-    # =====================================================
+        thickness = self._thickness_from_feature(model, feature) if is_sm else None
+        return is_sm, thickness
+
+    # Backward-compatible wrappers
+    def is_sheet_metal(self, component):
+        if not getattr(component, "is_part", True):
+            return False
+        model = self.get_model_from_component(component)
+        return model is not None and self.analyze_model(model)[0]
 
     def get_thickness(self, component):
         model = self.get_model_from_component(component)
-
         if model is None:
             return None
-
-        feature = self.get_sheet_metal_feature(model)
-
-        if feature is None:
-            return None
-
-        try:
-            definition = feature.GetDefinition()
-
-            if definition is None:
-                return None
-
-            thickness = getattr(definition, "Thickness", None)
-
-            if callable(thickness):
-                try:
-                    thickness = thickness()
-                except Exception:
-                    pass
-
-            if thickness is None:
-                return None
-
-            try:
-                return float(thickness)
-            except Exception:
-                return None
-
-        except Exception:
-            return None
-
-    # =====================================================
-    # NORMALIZE THICKNESS
-    # =====================================================
+        return self.analyze_model(model)[1]
 
     @staticmethod
     def thickness_mm(thickness):
         if thickness is None:
             return None
-
         try:
             return round(float(thickness) * 1000, 3)
         except Exception:
             return None
 
     # =====================================================
-    # SCAN SHEET METAL
+    # SCAN
     # =====================================================
 
     def scan_sheet_metal(self, unique_parts):
@@ -391,150 +294,93 @@ class SheetMetalDetector:
         print("=" * 60)
         print("SHEET METAL SCANNER")
         print("=" * 60)
-
+        print(f"Unique parts to scan: {total}")
         print()
-        print(f"Unique Parts to scan: {total}")
-
-        # =================================================
-        # SCAN
-        # =================================================
 
         for index, part in enumerate(unique_parts, start=1):
-            print()
-            print("-" * 60)
-            print(f"[{index}/{total}]")
-            print(f"Part: {part['name']}")
-            print(f"Quantity: {part['quantity']}")
-
-            component = part["components"][0]
+            label = f"[{index}/{total}] {part['name']} (x{part['quantity']})"
 
             try:
-                print("Path:")
-                print(f"  {component.path}")
-
-                # -----------------------------------------
-                # MODEL
-                # -----------------------------------------
-
+                component = part["components"][0]
                 model = self.get_model_from_component(component)
 
                 if model is None:
-                    print("Result: FAILED - MODEL NOT FOUND")
+                    print(f"{label} -> FAILED: model not found")
                     failed += 1
                     continue
 
-                # -----------------------------------------
-                # SHEET METAL
-                # -----------------------------------------
+                is_sm, thickness = self.analyze_model(model)
 
-                if not self.is_sheet_metal(component):
-                    print("Result: NOT SHEET METAL")
+                if not is_sm:
+                    print(f"{label} -> not sheet metal")
                     not_sheet_metal += 1
                     continue
 
-                # -----------------------------------------
-                # THICKNESS
-                # -----------------------------------------
-
-                thickness = self.get_thickness(component)
                 thickness_mm = self.thickness_mm(thickness)
 
                 if thickness_mm is None:
-                    print("Result: SHEET METAL - THICKNESS NOT FOUND")
+                    print(f"{label} -> FAILED: sheet metal, thickness not found")
                     failed += 1
                     continue
 
-                # -----------------------------------------
-                # SAVE
-                # -----------------------------------------
-
-                item = {
-                    "name": part["name"],
-                    "path": part["path"],
-                    "quantity": part["quantity"],
-                    "thickness": thickness_mm,
-                    "component": component,
-                    "model": model,
-                }
-
-                sheet_metal_parts.append(item)
-
-                print("Result: SHEET METAL")
-                print(f"Thickness: {thickness_mm:.3f} mm")
+                sheet_metal_parts.append(
+                    {
+                        "name": part["name"],
+                        "path": part.get("path"),
+                        "quantity": part["quantity"],
+                        "thickness": thickness_mm,
+                        "component": component,
+                        "model": model,
+                    }
+                )
+                print(f"{label} -> SHEET METAL, {thickness_mm:.3f} mm")
 
             except Exception as e:
                 failed += 1
-                print(f"Component processing error: {e}")
+                print(f"{label} -> ERROR: {e}")
 
-        # =================================================
-        # GROUP BY THICKNESS
-        # =================================================
+        # ---------------- group by thickness ----------------
 
         thickness_groups = {}
-
         for item in sheet_metal_parts:
-            thickness = item["thickness"]
-
-            if thickness not in thickness_groups:
-                thickness_groups[thickness] = {
-                    "thickness": thickness,
+            group = thickness_groups.setdefault(
+                item["thickness"],
+                {
+                    "thickness": item["thickness"],
                     "unique_parts": 0,
                     "quantity": 0,
                     "parts": [],
-                }
+                },
+            )
+            group["unique_parts"] += 1
+            group["quantity"] += item["quantity"]
+            group["parts"].append(item)
 
-            thickness_groups[thickness]["unique_parts"] += 1
-            thickness_groups[thickness]["quantity"] += item["quantity"]
-            thickness_groups[thickness]["parts"].append(item)
+        thickness_groups = dict(sorted(thickness_groups.items()))
 
-        # =================================================
-        # SORT
-        # =================================================
-
-        thickness_groups = dict(sorted(thickness_groups.items(), key=lambda x: x[0]))
-
-        # =================================================
-        # FINAL REPORT
-        # =================================================
+        # ---------------- report ----------------
 
         print()
         print("=" * 60)
         print("SHEET METAL THICKNESS SUMMARY")
         print("=" * 60)
-
-        print()
-        print(f"Unique Parts:          {total}")
-        print(f"Sheet Metal Parts:     {len(sheet_metal_parts)}")
-        print(f"Not Sheet Metal:       {not_sheet_metal}")
-        print(f"Failed:                {failed}")
-
-        print()
-        print("-" * 60)
-        print("THICKNESS GROUPS")
+        print(f"Unique parts:      {total}")
+        print(f"Sheet metal parts: {len(sheet_metal_parts)}")
+        print(f"Not sheet metal:   {not_sheet_metal}")
+        print(f"Failed:            {failed}")
         print("-" * 60)
 
-        total_sheet_quantity = 0
-
+        total_quantity = 0
         for thickness, group in thickness_groups.items():
-            quantity = group["quantity"]
-            unique_count = group["unique_parts"]
-
-            total_sheet_quantity += quantity
-
+            total_quantity += group["quantity"]
             print(
-                f"{thickness:>8.3f} mm"
-                f"  |  "
-                f"Unique Parts: {unique_count:<3}"
-                f"  |  "
-                f"Quantity: {quantity}"
+                f"{thickness:>8.3f} mm  |  "
+                f"Unique parts: {group['unique_parts']:<3}  |  "
+                f"Quantity: {group['quantity']}"
             )
 
         print("-" * 60)
-        print(f"Total Sheet Metal Quantity: {total_sheet_quantity}")
-
-        # =================================================
-        # RETURN
-        # =================================================
+        print(f"Total sheet metal quantity: {total_quantity}")
 
         return {
             "unique_parts": total,
@@ -544,3 +390,37 @@ class SheetMetalDetector:
             "sheet_metal_parts": sheet_metal_parts,
             "thickness_groups": thickness_groups,
         }
+
+    # =====================================================
+    # SCAN + EXPORT (name expected by the main script)
+    # =====================================================
+
+    def scan_and_export(self, unique_parts, output_path=None, *args, **kwargs):
+        result = self.scan_sheet_metal(unique_parts)
+
+        if output_path:
+            self.export_csv(result, output_path)
+
+        return result
+
+    def export_csv(self, result, output_path):
+        output_path = Path(output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+
+        rows = sorted(
+            result["sheet_metal_parts"],
+            key=lambda item: (item["thickness"], item["name"]),
+        )
+
+        with open(output_path, "w", newline="", encoding="utf-8-sig") as f:
+            writer = csv.writer(f)
+            writer.writerow(["Thickness (mm)", "Part", "Quantity"])
+            for item in rows:
+                writer.writerow([item["thickness"], item["name"], item["quantity"]])
+
+            writer.writerow([])
+            writer.writerow(["Thickness (mm)", "Unique Parts", "Total Quantity"])
+            for thickness, group in result["thickness_groups"].items():
+                writer.writerow([thickness, group["unique_parts"], group["quantity"]])
+
+        print(f"Exported: {output_path}")
