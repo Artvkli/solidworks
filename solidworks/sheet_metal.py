@@ -25,8 +25,10 @@ MAX_DEBUG_PARTS = 3  # how many failed parts print diagnostic lines
 
 
 class SheetMetalDetector:
-    def __init__(self, sw_app, assembly_path=None):
+    def __init__(self, sw_app, assembly_path=None, read_thickness=False):
         self.sw_app = sw_app
+        self.read_thickness = read_thickness
+        self.last_method = ""
         self.assembly_path = Path(assembly_path) if assembly_path else None
         self._opened_models = {}
         self._opened_by_us = []  # titles of documents this class opened
@@ -425,14 +427,19 @@ class SheetMetalDetector:
             + (str(self._read(feature, "Name")) if feature is not None else "NOT FOUND")
         )
 
+        self.last_method = ""
         is_sm = feature is not None
-        if not is_sm:
+        if is_sm:
+            self.last_method = "SheetMetal feature"
+        else:
             hits = len(self.get_sheet_metal_bodies(model))
             debug.append(f"sheet metal bodies: {hits}")
             is_sm = hits > 0
+            if is_sm:
+                self.last_method = "sheet metal body"
 
         thickness = None
-        if is_sm:
+        if is_sm and self.read_thickness:
             thickness = self._find_thickness(model, feature, features, debug)
 
         return is_sm, thickness
@@ -498,16 +505,20 @@ class SheetMetalDetector:
                         not_sheet_metal += 1
                         continue
 
-                    thickness_mm = self.thickness_mm(thickness)
+                    method = self.last_method
+                    thickness_mm = None
 
-                    if thickness_mm is None:
-                        print(f"{label} -> FAILED: thickness not found")
-                        failed_parts.append(part["name"])
-                        if debug_printed < MAX_DEBUG_PARTS:
-                            debug_printed += 1
-                            for line in self.last_debug:
-                                print(f"      [debug] {line}")
-                        continue
+                    if self.read_thickness:
+                        thickness_mm = self.thickness_mm(thickness)
+
+                        if thickness_mm is None:
+                            print(f"{label} -> FAILED: thickness not found")
+                            failed_parts.append(part["name"])
+                            if debug_printed < MAX_DEBUG_PARTS:
+                                debug_printed += 1
+                                for line in self.last_debug:
+                                    print(f"      [debug] {line}")
+                            continue
 
                     sheet_metal_parts.append(
                         {
@@ -515,9 +526,14 @@ class SheetMetalDetector:
                             "path": part.get("path"),
                             "quantity": part["quantity"],
                             "thickness": thickness_mm,
+                            "method": method,
                         }
                     )
-                    print(f"{label} -> SHEET METAL, {thickness_mm:.3f} mm")
+
+                    extra = (
+                        f", {thickness_mm:.3f} mm" if thickness_mm is not None else ""
+                    )
+                    print(f"{label} -> SHEET METAL ({method}){extra}")
 
                 except Exception as e:
                     failed_parts.append(part.get("name", "?"))
@@ -525,31 +541,32 @@ class SheetMetalDetector:
         finally:
             self.close_opened_models()
 
-        # ---------------- group by thickness ----------------
+        total_quantity = sum(item["quantity"] for item in sheet_metal_parts)
+
+        # ---------------- group by thickness (optional) ----------------
 
         thickness_groups = {}
-        for item in sheet_metal_parts:
-            group = thickness_groups.setdefault(
-                item["thickness"],
-                {
-                    "thickness": item["thickness"],
-                    "unique_parts": 0,
-                    "quantity": 0,
-                    "parts": [],
-                },
-            )
-            group["unique_parts"] += 1
-            group["quantity"] += item["quantity"]
-            group["parts"].append(item)
-
-        thickness_groups = dict(sorted(thickness_groups.items()))
-        total_quantity = sum(g["quantity"] for g in thickness_groups.values())
+        if self.read_thickness:
+            for item in sheet_metal_parts:
+                group = thickness_groups.setdefault(
+                    item["thickness"],
+                    {
+                        "thickness": item["thickness"],
+                        "unique_parts": 0,
+                        "quantity": 0,
+                        "parts": [],
+                    },
+                )
+                group["unique_parts"] += 1
+                group["quantity"] += item["quantity"]
+                group["parts"].append(item)
+            thickness_groups = dict(sorted(thickness_groups.items()))
 
         # ---------------- report ----------------
 
         print()
         print("=" * 60)
-        print("SHEET METAL QUANTITY BY THICKNESS")
+        print("SHEET METAL SUMMARY")
         print("=" * 60)
         print(f"Unique parts scanned:  {total}")
         print(f"Sheet metal (unique):  {len(sheet_metal_parts)}")
@@ -557,14 +574,15 @@ class SheetMetalDetector:
         print(f"Failed:                {len(failed_parts)}")
         print("-" * 60)
 
-        for thickness, group in thickness_groups.items():
-            print(
-                f"{thickness:>8.3f} mm  |  "
-                f"Unique parts: {group['unique_parts']:<3}  |  "
-                f"Quantity: {group['quantity']}"
-            )
+        if self.read_thickness:
+            for thickness, group in thickness_groups.items():
+                print(
+                    f"{thickness:>8.3f} mm  |  "
+                    f"Unique parts: {group['unique_parts']:<3}  |  "
+                    f"Quantity: {group['quantity']}"
+                )
+            print("-" * 60)
 
-        print("-" * 60)
         print(f"TOTAL SHEET METAL QUANTITY: {total_quantity}")
 
         if failed_parts:
@@ -606,26 +624,35 @@ class SheetMetalDetector:
         try:
             csv_path.parent.mkdir(parents=True, exist_ok=True)
 
+            rows = sorted(result["sheet_metal_parts"], key=lambda item: item["name"])
+
             with open(csv_path, "w", newline="", encoding="utf-8-sig") as f:
                 writer = csv.writer(f)
 
-                writer.writerow(["Thickness (mm)", "Unique Parts", "Total Quantity"])
-                for thickness, group in result["thickness_groups"].items():
+                if self.read_thickness:
                     writer.writerow(
-                        [thickness, group["unique_parts"], group["quantity"]]
+                        ["Thickness (mm)", "Unique Parts", "Total Quantity"]
                     )
-                writer.writerow(
-                    ["TOTAL", result["sheet_metal"], result["total_quantity"]]
-                )
-
-                writer.writerow([])
-                writer.writerow(["Thickness (mm)", "Part", "Quantity"])
-                rows = sorted(
-                    result["sheet_metal_parts"],
-                    key=lambda item: (item["thickness"], item["name"]),
-                )
-                for item in rows:
-                    writer.writerow([item["thickness"], item["name"], item["quantity"]])
+                    for thickness, group in result["thickness_groups"].items():
+                        writer.writerow(
+                            [thickness, group["unique_parts"], group["quantity"]]
+                        )
+                    writer.writerow(
+                        ["TOTAL", result["sheet_metal"], result["total_quantity"]]
+                    )
+                    writer.writerow([])
+                    writer.writerow(["Thickness (mm)", "Part", "Quantity"])
+                    for item in sorted(rows, key=lambda i: (i["thickness"], i["name"])):
+                        writer.writerow(
+                            [item["thickness"], item["name"], item["quantity"]]
+                        )
+                else:
+                    writer.writerow(["Part", "Quantity", "Detected by"])
+                    for item in rows:
+                        writer.writerow(
+                            [item["name"], item["quantity"], item["method"]]
+                        )
+                    writer.writerow(["TOTAL", result["total_quantity"], ""])
 
             print()
             print(f"CSV saved: {csv_path}")
