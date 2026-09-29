@@ -6,6 +6,7 @@ import pythoncom
 import win32com.client
 
 from solidworks.assembly import SolidWorksAssembly, find_assemblies
+from solidworks.dwg_exporter import DwgExporter
 from solidworks.sheet_metal import SheetMetalDetector
 
 
@@ -166,6 +167,29 @@ def main():
         return
 
     # -----------------------------------------------------
+    # DWG export (flat patterns)
+    # -----------------------------------------------------
+
+    dwg_result = None
+    exporter = DwgExporter(sw_app, assembly_path=assembly_path)
+
+    try:
+        dwg_result = exporter.export_all(
+            result["sheet_metal_parts"], output_folder / "DWG"
+        )
+
+    except Exception as e:
+        print()
+        print("=" * 60)
+        print("DWG EXPORT FAILED")
+        print("=" * 60)
+        print(e)
+
+    finally:
+        exporter.activate_assembly(assembly.model)
+        detector.close_opened_models()
+
+    # -----------------------------------------------------
     # Final result
     # -----------------------------------------------------
 
@@ -179,10 +203,13 @@ def main():
     print(f"Not sheet metal: {result['not_sheet_metal']}")
     print(f"Failed: {result['failed']}")
 
-    if result["csv_path"]:
-        print()
-        print("CSV file:")
-        print(result["csv_path"])
+    if dwg_result is not None:
+        print(f"DWG exported: {dwg_result['exported']}")
+        print(f"DWG failed: {dwg_result['failed']}")
+
+    print()
+    print("Output folder:")
+    print(output_folder)
 
     print()
 

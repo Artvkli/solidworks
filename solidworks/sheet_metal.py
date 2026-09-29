@@ -485,61 +485,58 @@ class SheetMetalDetector:
         print(f"Unique parts to scan: {total}")
         print()
 
-        try:
-            for index, part in enumerate(unique_parts, start=1):
-                label = f"[{index}/{total}] {part['name']} (x{part['quantity']})"
+        for index, part in enumerate(unique_parts, start=1):
+            label = f"[{index}/{total}] {part['name']} (x{part['quantity']})"
 
-                try:
-                    component = part["components"][0]
-                    model = self.get_model_from_component(component)
+            try:
+                component = part["components"][0]
+                model = self.get_model_from_component(component)
 
-                    if model is None:
-                        print(f"{label} -> FAILED: model not found")
+                if model is None:
+                    print(f"{label} -> FAILED: model not found")
+                    failed_parts.append(part["name"])
+                    continue
+
+                is_sm, thickness = self.analyze_model(model)
+
+                if not is_sm:
+                    print(f"{label} -> not sheet metal")
+                    not_sheet_metal += 1
+                    continue
+
+                method = self.last_method
+                thickness_mm = None
+
+                if self.read_thickness:
+                    thickness_mm = self.thickness_mm(thickness)
+
+                    if thickness_mm is None:
+                        print(f"{label} -> FAILED: thickness not found")
                         failed_parts.append(part["name"])
+                        if debug_printed < MAX_DEBUG_PARTS:
+                            debug_printed += 1
+                            for line in self.last_debug:
+                                print(f"      [debug] {line}")
                         continue
 
-                    is_sm, thickness = self.analyze_model(model)
+                sheet_metal_parts.append(
+                    {
+                        "name": part["name"],
+                        "path": part.get("path"),
+                        "quantity": part["quantity"],
+                        "thickness": thickness_mm,
+                        "method": method,
+                        "component": component,
+                        "model": model,
+                    }
+                )
 
-                    if not is_sm:
-                        print(f"{label} -> not sheet metal")
-                        not_sheet_metal += 1
-                        continue
+                extra = f", {thickness_mm:.3f} mm" if thickness_mm is not None else ""
+                print(f"{label} -> SHEET METAL ({method}){extra}")
 
-                    method = self.last_method
-                    thickness_mm = None
-
-                    if self.read_thickness:
-                        thickness_mm = self.thickness_mm(thickness)
-
-                        if thickness_mm is None:
-                            print(f"{label} -> FAILED: thickness not found")
-                            failed_parts.append(part["name"])
-                            if debug_printed < MAX_DEBUG_PARTS:
-                                debug_printed += 1
-                                for line in self.last_debug:
-                                    print(f"      [debug] {line}")
-                            continue
-
-                    sheet_metal_parts.append(
-                        {
-                            "name": part["name"],
-                            "path": part.get("path"),
-                            "quantity": part["quantity"],
-                            "thickness": thickness_mm,
-                            "method": method,
-                        }
-                    )
-
-                    extra = (
-                        f", {thickness_mm:.3f} mm" if thickness_mm is not None else ""
-                    )
-                    print(f"{label} -> SHEET METAL ({method}){extra}")
-
-                except Exception as e:
-                    failed_parts.append(part.get("name", "?"))
-                    print(f"{label} -> ERROR: {e}")
-        finally:
-            self.close_opened_models()
+            except Exception as e:
+                failed_parts.append(part.get("name", "?"))
+                print(f"{label} -> ERROR: {e}")
 
         total_quantity = sum(item["quantity"] for item in sheet_metal_parts)
 
