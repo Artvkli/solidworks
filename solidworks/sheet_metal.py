@@ -21,6 +21,7 @@ SW_OPEN_READONLY = 2  # swOpenDocOptions_ReadOnly
 SW_TN_SHEET_METAL = "SheetMetal"  # swTnSheetMetal
 
 MAX_FEATURES = 100000  # safety guard against endless loops
+MAX_DEBUG_PARTS = 3  # how many failed parts print diagnostic lines
 
 
 class SheetMetalDetector:
@@ -29,6 +30,7 @@ class SheetMetalDetector:
         self.assembly_path = Path(assembly_path) if assembly_path else None
         self._opened_models = {}
         self._opened_by_us = []  # titles of documents this class opened
+        self.last_debug = []
 
     # =====================================================
     # SAFE COM HELPERS
@@ -171,6 +173,38 @@ class SheetMetalDetector:
         self._opened_models = {}
 
     # =====================================================
+    # SMALL HELPERS
+    # =====================================================
+
+    @staticmethod
+    def _obj(obj, name):
+        """Read a COM object property (never 'calls' a COM object by mistake)."""
+        if obj is None:
+            return None
+        try:
+            value = getattr(obj, name)
+        except Exception:
+            return None
+        if value is None:
+            return None
+        if hasattr(value, "_oleobj_"):  # already a COM object
+            return value
+        if callable(value):
+            try:
+                return value()
+            except Exception:
+                return None
+        return value
+
+    @staticmethod
+    def _positive(value):
+        try:
+            value = float(value)
+        except Exception:
+            return None
+        return value if value > 0 else None
+
+    # =====================================================
     # BODIES (secondary detection method)
     # =====================================================
 
@@ -196,36 +230,52 @@ class SheetMetalDetector:
     # =====================================================
 
     def iter_features(self, model):
-        """Walk the top level of the FeatureManager tree."""
-        first = self._call(model, "FirstFeature")
-
-        if first is None:
-            try:
-                first = model.FirstFeature  # property style wrappers
-            except Exception:
-                first = None
-
-        current = first
+        """Walk the top level of the FeatureManager tree (FirstFeature chain)."""
+        current = self._obj(model, "FirstFeature")
         count = 0
         while current is not None and count < MAX_FEATURES:
             yield current
             current = self._call(current, "GetNextFeature")
             count += 1
 
+    def get_features(self, model):
+        """All top-level features. Uses FeatureManager.GetFeatures, then FirstFeature."""
+        features = []
+
+        feature_manager = self._obj(model, "FeatureManager")
+        raw = self._call(feature_manager, "GetFeatures", True)
+        if raw:
+            try:
+                features = [f for f in raw if f is not None]
+            except Exception:
+                features = []
+
+        if not features:
+            features = list(self.iter_features(model))
+
+        return features
+
     def _type_name(self, feature):
         name = self._call(feature, "GetTypeName2")
         return str(name).lower() if name else ""
 
-    def get_sheet_metal_feature(self, model):
+    def get_sheet_metal_feature(self, model, features=None):
         wanted = SW_TN_SHEET_METAL.lower()
-        features = list(self.iter_features(model))
 
-        # Pass 1: top level (normal case)
+        if features is None:
+            features = self.get_features(model)
+
+        # Pass 1: top level
         for feature in features:
             if self._type_name(feature) == wanted:
                 return feature
 
-        # Pass 2: sub features (rare)
+        # Pass 2: default feature name
+        feature = self._call(model, "FeatureByName", "Sheet-Metal1")
+        if feature is not None and self._type_name(feature) == wanted:
+            return feature
+
+        # Pass 3: sub features
         for feature in features:
             sub = self._call(feature, "GetFirstSubFeature")
             count = 0
@@ -241,30 +291,113 @@ class SheetMetalDetector:
     # THICKNESS (meters)
     # =====================================================
 
-    def _thickness_from_feature(self, model, feature):
-        if feature is None:
+    def _active_config_name(self, model):
+        config_manager = self._obj(model, "ConfigurationManager")
+        config = self._obj(config_manager, "ActiveConfiguration")
+        return self._read(config, "Name")
+
+    def _dimension_value(self, model, dimension):
+        """Dimension value in meters (SI) or None."""
+        if dimension is None:
             return None
 
-        # Method 1: SheetMetalFeatureData.Thickness
-        definition = self._call(feature, "GetDefinition")
-        try:
-            value = float(self._read(definition, "Thickness"))
-            if value > 0:
+        value = self._positive(self._read(dimension, "SystemValue"))
+        if value:
+            return value
+
+        config_name = self._active_config_name(model)
+        if config_name:
+            value = self._positive(
+                self._call(dimension, "GetSystemValue2", config_name)
+            )
+            if value:
                 return value
+
+        return None
+
+    def _thickness_from_definition(self, model, feature):
+        definition = self._call(feature, "GetDefinition")
+        if definition is None:
+            return None
+
+        value = self._positive(self._read(definition, "Thickness"))
+        if value:
+            return value
+
+        # Some feature data objects need selection access first
+        self._call(definition, "AccessSelections", model, None)
+        try:
+            return self._positive(self._read(definition, "Thickness"))
+        finally:
+            self._call(definition, "ReleaseSelectionAccess")
+
+    def _thickness_from_parameter(self, model, feature_name):
+        try:
+            dimension = model.Parameter(f"Thickness@{feature_name}")
         except Exception:
-            pass
+            return None
+        return self._dimension_value(model, dimension)
 
-        # Method 2: dimension "Thickness@<feature name>"
-        name = self._read(feature, "Name")
-        if name:
-            try:
-                dimension = model.Parameter(f"Thickness@{name}")
-                value = float(self._read(dimension, "SystemValue"))
-                if value > 0:
+    def _thickness_from_display_dimensions(self, model, feature):
+        display = self._call(feature, "GetFirstDisplayDimension")
+        count = 0
+
+        while display is not None and count < 500:
+            dimension = self._call(display, "GetDimension2", 0)
+
+            full_name = str(self._read(dimension, "FullName") or "").lower()
+            short_name = str(self._read(dimension, "Name") or "").lower()
+
+            if full_name.startswith("thickness@") or short_name == "thickness":
+                value = self._dimension_value(model, dimension)
+                if value:
                     return value
-            except Exception:
-                pass
 
+            display = self._call(feature, "GetNextDisplayDimension", display)
+            count += 1
+
+        return None
+
+    def _find_thickness(self, model, feature, features, debug):
+        # 1. SheetMetalFeatureData.Thickness
+        if feature is not None:
+            value = self._thickness_from_definition(model, feature)
+            debug.append(f"definition.Thickness -> {value}")
+            if value:
+                return value
+
+        # 2. Dimension "Thickness@<feature name>"
+        names = []
+        if feature is not None:
+            feature_name = self._read(feature, "Name")
+            if feature_name:
+                names.append(str(feature_name))
+        if "Sheet-Metal1" not in names:
+            names.append("Sheet-Metal1")
+
+        for name in names:
+            value = self._thickness_from_parameter(model, name)
+            debug.append(f"Parameter('Thickness@{name}') -> {value}")
+            if value:
+                return value
+
+        # 3. Display dimensions of sheet metal related features
+        related = ("sheetmetal", "smbaseflange", "baseflange")
+        for candidate in features:
+            if self._type_name(candidate) in related:
+                value = self._thickness_from_display_dimensions(model, candidate)
+                if value:
+                    debug.append(f"display dimension of sheet metal feature -> {value}")
+                    return value
+
+        # 4. Last resort: any feature that owns a 'Thickness' dimension
+        for candidate in features:
+            value = self._thickness_from_display_dimensions(model, candidate)
+            if value:
+                debug.append(f"display dimension of any feature -> {value}")
+                return value
+
+        debug.append("display dimensions -> nothing found")
         return None
 
     # =====================================================
@@ -272,17 +405,36 @@ class SheetMetalDetector:
     # =====================================================
 
     def analyze_model(self, model):
+        debug = []
+        self.last_debug = debug
+
         doc_type = self._call(model, "GetType")
         if doc_type is not None and doc_type != SW_DOC_PART:
+            debug.append(f"document type is {doc_type}, not a part")
             return False, None
 
-        feature = self.get_sheet_metal_feature(model)
+        features = self.get_features(model)
+        feature = self.get_sheet_metal_feature(model, features)
+
+        sample = []
+        for f in features[:12]:
+            sample.append(f"{self._read(f, 'Name')}:{self._call(f, 'GetTypeName2')}")
+        debug.append(f"top-level features: {len(features)}  {sample}")
+        debug.append(
+            "SheetMetal feature: "
+            + (str(self._read(feature, "Name")) if feature is not None else "NOT FOUND")
+        )
 
         is_sm = feature is not None
         if not is_sm:
-            is_sm = bool(self.get_sheet_metal_bodies(model))
+            hits = len(self.get_sheet_metal_bodies(model))
+            debug.append(f"sheet metal bodies: {hits}")
+            is_sm = hits > 0
 
-        thickness = self._thickness_from_feature(model, feature) if is_sm else None
+        thickness = None
+        if is_sm:
+            thickness = self._find_thickness(model, feature, features, debug)
+
         return is_sm, thickness
 
     # Backward-compatible wrappers
@@ -317,6 +469,7 @@ class SheetMetalDetector:
         sheet_metal_parts = []
         not_sheet_metal = 0
         failed_parts = []
+        debug_printed = 0
 
         print()
         print("=" * 60)
@@ -350,6 +503,10 @@ class SheetMetalDetector:
                     if thickness_mm is None:
                         print(f"{label} -> FAILED: thickness not found")
                         failed_parts.append(part["name"])
+                        if debug_printed < MAX_DEBUG_PARTS:
+                            debug_printed += 1
+                            for line in self.last_debug:
+                                print(f"      [debug] {line}")
                         continue
 
                     sheet_metal_parts.append(
