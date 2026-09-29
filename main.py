@@ -1,202 +1,141 @@
-# main.py
-
 from pathlib import Path
+import gc
+import json
+import sys
+import traceback
 
-import pythoncom
-import win32com.client
+try:
+    import pythoncom
+    import win32com.client
+except ImportError:
+    print("ERROR: pywin32 is required. Install: pip install pywin32")
+    raise
 
 from solidworks.assembly import SolidWorksAssembly, find_assemblies
 from solidworks.dwg_exporter import DwgExporter
 from solidworks.thickness_dwg import ThicknessDwgBuilder
 from solidworks.sheet_metal import SheetMetalDetector
 
-
-# =========================================================
-# SETTINGS
-# =========================================================
-
-# Group the sheet metal parts by thickness (one drawing per thickness)?
-#   False -> ONE drawing with all sheet metal parts (thickness is not read)
-#   True  -> one drawing per thickness (needs the thickness to be readable)
 GROUP_BY_THICKNESS = True
-
-# Put every part as many times as its quantity into the drawing?
-#   False -> each part once, with a label "xN" (recommended for checking)
-#   True  -> N copies of each part (for cutting)
 REPEAT_BY_QUANTITY = False
-
-# Full path of ODAFileConverter.exe (only needed if it is not found automatically)
 ODA_CONVERTER_PATH = None
-
-# Gap between parts and maximum row width (in the DXF units, normally mm)
 PART_GAP = 20.0
 MAX_ROW_WIDTH = 6000.0
 
 
-# =========================================================
-# CONNECT TO SOLIDWORKS
-# =========================================================
-
-
 def connect_to_solidworks():
-    print()
-    print("=" * 60)
-    print("SOLIDWORKS SHEET METAL SCANNER")
-    print("=" * 60)
-
-    print()
-    print("Connecting to SolidWorks...")
-
+    print("\nConnecting to SolidWorks...")
     try:
         sw_app = win32com.client.Dispatch("SldWorks.Application")
         sw_app.Visible = True
-
         print("Connected successfully.")
         return sw_app
-
-    except Exception as e:
-        print(f"Could not connect to SolidWorks:\n{e}")
+    except Exception as exc:
+        print(f"Could not connect to SolidWorks: {exc}")
         return None
-
-
-# =========================================================
-# SELECT ASSEMBLY
-# =========================================================
 
 
 def select_assembly(input_folder):
     assemblies = find_assemblies(input_folder)
-
     if not assemblies:
-        print()
-        print(f"No .SLDASM files found in:\n{input_folder}")
+        print(f"\nNo .SLDASM files found in:\n{input_folder}")
         return None
-
-    print()
-    print("Assemblies found:")
-
-    for index, assembly in enumerate(assemblies, start=1):
-        print(f"{index}. {assembly.name}")
-
-    # Use the first assembly automatically
+    print("\nAssemblies found:")
+    for i, assembly in enumerate(assemblies, 1):
+        print(f"  {i}. {assembly.name}")
     selected = assemblies[0]
-
-    print()
-    print("Selected:")
-    print(selected)
-
+    print(f"Selected: {selected}")
     return selected
 
 
-# =========================================================
-# PRINT COMPONENT SUMMARY
-# =========================================================
-
-
 def print_summary(components, unique_parts):
-    parts = 0
-    sub_assemblies = 0
-    unknown = 0
-
-    for component in components:
-        if component.is_part:
-            parts += 1
-        elif component.is_assembly:
-            sub_assemblies += 1
-        else:
-            unknown += 1
-
-    print()
-    print("=" * 60)
+    parts = sum(1 for c in components if c.is_part)
+    assemblies = sum(1 for c in components if c.is_assembly)
+    print("\n" + "=" * 60)
     print("ASSEMBLY SUMMARY")
     print("=" * 60)
-
     print(f"Total components: {len(components)}")
-    print(f"Part instances: {parts}")
-    print(f"Sub-assemblies: {sub_assemblies}")
-    print(f"Unknown: {unknown}")
-    print(f"Unique parts: {len(unique_parts)}")
+    print(f"Part instances:   {parts}")
+    print(f"Sub-assemblies:   {assemblies}")
+    print(f"Unique part/config: {len(unique_parts)}")
 
 
-# =========================================================
-# MAIN
-# =========================================================
+def save_run_summary(output_folder, assembly_path, scan_result, drawing_result):
+    data = {
+        "assembly": str(assembly_path),
+        "scan": {
+            "unique_parts": scan_result.get("unique_parts", 0),
+            "sheet_metal": scan_result.get("sheet_metal", 0),
+            "not_sheet_metal": scan_result.get("not_sheet_metal", 0),
+            "failed": scan_result.get("failed", 0),
+            "total_quantity": scan_result.get("total_quantity", 0),
+            "failed_parts": scan_result.get("failed_parts", []),
+        },
+        "drawings": {
+            "created": len(drawing_result.get("files", [])) if drawing_result else 0,
+            "failed_parts": drawing_result.get("failed_parts", []) if drawing_result else [],
+            "error": drawing_result.get("error") if drawing_result else None,
+            "files": [
+                {
+                    "thickness": item.get("thickness"),
+                    "unique_parts": item.get("unique_parts"),
+                    "quantity": item.get("quantity"),
+                    "path": str(item.get("path")),
+                    "is_dwg": item.get("is_dwg", False),
+                }
+                for item in (drawing_result.get("files", []) if drawing_result else [])
+            ],
+        },
+    }
+    path = Path(output_folder) / "run_summary.json"
+    try:
+        path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        print(f"Run summary saved: {path}")
+    except Exception as exc:
+        print(f"Could not save run summary: {exc}")
 
 
 def main():
     project_folder = Path(__file__).resolve().parent
     input_folder = project_folder / "input"
     output_folder = project_folder / "output"
+    input_folder.mkdir(exist_ok=True)
+    output_folder.mkdir(exist_ok=True)
 
-    input_folder.mkdir(parents=True, exist_ok=True)
-    output_folder.mkdir(parents=True, exist_ok=True)
-
-    # -----------------------------------------------------
-    # Connect
-    # -----------------------------------------------------
+    print("\n" + "=" * 60)
+    print("SOLIDWORKS SHEET METAL -> DXF/DWG EXPORTER")
+    print("=" * 60)
 
     sw_app = connect_to_solidworks()
     if sw_app is None:
-        return
-
-    # -----------------------------------------------------
-    # Find assembly
-    # -----------------------------------------------------
+        return 1
 
     assembly_path = select_assembly(input_folder)
     if assembly_path is None:
-        return
-
-    # -----------------------------------------------------
-    # Open assembly
-    # -----------------------------------------------------
+        return 1
 
     assembly = SolidWorksAssembly(sw_app)
-
     if not assembly.open(assembly_path):
-        print()
-        print("Could not open the assembly. Stopping.")
-        return
-
-    # -----------------------------------------------------
-    # Components + unique parts
-    # -----------------------------------------------------
+        print("Could not open assembly. Stopping.")
+        return 1
 
     components = assembly.get_components()
     if not components:
-        print()
         print("No components found. Stopping.")
-        return
+        return 1
 
     unique_parts = assembly.get_unique_part_quantities(components)
-
     print_summary(components, unique_parts)
 
-    # -----------------------------------------------------
-    # Sheet metal scan + CSV export
-    # -----------------------------------------------------
-
-    detector = SheetMetalDetector(
-        sw_app, assembly_path=assembly_path, read_thickness=GROUP_BY_THICKNESS
-    )
-
-    try:
-        result = detector.scan_and_export(unique_parts, output_folder)
-
-    except Exception as e:
-        print()
-        print("=" * 60)
-        print("SCAN FAILED")
-        print("=" * 60)
-        print(e)
-        return
-
-    # -----------------------------------------------------
-    # One drawing per thickness
-    # -----------------------------------------------------
+    detector = SheetMetalDetector(sw_app, assembly_path=assembly_path, read_thickness=GROUP_BY_THICKNESS)
+    scan_result = detector.scan_and_export(unique_parts, output_folder)
 
     drawing_result = None
-    exporter = DwgExporter(sw_app, assembly_path=assembly_path)
+    exporter = DwgExporter(
+        sw_app,
+        assembly_path=assembly_path,
+        reconnect=connect_to_solidworks,
+    )
     builder = ThicknessDwgBuilder(
         exporter,
         gap=PART_GAP,
@@ -208,67 +147,50 @@ def main():
 
     try:
         drawing_result = builder.build(
-            result["sheet_metal_parts"],
+            scan_result["sheet_metal_parts"],
             output_folder / ("by_thickness" if GROUP_BY_THICKNESS else "combined"),
             base_name=assembly_path.stem,
         )
-
-    except Exception as e:
-        print()
-        print("=" * 60)
-        print("DRAWING EXPORT FAILED")
-        print("=" * 60)
-        print(e)
-
+    except Exception as exc:
+        print("\nDRAWING EXPORT FAILED")
+        print(f"{type(exc).__name__}: {exc}")
+        traceback.print_exc()
+        drawing_result = {"files": [], "failed_parts": [], "error": str(exc)}
     finally:
-        exporter.activate_assembly(assembly.model)
-        detector.close_opened_models()
+        exporter.activate_assembly()
+        gc.collect()
+        try:
+            pythoncom.CoFreeUnusedLibraries()
+        except Exception:
+            pass
 
-    # -----------------------------------------------------
-    # Final result
-    # -----------------------------------------------------
+    save_run_summary(output_folder, assembly_path, scan_result, drawing_result)
 
-    print()
-    print("=" * 60)
+    print("\n" + "=" * 60)
     print("PROCESS FINISHED")
     print("=" * 60)
-
-    print(f"Sheet metal (unique parts): {result['sheet_metal']}")
-    print(f"Sheet metal (total quantity): {result['total_quantity']}")
-    print(f"Not sheet metal: {result['not_sheet_metal']}")
-    print(f"Failed: {result['failed']}")
-
-    if drawing_result is not None:
+    print(f"Sheet metal (unique): {scan_result['sheet_metal']}")
+    print(f"Sheet metal (quantity): {scan_result['total_quantity']}")
+    print(f"Not sheet metal: {scan_result['not_sheet_metal']}")
+    print(f"Scan failures: {scan_result['failed']}")
+    if drawing_result:
         print(f"Drawings created: {len(drawing_result['files'])}")
-        print(f"Parts not exported: {len(drawing_result['failed_parts'])}")
+        print(f"Export failures: {len(drawing_result['failed_parts'])}")
+    print(f"Output: {output_folder}")
+    return 0
 
-    print()
-    print("Output folder:")
-    print(output_folder)
-
-    print()
-
-
-# =========================================================
-# ENTRY POINT
-# =========================================================
 
 if __name__ == "__main__":
     pythoncom.CoInitialize()
-
     try:
-        main()
-
+        sys.exit(main())
     except KeyboardInterrupt:
-        print()
-        print("Process interrupted by user.")
-
-    except Exception as e:
-        print()
-        print("=" * 60)
-        print("UNEXPECTED ERROR")
-        print("=" * 60)
-        print(e)
-
+        print("\nInterrupted by user.")
+        sys.exit(130)
+    except Exception as exc:
+        print("\nUNEXPECTED ERROR")
+        print(f"{type(exc).__name__}: {exc}")
+        traceback.print_exc()
+        sys.exit(1)
     finally:
         pythoncom.CoUninitialize()

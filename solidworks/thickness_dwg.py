@@ -68,11 +68,6 @@ class ThicknessDwgBuilder:
             name = item["name"]
             label = f"[{index}/{total}] {name}"
 
-            model = item.get("model")
-            if model is None:
-                print(f"{label} -> FAILED: no model")
-                failed.append((name, "no model"))
-                continue
 
             base = self._safe(name)
             unique = base
@@ -85,7 +80,7 @@ class ThicknessDwgBuilder:
             dxf_path = dxf_folder / f"{unique}.dxf"
 
             try:
-                ok, message = self.exporter.export_part(model, dxf_path)
+                ok, message = self.exporter.export_part(item, dxf_path)
             except Exception as e:
                 ok, message = False, f"error: {e}"
 
