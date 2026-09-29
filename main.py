@@ -18,7 +18,7 @@ from solidworks.sheet_metal import SheetMetalDetector
 # Group the sheet metal parts by thickness (one drawing per thickness)?
 #   False -> ONE drawing with all sheet metal parts (thickness is not read)
 #   True  -> one drawing per thickness (needs the thickness to be readable)
-GROUP_BY_THICKNESS = False
+GROUP_BY_THICKNESS = True
 
 # Put every part as many times as its quantity into the drawing?
 #   False -> each part once, with a label "xN" (recommended for checking)
