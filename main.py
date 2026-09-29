@@ -1,6 +1,7 @@
 # main.py
 
 from pathlib import Path
+
 import pythoncom
 import win32com.client
 
@@ -14,7 +15,6 @@ from solidworks.sheet_metal import SheetMetalDetector
 
 
 def connect_to_solidworks():
-
     print()
     print("=" * 60)
     print("SOLIDWORKS SHEET METAL SCANNER")
@@ -25,16 +25,13 @@ def connect_to_solidworks():
 
     try:
         sw_app = win32com.client.Dispatch("SldWorks.Application")
-
         sw_app.Visible = True
 
         print("Connected successfully.")
-
         return sw_app
 
     except Exception as e:
         print(f"Could not connect to SolidWorks:\n{e}")
-
         return None
 
 
@@ -44,13 +41,11 @@ def connect_to_solidworks():
 
 
 def select_assembly(input_folder):
-
     assemblies = find_assemblies(input_folder)
 
     if not assemblies:
         print()
         print(f"No .SLDASM files found in:\n{input_folder}")
-
         return None
 
     print()
@@ -59,10 +54,7 @@ def select_assembly(input_folder):
     for index, assembly in enumerate(assemblies, start=1):
         print(f"{index}. {assembly.name}")
 
-    # -----------------------------------------------------
-    # Currently use the first assembly automatically
-    # -----------------------------------------------------
-
+    # Use the first assembly automatically
     selected = assemblies[0]
 
     print()
@@ -78,7 +70,6 @@ def select_assembly(input_folder):
 
 
 def print_summary(components, unique_parts):
-
     parts = 0
     sub_assemblies = 0
     unknown = 0
@@ -86,10 +77,8 @@ def print_summary(components, unique_parts):
     for component in components:
         if component.is_part:
             parts += 1
-
         elif component.is_assembly:
             sub_assemblies += 1
-
         else:
             unknown += 1
 
@@ -99,13 +88,9 @@ def print_summary(components, unique_parts):
     print("=" * 60)
 
     print(f"Total components: {len(components)}")
-
     print(f"Part instances: {parts}")
-
     print(f"Sub-assemblies: {sub_assemblies}")
-
     print(f"Unknown: {unknown}")
-
     print(f"Unique parts: {len(unique_parts)}")
 
 
@@ -115,28 +100,18 @@ def print_summary(components, unique_parts):
 
 
 def main():
-
-    # -----------------------------------------------------
-    # Project folders
-    # -----------------------------------------------------
-
     project_folder = Path(__file__).resolve().parent
-
     input_folder = project_folder / "input"
-
     output_folder = project_folder / "output"
 
-    # Create folders if necessary
     input_folder.mkdir(parents=True, exist_ok=True)
-
     output_folder.mkdir(parents=True, exist_ok=True)
 
     # -----------------------------------------------------
-    # Connect to SolidWorks
+    # Connect
     # -----------------------------------------------------
 
     sw_app = connect_to_solidworks()
-
     if sw_app is None:
         return
 
@@ -145,7 +120,6 @@ def main():
     # -----------------------------------------------------
 
     assembly_path = select_assembly(input_folder)
-
     if assembly_path is None:
         return
 
@@ -155,72 +129,40 @@ def main():
 
     assembly = SolidWorksAssembly(sw_app)
 
-    try:
-        assembly.open(assembly_path)
-
-    except Exception as e:
+    if not assembly.open(assembly_path):
         print()
-        print(f"Assembly open failed:\n{e}")
-
+        print("Could not open the assembly. Stopping.")
         return
 
     # -----------------------------------------------------
-    # Get all components
+    # Components + unique parts
     # -----------------------------------------------------
 
-    try:
-        components = assembly.get_components()
-
-    except Exception as e:
+    components = assembly.get_components()
+    if not components:
         print()
-        print(f"Component scan failed:\n{e}")
-
+        print("No components found. Stopping.")
         return
 
-    # -----------------------------------------------------
-    # Group unique parts
-    # -----------------------------------------------------
-
-    try:
-        unique_parts = assembly.get_unique_part_quantities(components)
-
-    except Exception as e:
-        print()
-        print(f"Unique part grouping failed:\n{e}")
-
-        return
-
-    # -----------------------------------------------------
-    # Summary
-    # -----------------------------------------------------
+    unique_parts = assembly.get_unique_part_quantities(components)
 
     print_summary(components, unique_parts)
 
     # -----------------------------------------------------
-    # Sheet Metal Detector
-    #
-    # IMPORTANT:
-    # Pass assembly_path so the detector can search for
-    # missing/old component paths next to the assembly.
+    # Sheet metal scan + CSV export
     # -----------------------------------------------------
 
     detector = SheetMetalDetector(sw_app, assembly_path=assembly_path)
 
-    # -----------------------------------------------------
-    # Scan + Export DWG
-    # -----------------------------------------------------
-
     try:
-        result = detector.scan_and_export(components, unique_parts, output_folder)
+        result = detector.scan_and_export(unique_parts, output_folder)
 
     except Exception as e:
         print()
         print("=" * 60)
         print("SCAN FAILED")
         print("=" * 60)
-
         print(e)
-
         return
 
     # -----------------------------------------------------
@@ -232,17 +174,15 @@ def main():
     print("PROCESS FINISHED")
     print("=" * 60)
 
-    print(f"Exported DWG: {result['exported']}")
-
-    print(f"Sheet Metal: {result['sheet_metal']}")
-
-    print(f"Not Sheet Metal: {result['not_sheet_metal']}")
-
+    print(f"Sheet metal (unique parts): {result['sheet_metal']}")
+    print(f"Sheet metal (total quantity): {result['total_quantity']}")
+    print(f"Not sheet metal: {result['not_sheet_metal']}")
     print(f"Failed: {result['failed']}")
 
-    print()
-    print("Output folder:")
-    print(output_folder)
+    if result["csv_path"]:
+        print()
+        print("CSV file:")
+        print(result["csv_path"])
 
     print()
 
@@ -266,7 +206,6 @@ if __name__ == "__main__":
         print("=" * 60)
         print("UNEXPECTED ERROR")
         print("=" * 60)
-
         print(e)
 
     finally:

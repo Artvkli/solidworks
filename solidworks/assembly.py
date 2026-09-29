@@ -5,11 +5,20 @@ import win32com.client
 
 from solidworks.component import Component
 
+# swOpenDocOptions_Silent
+SW_OPEN_SILENT = 1
+# swDocASSEMBLY
+SW_DOC_ASSEMBLY = 2
+
 
 class SolidWorksAssembly:
     def __init__(self, sw_app):
         self.sw_app = sw_app
         self.model = None
+
+    # =====================================================
+    # SAFE HELPERS
+    # =====================================================
 
     def _get(self, obj, name, default=None):
         if obj is None:
@@ -28,6 +37,17 @@ class SolidWorksAssembly:
 
         except Exception:
             return default
+
+    def _flag(self, obj, name):
+        """Read a boolean COM flag. Returns False if it cannot be read."""
+        value = self._get(obj, name, False)
+        if isinstance(value, (bool, int)):
+            return bool(value)
+        return False
+
+    # =====================================================
+    # OPEN
+    # =====================================================
 
     def open(self, file_path):
         file_path = Path(file_path)
@@ -57,6 +77,10 @@ class SolidWorksAssembly:
         print("Path:")
         print(file_path)
 
+        # -------------------------------------------------
+        # Already open?
+        # -------------------------------------------------
+
         try:
             existing_model = self.sw_app.GetOpenDocumentByName(str(file_path))
 
@@ -65,10 +89,7 @@ class SolidWorksAssembly:
 
                 print()
                 print("Assembly is already open.")
-
-                title = self._get(self.model, "GetTitle", file_path.stem)
-
-                print("Title:", title)
+                print("Title:", self._get(self.model, "GetTitle", file_path.stem))
 
                 return self._prepare_assembly()
 
@@ -78,38 +99,39 @@ class SolidWorksAssembly:
             print("Continuing with OpenDoc6...")
             print("Details:", e)
 
+        # -------------------------------------------------
+        # Open
+        # -------------------------------------------------
+
         try:
-            document_type = 2
-            options = 0
-
             errors = win32com.client.VARIANT(pythoncom.VT_BYREF | pythoncom.VT_I4, 0)
-
             warnings = win32com.client.VARIANT(pythoncom.VT_BYREF | pythoncom.VT_I4, 0)
 
             print()
             print("Opening with OpenDoc6...")
 
             model = self.sw_app.OpenDoc6(
-                str(file_path), document_type, options, "", errors, warnings
+                str(file_path),
+                SW_DOC_ASSEMBLY,
+                SW_OPEN_SILENT,
+                "",
+                errors,
+                warnings,
             )
 
             self.model = model
 
+            print("OpenDoc6 Errors:", errors.value)
+            print("OpenDoc6 Warnings:", warnings.value)
+
             if self.model is None:
                 print()
                 print("SolidWorks returned no model.")
-                print("OpenDoc6 Errors:", errors.value)
-                print("OpenDoc6 Warnings:", warnings.value)
                 return False
 
             print()
             print("Assembly opened successfully.")
-            print("OpenDoc6 Errors:", errors.value)
-            print("OpenDoc6 Warnings:", warnings.value)
-
-            title = self._get(self.model, "GetTitle", file_path.stem)
-
-            print("Title:", title)
+            print("Title:", self._get(self.model, "GetTitle", file_path.stem))
 
             return self._prepare_assembly()
 
@@ -136,6 +158,10 @@ class SolidWorksAssembly:
 
         return True
 
+    # =====================================================
+    # COMPONENTS
+    # =====================================================
+
     def get_components(self):
         if self.model is None:
             print()
@@ -148,6 +174,7 @@ class SolidWorksAssembly:
         print("=" * 60)
 
         try:
+            # TopOnly = False -> all levels (sub-assembly children included)
             sw_components = self.model.GetComponents(False)
 
         except Exception as e:
@@ -162,11 +189,22 @@ class SolidWorksAssembly:
             return []
 
         components = []
+        skipped_suppressed = 0
+        skipped_envelope = 0
 
         for sw_component in sw_components:
             try:
-                name = self._get(sw_component, "Name2", "Unknown")
+                # Suppressed components are not part of the model
+                if self._flag(sw_component, "IsSuppressed"):
+                    skipped_suppressed += 1
+                    continue
 
+                # Envelopes are reference geometry, not real parts
+                if self._flag(sw_component, "IsEnvelope"):
+                    skipped_envelope += 1
+                    continue
+
+                name = self._get(sw_component, "Name2", "Unknown")
                 path = self._get(sw_component, "GetPathName", None)
 
                 if not path:
@@ -182,27 +220,7 @@ class SolidWorksAssembly:
                 else:
                     continue
 
-                try:
-                    suppression = sw_component.GetSuppression
-                    if callable(suppression):
-                        suppression = suppression()
-                except Exception:
-                    suppression = None
-
-                try:
-                    lightweight = sw_component.IsLightWeight
-                    if callable(lightweight):
-                        lightweight = lightweight()
-                    lightweight = bool(lightweight)
-                except Exception:
-                    lightweight = False
-
-                try:
-                    configuration = sw_component.ReferencedConfiguration
-                    if callable(configuration):
-                        configuration = configuration()
-                except Exception:
-                    configuration = None
+                configuration = self._get(sw_component, "ReferencedConfiguration", None)
 
                 component = Component(
                     name=str(name),
@@ -212,8 +230,7 @@ class SolidWorksAssembly:
                 )
 
                 component.sw_component = sw_component
-                component.suppression = suppression
-                component.lightweight = lightweight
+                component.lightweight = self._flag(sw_component, "IsLightWeight")
                 component.configuration = configuration
 
                 components.append(component)
@@ -225,6 +242,10 @@ class SolidWorksAssembly:
 
         print()
         print("Components collected:", len(components))
+        if skipped_suppressed:
+            print("Skipped suppressed:", skipped_suppressed)
+        if skipped_envelope:
+            print("Skipped envelopes:", skipped_envelope)
 
         return components
 
