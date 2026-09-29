@@ -57,16 +57,30 @@ class DwgExporter:
 
     @staticmethod
     def _call(obj, name, *args, default=None):
+        """
+        Call a COM method safely.
+        pywin32 sometimes evaluates no-argument members right away and returns the
+        VALUE (a string, a number or a COM object) instead of a callable. Those
+        values are returned as they are.
+        """
         if obj is None:
             return default
         try:
-            method = getattr(obj, name)
-            if callable(method):
-                result = method(*args)
-                return default if result is None else result
+            attr = getattr(obj, name)
         except Exception:
-            pass
-        return default
+            return default
+        try:
+            if args:
+                result = attr(*args) if callable(attr) else default
+            elif hasattr(attr, "_oleobj_"):  # COM object already evaluated
+                result = attr
+            elif callable(attr):
+                result = attr()
+            else:  # plain value already evaluated
+                result = attr
+        except Exception:
+            return default
+        return default if result is None else result
 
     @staticmethod
     def _safe_filename(name):

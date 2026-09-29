@@ -15,6 +15,11 @@ from solidworks.sheet_metal import SheetMetalDetector
 # SETTINGS
 # =========================================================
 
+# Group the sheet metal parts by thickness (one drawing per thickness)?
+#   False -> ONE drawing with all sheet metal parts (thickness is not read)
+#   True  -> one drawing per thickness (needs the thickness to be readable)
+GROUP_BY_THICKNESS = False
+
 # Put every part as many times as its quantity into the drawing?
 #   False -> each part once, with a label "xN" (recommended for checking)
 #   True  -> N copies of each part (for cutting)
@@ -172,7 +177,7 @@ def main():
     # -----------------------------------------------------
 
     detector = SheetMetalDetector(
-        sw_app, assembly_path=assembly_path, read_thickness=True
+        sw_app, assembly_path=assembly_path, read_thickness=GROUP_BY_THICKNESS
     )
 
     try:
@@ -198,12 +203,13 @@ def main():
         max_row_width=MAX_ROW_WIDTH,
         repeat_by_quantity=REPEAT_BY_QUANTITY,
         oda_path=ODA_CONVERTER_PATH,
+        group_by_thickness=GROUP_BY_THICKNESS,
     )
 
     try:
         drawing_result = builder.build(
             result["sheet_metal_parts"],
-            output_folder / "by_thickness",
+            output_folder / ("by_thickness" if GROUP_BY_THICKNESS else "combined"),
             base_name=assembly_path.stem,
         )
 

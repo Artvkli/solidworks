@@ -24,7 +24,9 @@ class ThicknessDwgBuilder:
         repeat_by_quantity=False,
         oda_path=None,
         dwg_version="R2018",
+        group_by_thickness=True,
     ):
+        self.group_by_thickness = group_by_thickness
         self.exporter = exporter
         self.gap = gap
         self.max_row_width = max_row_width
@@ -184,16 +186,28 @@ class ThicknessDwgBuilder:
     # STEP 3: DXF -> DWG (optional)
     # =====================================================
 
+    @staticmethod
+    def _find_oda():
+        import os
+
+        for env in ("ProgramFiles", "ProgramFiles(x86)"):
+            base = os.environ.get(env)
+            if not base:
+                continue
+            matches = sorted(Path(base).glob("ODA/*/ODAFileConverter.exe"))
+            if matches:
+                return matches[-1]
+        return None
+
     def _convert_to_dwg(self, dxf_path):
         try:
             import ezdxf
             from ezdxf.addons import odafc
 
-            if self.oda_path:
+            oda_path = self.oda_path or self._find_oda()
+            if oda_path:
                 try:
-                    ezdxf.options.set(
-                        "odafc-addon", "win_exec_path", str(self.oda_path)
-                    )
+                    ezdxf.options.set("odafc-addon", "win_exec_path", str(oda_path))
                 except Exception:
                     pass
 
@@ -229,10 +243,13 @@ class ThicknessDwgBuilder:
             print("Install it with:  pip install ezdxf")
             return {"files": [], "failed_parts": [], "error": "ezdxf missing"}
 
-        parts = sorted(
-            [p for p in sheet_metal_parts if p.get("thickness") is not None],
-            key=lambda p: (p["thickness"], p["name"]),
-        )
+        if self.group_by_thickness:
+            parts = sorted(
+                [p for p in sheet_metal_parts if p.get("thickness") is not None],
+                key=lambda p: (p["thickness"], p["name"]),
+            )
+        else:
+            parts = sorted(sheet_metal_parts, key=lambda p: p["name"])
 
         exported, failed = self._export_part_dxfs(
             parts, output_folder / DXF_FOLDER_NAME
@@ -240,26 +257,34 @@ class ThicknessDwgBuilder:
 
         groups = {}
         for entry in exported:
-            groups.setdefault(entry["item"]["thickness"], []).append(entry)
+            key = entry["item"]["thickness"] if self.group_by_thickness else None
+            groups.setdefault(key, []).append(entry)
 
         print()
         print("=" * 60)
-        print("STEP 2/2: ONE DRAWING PER THICKNESS")
+        print("STEP 2/2: MERGE INTO DRAWING(S)")
         print("=" * 60)
 
         files = []
 
-        for thickness in sorted(groups):
+        for thickness in sorted(groups, key=lambda k: (k is None, k or 0)):
             entries = groups[thickness]
-            tag = self._format_thickness(thickness)
-            out_dxf = output_folder / f"{self._safe(base_name)}_{tag}mm.dxf"
+            if thickness is None:
+                tag = "ALL"
+                out_dxf = output_folder / f"{self._safe(base_name)}_all_sheet_metal.dxf"
+            else:
+                tag = f"{self._format_thickness(thickness)} mm"
+                out_dxf = (
+                    output_folder
+                    / f"{self._safe(base_name)}_{self._format_thickness(thickness)}mm.dxf"
+                )
 
             quantity = sum(int(e["item"]["quantity"]) for e in entries)
 
             try:
                 placed, skipped = self._merge(entries, out_dxf)
             except Exception as e:
-                print(f"{tag} mm -> MERGE FAILED: {e}")
+                print(f"{tag} -> MERGE FAILED: {e}")
                 failed.extend(
                     (e2["item"]["name"], f"merge failed: {e}") for e2 in entries
                 )
@@ -270,12 +295,12 @@ class ThicknessDwgBuilder:
 
             if dwg_path:
                 print(
-                    f"{tag} mm -> {len(entries)} parts "
+                    f"{tag} -> {len(entries)} parts "
                     f"(total quantity {quantity}) -> {dwg_path.name}"
                 )
             else:
                 print(
-                    f"{tag} mm -> {len(entries)} parts "
+                    f"{tag} -> {len(entries)} parts "
                     f"(total quantity {quantity}) -> {out_dxf.name} "
                     f"(DXF only: {message})"
                 )
@@ -299,8 +324,9 @@ class ThicknessDwgBuilder:
         print("=" * 60)
         for f in files:
             kind = "DWG" if f["is_dwg"] else "DXF"
+            label = "ALL" if f["thickness"] is None else f"{f['thickness']:g} mm"
             print(
-                f"{f['thickness']:>8g} mm | parts: {f['unique_parts']:<3} | "
+                f"{label:>8} | parts: {f['unique_parts']:<3} | "
                 f"qty: {f['quantity']:<4} | {kind}: {f['path'].name}"
             )
 
