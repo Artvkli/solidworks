@@ -25,8 +25,10 @@ class ThicknessDwgBuilder:
         oda_path=None,
         dwg_version="R2018",
         group_by_thickness=True,
+        label_height=10.0,
     ):
         self.group_by_thickness = group_by_thickness
+        self.label_height = label_height
         self.exporter = exporter
         self.gap = gap
         self.max_row_width = max_row_width
@@ -68,7 +70,6 @@ class ThicknessDwgBuilder:
             name = item["name"]
             label = f"[{index}/{total}] {name}"
 
-
             base = self._safe(name)
             unique = base
             counter = 2
@@ -97,6 +98,14 @@ class ThicknessDwgBuilder:
     # STEP 2: MERGE ONE THICKNESS INTO ONE DRAWING
     # =====================================================
 
+    def _label_texts(self, item, copy_index, copies):
+        quantity = int(item["quantity"])
+        if self.repeat_by_quantity and copies > 1:
+            qty_text = f"QTY: {quantity}  ({copy_index + 1}/{copies})"
+        else:
+            qty_text = f"QTY: {quantity}"
+        return qty_text, str(item["name"])
+
     def _merge(self, entries, out_dxf):
         import ezdxf
         from ezdxf import bbox
@@ -107,6 +116,9 @@ class ThicknessDwgBuilder:
 
         if "PART_LABELS" not in target.layers:
             target.layers.add("PART_LABELS", color=3)
+
+        lh = float(self.label_height)
+        label_area = lh * 3.0  # room under each part for the QTY line and the name line
 
         cursor_x = 0.0
         cursor_y = 0.0
@@ -137,15 +149,21 @@ class ThicknessDwgBuilder:
 
                 width = box.size.x
                 height = box.size.y
-                label_space = max(10.0, self.gap)
 
-                if cursor_x > 0 and cursor_x + width > self.max_row_width:
+                qty_text, name_text = self._label_texts(item, copy_index, copies)
+
+                # a cell is at least as wide as its text, so labels never overlap
+                text_width = max(len(qty_text), len(name_text) * 0.7) * lh * 0.8
+                cell_width = max(width, text_width)
+
+                if cursor_x > 0 and cursor_x + cell_width > self.max_row_width:
                     cursor_x = 0.0
                     cursor_y += row_height + self.gap
                     row_height = 0.0
 
+                # part sits above its label area
                 dx = cursor_x - box.extmin.x
-                dy = cursor_y - box.extmin.y
+                dy = (cursor_y + label_area) - box.extmin.y
 
                 entities = list(source_msp)
                 for entity in entities:
@@ -155,23 +173,26 @@ class ThicknessDwgBuilder:
                 importer.import_entities(entities, target_msp)
                 importer.finalize()
 
-                label = item["name"]
-                if self.repeat_by_quantity and copies > 1:
-                    label += f"  ({copy_index + 1}/{copies})"
-                elif not self.repeat_by_quantity:
-                    label += f"  x{item['quantity']}"
-
+                # QTY directly under the part, the part name below it
                 target_msp.add_text(
-                    label,
-                    height=max(4.0, label_space * 0.5),
+                    qty_text,
+                    height=lh,
                     dxfattribs={
                         "layer": "PART_LABELS",
-                        "insert": (cursor_x, cursor_y + height + 2.0),
+                        "insert": (cursor_x, cursor_y + lh * 1.6),
+                    },
+                )
+                target_msp.add_text(
+                    name_text,
+                    height=lh * 0.7,
+                    dxfattribs={
+                        "layer": "PART_LABELS",
+                        "insert": (cursor_x, cursor_y + lh * 0.3),
                     },
                 )
 
-                row_height = max(row_height, height + label_space)
-                cursor_x += width + self.gap
+                row_height = max(row_height, height + label_area)
+                cursor_x += cell_width + self.gap
                 placed += 1
 
         target.saveas(str(out_dxf))

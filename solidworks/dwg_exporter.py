@@ -76,14 +76,18 @@ class DwgExporter:
     @staticmethod
     def _is_connection_error(exc):
         text = str(exc).lower()
-        return any(token in text for token in (
-            "rpc server is unavailable",
-            "server execution failed",
-            "object invoked has disconnected",
-            "disconnected from its clients",
-            "automation error",
-            "catastrophic failure",
-        ))
+        return any(
+            token in text
+            for token in (
+                "rpc server is unavailable",
+                "remote procedure call failed",
+                "server execution failed",
+                "object invoked has disconnected",
+                "disconnected from its clients",
+                "automation error",
+                "catastrophic failure",
+            )
+        )
 
     def _reconnect(self):
         if not self.reconnect:
@@ -109,16 +113,28 @@ class DwgExporter:
         errors = self._byref_i4()
         warnings = self._byref_i4()
         try:
-            model = self.sw_app.OpenDoc6(str(path), SW_DOC_PART, SW_OPEN_SILENT, "", errors, warnings)
+            model = self.sw_app.OpenDoc6(
+                str(path), SW_DOC_PART, SW_OPEN_SILENT, "", errors, warnings
+            )
             if model is None:
-                return None, False, f"OpenDoc6 returned None (errors={getattr(errors, 'value', errors)}, warnings={getattr(warnings, 'value', warnings)})"
-            return model, True, f"opened (errors={getattr(errors, 'value', errors)}, warnings={getattr(warnings, 'value', warnings)})"
+                return (
+                    None,
+                    False,
+                    f"OpenDoc6 returned None (errors={getattr(errors, 'value', errors)}, warnings={getattr(warnings, 'value', warnings)})",
+                )
+            return (
+                model,
+                True,
+                f"opened (errors={getattr(errors, 'value', errors)}, warnings={getattr(warnings, 'value', warnings)})",
+            )
         except Exception as exc:
             if self._is_connection_error(exc) and self._reconnect():
                 errors = self._byref_i4()
                 warnings = self._byref_i4()
                 try:
-                    model = self.sw_app.OpenDoc6(str(path), SW_DOC_PART, SW_OPEN_SILENT, "", errors, warnings)
+                    model = self.sw_app.OpenDoc6(
+                        str(path), SW_DOC_PART, SW_OPEN_SILENT, "", errors, warnings
+                    )
                     if model is not None:
                         return model, True, "opened after SolidWorks reconnect"
                 except Exception as exc2:
@@ -150,7 +166,7 @@ class DwgExporter:
         try:
             result = model.ShowConfiguration2(str(configuration))
             return bool(result), previous
-        except Exception as exc:
+        except Exception:
             return False, previous
 
     def _restore_configuration(self, model, previous):
@@ -206,7 +222,9 @@ class DwgExporter:
                 )
                 if bool(result) and self._written(output_path):
                     return True, f"ExportToDWG2 returned {result}"
-                attempts.append(f"returned {result!r}, file={self._written(output_path)}")
+                attempts.append(
+                    f"returned {result!r}, file={self._written(output_path)}"
+                )
             except Exception as exc:
                 attempts.append(f"{type(exc).__name__}: {exc}")
         return False, "ExportToDWG2 failed: " + " | ".join(attempts)
@@ -219,24 +237,48 @@ class DwgExporter:
             was_suppressed = bool(self._get(flat_pattern, "IsSuppressed", False))
             if was_suppressed:
                 try:
-                    flat_pattern.SetSuppression2(SW_UNSUPPRESS, SW_THIS_CONFIGURATION, None)
+                    flat_pattern.SetSuppression2(
+                        SW_UNSUPPRESS, SW_THIS_CONFIGURATION, None
+                    )
                 except Exception as exc:
                     return False, f"could not unsuppress Flat-Pattern: {exc}"
             try:
                 result = model.ExportFlatPatternView(str(output_path), 0)
                 if self._written(output_path):
                     return True, f"ExportFlatPatternView returned {result}"
-                return False, f"ExportFlatPatternView returned {result!r} but created no file"
+                return (
+                    False,
+                    f"ExportFlatPatternView returned {result!r} but created no file",
+                )
             except Exception as exc:
                 return False, f"ExportFlatPatternView exception: {exc}"
         finally:
             if was_suppressed:
                 try:
-                    flat_pattern.SetSuppression2(SW_SUPPRESS, SW_THIS_CONFIGURATION, None)
+                    flat_pattern.SetSuppression2(
+                        SW_SUPPRESS, SW_THIS_CONFIGURATION, None
+                    )
                 except Exception:
                     pass
 
-    def export_part(self, item, output_path, attempt=1):
+    # =====================================================
+    # EXPORT ONE PART (with one retry after a lost connection)
+    # =====================================================
+
+    def export_part(self, item, output_path):
+        ok, message = self._export_part_once(item, output_path, attempt=1)
+
+        if not ok and self._is_connection_error(RuntimeError(message)):
+            print(
+                "  SolidWorks connection problem. Reconnecting and retrying this part once..."
+            )
+            time.sleep(3)
+            if self._reconnect():
+                ok, message = self._export_part_once(item, output_path, attempt=2)
+
+        return ok, message
+
+    def _export_part_once(self, item, output_path, attempt=1):
         output_path = Path(output_path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
         if output_path.exists():
@@ -264,11 +306,20 @@ class DwgExporter:
             if model is None:
                 return False, open_status
 
-            config_ok, previous_config = self._activate_configuration(model, configuration)
+            config_ok, previous_config = self._activate_configuration(
+                model, configuration
+            )
             diagnostics["configuration_ok"] = config_ok
-            diagnostics["active_configuration"] = self._get(self._call(self._call(model, "ConfigurationManager"), "ActiveConfiguration"), "Name")
+            diagnostics["active_configuration"] = self._get(
+                self._call(
+                    self._call(model, "ConfigurationManager"), "ActiveConfiguration"
+                ),
+                "Name",
+            )
             if configuration and not config_ok:
-                diagnostics["warning"] = f"could not activate configuration {configuration}"
+                diagnostics["warning"] = (
+                    f"could not activate configuration {configuration}"
+                )
 
             rebuilt, rebuild_message = self._rebuild(model)
             diagnostics["rebuild"] = rebuild_message
@@ -280,7 +331,9 @@ class DwgExporter:
             ok, message = self._export_to_dwg2(model, output_path)
             diagnostics["primary_export"] = message
             if not ok:
-                fallback_ok, fallback_message = self._export_flat_pattern_fallback(model, output_path, flat_pattern)
+                fallback_ok, fallback_message = self._export_flat_pattern_fallback(
+                    model, output_path, flat_pattern
+                )
                 diagnostics["fallback_export"] = fallback_message
                 if fallback_ok:
                     diagnostics["elapsed_sec"] = round(time.time() - started, 3)
@@ -299,9 +352,6 @@ class DwgExporter:
             diagnostics["exception"] = f"{type(exc).__name__}: {exc}"
             diagnostics["elapsed_sec"] = round(time.time() - started, 3)
             self.last_error = diagnostics
-            if self._is_connection_error(exc) and attempt == 1 and self._reconnect():
-                print("  SolidWorks connection was lost. Reconnecting and retrying this part once...")
-                return self.export_part(item, output_path, attempt=2)
             return False, self._format_failure(diagnostics)
         finally:
             if model is not None:
@@ -316,7 +366,9 @@ class DwgExporter:
         if not self.assembly_path:
             return False
         try:
-            self.sw_app.ActivateDoc3(str(self.assembly_path), False, SW_DONT_REBUILD, self._byref_i4())
+            self.sw_app.ActivateDoc3(
+                str(self.assembly_path), False, SW_DONT_REBUILD, self._byref_i4()
+            )
             return True
         except Exception:
             return False
