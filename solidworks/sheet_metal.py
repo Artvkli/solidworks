@@ -1,5 +1,6 @@
 import csv
 import gc
+import re
 from pathlib import Path
 
 import pythoncom
@@ -11,8 +12,41 @@ SW_OPEN_SILENT = 1
 SW_OPEN_READONLY = 2
 SW_TN_SHEET_METAL = "sheetmetal"
 MAX_FEATURES = 100000
-STANDARD_THICKNESSES_MM = (0.5, 0.6, 0.7, 0.8, 1.0, 1.2, 1.25, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0, 6.0, 8.0, 10.0)
+STANDARD_THICKNESSES_MM = (
+    0.5,
+    0.6,
+    0.7,
+    0.8,
+    1.0,
+    1.2,
+    1.25,
+    1.5,
+    2.0,
+    2.5,
+    3.0,
+    4.0,
+    5.0,
+    6.0,
+    8.0,
+    10.0,
+)
 SNAP_TOLERANCE = 0.08
+
+# ---------------------------------------------------------
+# Mirror detection
+# ---------------------------------------------------------
+# SolidWorks "Mirror Components" creates an opposite-hand part named "Mirror<original>".
+# The mirror part is a plain solid (not sheet metal), so it has no flat pattern of its own:
+# its flat pattern is the mirror image of the original's.
+MIRROR_PREFIX = re.compile(
+    r"^\s*mirror(?:ed)?[\s_\-\.]*(?P<rest>.+?)\s*$", re.IGNORECASE
+)
+MIRROR_SUFFIX = re.compile(
+    r"^\s*(?P<rest>.+?)[\s_\-\.]*mirror(?:ed)?(?:[\s_\-\.]*\(?\d+\)?)?\s*$",
+    re.IGNORECASE,
+)
+# A mirrored solid has exactly the same volume and surface area as the original.
+MIRROR_GEOMETRY_TOLERANCE = 1e-3  # relative difference
 
 
 class SheetMetalDetector:
@@ -83,10 +117,20 @@ class SheetMetalDetector:
         errors = self._byref_i4()
         warnings = self._byref_i4()
         try:
-            model = self.sw_app.OpenDoc6(str(path), SW_DOC_PART, options, "", errors, warnings)
+            model = self.sw_app.OpenDoc6(
+                str(path), SW_DOC_PART, options, "", errors, warnings
+            )
             if model is None:
-                return None, False, f"OpenDoc6 returned None (errors={getattr(errors, 'value', errors)}, warnings={getattr(warnings, 'value', warnings)})"
-            return model, True, f"opened (errors={getattr(errors, 'value', errors)}, warnings={getattr(warnings, 'value', warnings)})"
+                return (
+                    None,
+                    False,
+                    f"OpenDoc6 returned None (errors={getattr(errors, 'value', errors)}, warnings={getattr(warnings, 'value', warnings)})",
+                )
+            return (
+                model,
+                True,
+                f"opened (errors={getattr(errors, 'value', errors)}, warnings={getattr(warnings, 'value', warnings)})",
+            )
         except Exception as exc:
             return None, False, f"OpenDoc6 exception: {exc}"
 
@@ -111,7 +155,9 @@ class SheetMetalDetector:
             return True
         try:
             result = model.ShowConfiguration2(str(configuration))
-            return bool(result) or str(self._get(model, "GetActiveConfiguration", "")) == str(configuration)
+            return bool(result) or str(
+                self._get(model, "GetActiveConfiguration", "")
+            ) == str(configuration)
         except Exception:
             return False
 
@@ -235,11 +281,19 @@ class SheetMetalDetector:
             return nearest
         return round(raw_mm, 2)
 
-    def _estimate_thickness(self, model, debug):
+    def _mass_properties(self, model):
+        """(volume m3, surface area m2) of the part, or (None, None)."""
         extension = self._obj(model, "Extension")
-        mass = self._call(extension, "CreateMassProperty2") or self._call(extension, "CreateMassProperty")
-        volume = self._positive(self._get(mass, "Volume"))
-        area = self._positive(self._get(mass, "SurfaceArea"))
+        mass = self._call(extension, "CreateMassProperty2")
+        if mass is None:
+            mass = self._call(extension, "CreateMassProperty")
+        return (
+            self._positive(self._get(mass, "Volume")),
+            self._positive(self._get(mass, "SurfaceArea")),
+        )
+
+    def _estimate_thickness(self, model, debug):
+        volume, area = self._mass_properties(model)
         debug.append(f"mass properties: volume={volume} m3, surface={area} m2")
         if not volume or not area:
             return None
@@ -271,7 +325,11 @@ class SheetMetalDetector:
                 return value
 
         for candidate in features:
-            if self._type_name(candidate) in {"sheetmetal", "smbaseflange", "baseflange"}:
+            if self._type_name(candidate) in {
+                "sheetmetal",
+                "smbaseflange",
+                "baseflange",
+            }:
                 value = self._thickness_from_display_dimensions(model, candidate)
                 if value:
                     self.last_thickness_source = "SolidWorks"
@@ -298,7 +356,10 @@ class SheetMetalDetector:
         features = self.get_features(model)
         feature = self.get_sheet_metal_feature(model, features)
         debug.append(f"features={len(features)}")
-        debug.append("SheetMetal feature=" + (str(self._get(feature, "Name")) if feature else "NOT FOUND"))
+        debug.append(
+            "SheetMetal feature="
+            + (str(self._get(feature, "Name")) if feature else "NOT FOUND")
+        )
 
         if feature is not None:
             self.last_method = "SheetMetal feature"
@@ -310,16 +371,148 @@ class SheetMetalDetector:
             if is_sm:
                 self.last_method = "Sheet metal body"
 
-        thickness = self.find_thickness(model, feature, features, debug) if is_sm and self.read_thickness else None
+        thickness = (
+            self.find_thickness(model, feature, features, debug)
+            if is_sm and self.read_thickness
+            else None
+        )
         return is_sm, thickness
 
     @staticmethod
     def thickness_mm(value):
         return round(float(value) * 1000, 3) if value is not None else None
 
+    # =====================================================
+    # MIRROR DETECTION
+    # =====================================================
+
+    @staticmethod
+    def _norm(name):
+        return re.sub(r"\s+", " ", str(name)).strip().lower()
+
+    @staticmethod
+    def mirror_hint(name):
+        """True if the part name looks like a SolidWorks mirror part ('Mirror<name>' / '<name>Mirror')."""
+        text = str(name)
+        return bool(MIRROR_PREFIX.match(text) or MIRROR_SUFFIX.match(text))
+
+    def mirror_source_names(self, name):
+        """Normalised names the original of this mirror part could have."""
+        rests = []
+        for pattern in (MIRROR_PREFIX, MIRROR_SUFFIX):
+            match = pattern.match(str(name))
+            if match:
+                rests.append(match.group("rest"))
+
+        names = []
+        for rest in rests:
+            names.append(self._norm(rest))
+            # "MirrorAHU 3500-02-03-08.C" -> also try without the trailing ".C" style suffix
+            names.append(self._norm(re.sub(r"\.[A-Za-z0-9]{1,12}$", "", rest)))
+        return {n for n in names if n}
+
+    @staticmethod
+    def _same_geometry(a, b):
+        """True / False, or None when volume or area is not available for one of them."""
+        values = (a.get("volume"), a.get("area"), b.get("volume"), b.get("area"))
+        if any(v is None for v in values):
+            return None
+        vol_a, area_a, vol_b, area_b = values
+        vol_diff = abs(vol_a - vol_b) / max(vol_a, vol_b)
+        area_diff = abs(area_a - area_b) / max(area_a, area_b)
+        return (
+            vol_diff <= MIRROR_GEOMETRY_TOLERANCE
+            and area_diff <= MIRROR_GEOMETRY_TOLERANCE
+        )
+
+    def _find_mirror_source(self, mirror, sources):
+        """Returns (source, method, note). source is None when nothing reliable was found."""
+        names = self.mirror_source_names(mirror["name"])
+        by_name = [s for s in sources if self._norm(s["name"]) in names]
+
+        if by_name:
+            confirmed = [s for s in by_name if self._same_geometry(mirror, s) is True]
+            if confirmed:
+                return confirmed[0], "name + geometry", ""
+            unknown = [s for s in by_name if self._same_geometry(mirror, s) is None]
+            if len(unknown) == 1:
+                return unknown[0], "name only (geometry could not be compared)", ""
+            return (
+                None,
+                "",
+                (
+                    f"name matches '{by_name[0]['name']}' but the geometry differs - not merged"
+                ),
+            )
+
+        confirmed = [s for s in sources if self._same_geometry(mirror, s) is True]
+        if len(confirmed) == 1:
+            return confirmed[0], "geometry only", ""
+
+        return None, "", "no original found"
+
+    def _resolve_mirrors(self, sheet_parts, candidates):
+        """
+        Adds the quantity of every mirror part to the quantity of its original.
+
+        candidates: mirror-named parts that are NOT sheet metal (opposite-hand solids).
+        Mirror-named parts that ARE sheet metal are also merged when their original is found.
+        Returns (links, number_of_non_sheet_mirror_parts_merged). sheet_parts is modified in place.
+        """
+        mirror_like_sheet = [p for p in sheet_parts if self.mirror_hint(p["name"])]
+        sources = [p for p in sheet_parts if not self.mirror_hint(p["name"])]
+
+        pool = [(c, False) for c in candidates] + [(p, True) for p in mirror_like_sheet]
+
+        links = []
+        merged_sheet = []
+        merged_non_sheet = 0
+
+        for mirror, is_sheet in pool:
+            source, method, note = self._find_mirror_source(mirror, sources)
+
+            if source is None:
+                links.append(
+                    {
+                        "mirror": mirror["name"],
+                        "source": None,
+                        "quantity": mirror["quantity"],
+                        "method": note,
+                    }
+                )
+                continue
+
+            source["mirror_quantity"] += mirror["quantity"]
+            source["quantity"] += mirror["quantity"]
+            source["mirror_parts"].append(mirror["name"])
+
+            links.append(
+                {
+                    "mirror": mirror["name"],
+                    "source": source["name"],
+                    "quantity": mirror["quantity"],
+                    "method": method,
+                }
+            )
+
+            if is_sheet:
+                merged_sheet.append(mirror)
+            else:
+                merged_non_sheet += 1
+
+        for mirror in merged_sheet:
+            sheet_parts.remove(mirror)
+
+        return links, merged_non_sheet
+
+    # =====================================================
+    # SCAN
+    # =====================================================
+
     def scan_sheet_metal(self, unique_parts):
         total = len(unique_parts)
         sheet_parts, failed, not_sheet_metal = [], [], 0
+        mirror_candidates = []
         print("\n" + "=" * 60 + "\nSTEP 1/2: SCAN SHEET METAL\n" + "=" * 60)
 
         for index, part in enumerate(unique_parts, 1):
@@ -340,11 +533,34 @@ class SheetMetalDetector:
                 if not rebuilt:
                     print(f"{label} -> warning: {rebuild_msg}")
                 is_sm, thickness = self.analyze_model(model)
+
+                # volume / area are only needed to confirm mirror pairs
+                volume = area = None
+                if is_sm or self.mirror_hint(name):
+                    volume, area = self._mass_properties(model)
+
                 if not is_sm:
                     not_sheet_metal += 1
-                    print(f"{label} -> not sheet metal")
+                    if self.mirror_hint(name):
+                        mirror_candidates.append(
+                            {
+                                "name": name,
+                                "path": str(part["path"]),
+                                "quantity": int(part["quantity"]),
+                                "configuration": part.get("configuration"),
+                                "volume": volume,
+                                "area": area,
+                            }
+                        )
+                        print(
+                            f"{label} -> not sheet metal (mirror-like name, checked later)"
+                        )
+                    else:
+                        print(f"{label} -> not sheet metal")
                     continue
-                thickness_mm = self.thickness_mm(thickness) if self.read_thickness else None
+                thickness_mm = (
+                    self.thickness_mm(thickness) if self.read_thickness else None
+                )
                 if self.read_thickness and thickness_mm is None:
                     failed.append((name, "sheet metal detected, thickness not found"))
                     print(f"{label} -> FAILED: thickness not found")
@@ -355,14 +571,23 @@ class SheetMetalDetector:
                     "name": name,
                     "path": str(part["path"]),
                     "quantity": int(part["quantity"]),
+                    "own_quantity": int(part["quantity"]),
+                    "mirror_quantity": 0,
+                    "mirror_parts": [],
                     "configuration": part.get("configuration"),
                     "thickness": thickness_mm,
                     "method": self.last_method,
                     "thickness_source": self.last_thickness_source,
                     "thickness_raw_mm": self.last_thickness_raw_mm,
+                    "volume": volume,
+                    "area": area,
                 }
                 sheet_parts.append(record)
-                suffix = f", {thickness_mm:g} mm [{self.last_thickness_source}]" if thickness_mm is not None else ""
+                suffix = (
+                    f", {thickness_mm:g} mm [{self.last_thickness_source}]"
+                    if thickness_mm is not None
+                    else ""
+                )
                 print(f"{label} -> SHEET METAL ({self.last_method}){suffix}")
             except Exception as exc:
                 failed.append((name, f"scan error: {exc}"))
@@ -370,23 +595,52 @@ class SheetMetalDetector:
             finally:
                 self.close_if_opened(model, opened)
 
+        # ---------------- mirrors ----------------
+        mirror_links, merged_non_sheet = self._resolve_mirrors(
+            sheet_parts, mirror_candidates
+        )
+        not_sheet_metal -= merged_non_sheet
+
+        print("\n" + "=" * 60 + "\nMIRROR PARTS\n" + "=" * 60)
+        if not mirror_links:
+            print("No mirror parts found.")
+        for link in mirror_links:
+            if link["source"] is not None:
+                print(
+                    f"{link['mirror']} (x{link['quantity']}) -> added to "
+                    f"{link['source']}  [{link['method']}]"
+                )
+            else:
+                print(
+                    f"{link['mirror']} (x{link['quantity']}) -> NOT merged: {link['method']}"
+                )
+
         groups = {}
         for item in sheet_parts:
             key = item["thickness"] if self.read_thickness else None
-            g = groups.setdefault(key, {"thickness": key, "unique_parts": 0, "quantity": 0, "parts": []})
+            g = groups.setdefault(
+                key, {"thickness": key, "unique_parts": 0, "quantity": 0, "parts": []}
+            )
             g["unique_parts"] += 1
             g["quantity"] += item["quantity"]
             g["parts"].append(item)
 
+        total_quantity = sum(x["quantity"] for x in sheet_parts)
+
         print("\n" + "=" * 60 + "\nSCAN SUMMARY\n" + "=" * 60)
         print(f"Unique parts scanned: {total}")
         print(f"Sheet metal:          {len(sheet_parts)}")
+        print(
+            f"Mirror parts merged:  {sum(1 for l in mirror_links if l['source'] is not None)}"
+        )
         print(f"Not sheet metal:      {not_sheet_metal}")
         print(f"Scan failures:        {len(failed)}")
-        print(f"Total quantity:       {sum(x['quantity'] for x in sheet_parts)}")
+        print(f"Total quantity:       {total_quantity}  (mirrors included)")
         for thickness in sorted(k for k in groups if k is not None):
             g = groups[thickness]
-            print(f"  {thickness:g} mm | parts={g['unique_parts']} | qty={g['quantity']}")
+            print(
+                f"  {thickness:g} mm | parts={g['unique_parts']} | qty={g['quantity']}"
+            )
 
         return {
             "unique_parts": total,
@@ -394,16 +648,20 @@ class SheetMetalDetector:
             "not_sheet_metal": not_sheet_metal,
             "failed": len(failed),
             "failed_parts": failed,
-            "total_quantity": sum(x["quantity"] for x in sheet_parts),
+            "total_quantity": total_quantity,
             "sheet_metal_parts": sheet_parts,
             "thickness_groups": groups,
+            "mirror_links": mirror_links,
             "csv_path": None,
         }
 
     def scan_and_export(self, unique_parts, output_folder=None):
         result = self.scan_sheet_metal(unique_parts)
         if output_folder:
-            path = Path(output_folder) / f"{self.assembly_path.stem if self.assembly_path else 'assembly'}_sheet_metal.csv"
+            path = (
+                Path(output_folder)
+                / f"{self.assembly_path.stem if self.assembly_path else 'assembly'}_sheet_metal.csv"
+            )
             if self.export_csv(result, path):
                 result["csv_path"] = path
         return result
@@ -414,9 +672,36 @@ class SheetMetalDetector:
             csv_path.parent.mkdir(parents=True, exist_ok=True)
             with csv_path.open("w", newline="", encoding="utf-8-sig") as f:
                 writer = csv.writer(f)
-                writer.writerow(["Thickness (mm)", "Part", "Configuration", "Quantity", "Thickness source", "Raw value (mm)"])
-                for item in sorted(result["sheet_metal_parts"], key=lambda x: (x["thickness"] or 0, x["name"])):
-                    writer.writerow([item["thickness"], item["name"], item.get("configuration") or "", item["quantity"], item.get("thickness_source", ""), item.get("thickness_raw_mm", "")])
+                writer.writerow(
+                    [
+                        "Thickness (mm)",
+                        "Part",
+                        "Configuration",
+                        "Total quantity",
+                        "Own quantity",
+                        "Mirror quantity",
+                        "Mirror parts",
+                        "Thickness source",
+                        "Raw value (mm)",
+                    ]
+                )
+                for item in sorted(
+                    result["sheet_metal_parts"],
+                    key=lambda x: (x["thickness"] or 0, x["name"]),
+                ):
+                    writer.writerow(
+                        [
+                            item["thickness"],
+                            item["name"],
+                            item.get("configuration") or "",
+                            item["quantity"],
+                            item.get("own_quantity", item["quantity"]),
+                            item.get("mirror_quantity", 0),
+                            "; ".join(item.get("mirror_parts", [])),
+                            item.get("thickness_source", ""),
+                            item.get("thickness_raw_mm", ""),
+                        ]
+                    )
             print(f"CSV saved: {csv_path}")
             return True
         except Exception as exc:

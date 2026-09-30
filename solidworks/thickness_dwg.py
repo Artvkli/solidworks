@@ -99,11 +99,19 @@ class ThicknessDwgBuilder:
     # =====================================================
 
     def _label_texts(self, item, copy_index, copies):
-        quantity = int(item["quantity"])
+        quantity = int(item["quantity"])  # already includes the mirror parts
+        mirror = int(item.get("mirror_quantity", 0) or 0)
+        own = quantity - mirror
+
         if self.repeat_by_quantity and copies > 1:
             qty_text = f"QTY: {quantity}  ({copy_index + 1}/{copies})"
+            if mirror and copy_index >= own:
+                qty_text += "  MIRROR"
         else:
             qty_text = f"QTY: {quantity}"
+            if mirror:
+                qty_text += f"  ({own} + {mirror} MIRROR)"
+
         return qty_text, str(item["name"])
 
     def _merge(self, entries, out_dxf):
