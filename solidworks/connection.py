@@ -2,7 +2,6 @@ import win32com.client
 
 
 class SolidWorksConnection:
-
     def __init__(self):
         self.sw_app = None
 
@@ -10,9 +9,7 @@ class SolidWorksConnection:
         """Connect to an already running SolidWorks instance."""
 
         try:
-            self.sw_app = win32com.client.GetActiveObject(
-                "SldWorks.Application"
-            )
+            self.sw_app = win32com.client.GetActiveObject("SldWorks.Application")
 
             print("Connected to SolidWorks successfully!")
             print("Version:", self.sw_app.RevisionNumber)
