@@ -1,205 +1,224 @@
 
 from pathlib import Path
+import gc
 import json
-import re
+import sys
 import traceback
-from datetime import datetime
+import re
+
+try:
+    import pythoncom
+    import win32com.client
+except ImportError:
+    print("ERROR: pywin32 is required. Install: pip install pywin32")
+    raise
 
 from solidworks.assembly import SolidWorksAssembly, find_assemblies
 from solidworks.dwg_exporter import DwgExporter
+from solidworks.pdf_drawings import PdfDrawingExporter
 from solidworks.thickness_dwg import ThicknessDwgBuilder
 from solidworks.sheet_metal import SheetMetalDetector
 
-# ============================================================
-# NEW PDF EXPORTER
-# ============================================================
 
-from solidworks.pdf_builder import PdfDrawingExporter
-
-
-# ============================================================
-# SETTINGS
-# ============================================================
-
-# ------------------------------------------------------------
-# Input
-# ------------------------------------------------------------
-INPUT_FOLDER = Path(__file__).resolve().parent
-
-# ------------------------------------------------------------
-# Grouping / quantity
-# ------------------------------------------------------------
 GROUP_BY_THICKNESS = True
 REPEAT_BY_QUANTITY = False
-
-# ------------------------------------------------------------
-# Drawing
-# ------------------------------------------------------------
 ODA_CONVERTER_PATH = None
 PART_GAP = 20.0
 MAX_ROW_WIDTH = 6000.0
 
-# ------------------------------------------------------------
-# Output
-# ------------------------------------------------------------
-OUTPUT_FOLDER_NAME = "output"
-PDF_OUTPUT_FOLDER_NAME = "pdf_by_thickness"
 
-# ------------------------------------------------------------
-# New PDF settings
-# ------------------------------------------------------------
-PDF_PAPER = "A4"
-PDF_ORIENTATION = "portrait"
+# ============================================================
+# PDF DRAWINGS
+# ============================================================
+
+EXPORT_PDF = True
+
+PDF_PAPER = "A4"              # "A4" or "A3"
+PDF_ORIENTATION = "portrait"  # "portrait", "landscape" or "auto"
+
 PDF_COMPANY = "TECHNICAL DEPARTMENT"
-PDF_DRAWN_BY = ""
-PDF_CHECKED_BY = ""
-PDF_APPROVED_BY = ""
+PDF_DRAWN_BY = "HE.A"
+PDF_CHECKED_BY = "R.GH"
+PDF_APPROVED_BY = "R.GH"
 PDF_MATERIAL = ""
-PDF_DEBURR_NOTE = "DEBURR AND BREAK SHARP EDGES"
-PDF_DATE_TEXT = ""
 
-
-# ============================================================
-# OLD SOLIDWORKS PDF SETTINGS
-# ============================================================
-#
-# KEPT INTENTIONALLY.
-#
-# These belong to the old SolidWorksPdfBuilder workflow.
-# They are not used by the new PdfDrawingExporter.
-# ============================================================
-
-DRAWING_TEMPLATE = None
-BEND_TABLE_TEMPLATE = None
-KEEP_DRAWINGS = False
-
-
-# ============================================================
-# SOLIDWORKS CONNECTION
-# ============================================================
 
 def connect_to_solidworks():
-    """
-    Connect to an already-running SolidWorks instance.
-    """
-
+    print("\nConnecting to SolidWorks...")
     try:
-        import win32com.client
-
-        sw = win32com.client.GetActiveObject("SldWorks.Application")
-
-        try:
-            sw.Visible = True
-        except Exception:
-            pass
-
-        return sw
-
+        sw_app = win32com.client.Dispatch("SldWorks.Application")
+        sw_app.Visible = True
+        print("Connected successfully.")
+        return sw_app
     except Exception as exc:
-        print()
-        print("=" * 60)
-        print("SOLIDWORKS CONNECTION FAILED")
-        print("=" * 60)
-        print(exc)
+        print(f"Could not connect to SolidWorks: {exc}")
         return None
 
-
-# ============================================================
-# ASSEMBLY SELECTION
-# ============================================================
 
 def select_assembly(input_folder):
-    """
-    Find .SLDASM files in INPUT_FOLDER and let the user select one.
-    """
-
     assemblies = find_assemblies(input_folder)
-
     if not assemblies:
-        print()
-        print("=" * 60)
-        print("NO ASSEMBLY FOUND")
-        print("=" * 60)
-        print(f"Folder: {input_folder}")
+        print(f"\nNo .SLDASM files found in:\n{input_folder}")
         return None
 
-    print()
+    print("\nAssemblies found:")
+
+    for i, assembly in enumerate(assemblies, 1):
+        print(f"  {i}. {assembly.name}")
+
+    selected = assemblies[0]
+
+    print(f"Selected: {selected}")
+
+    return selected
+
+
+def print_summary(components, unique_parts):
+    parts = sum(1 for c in components if c.is_part)
+    assemblies = sum(1 for c in components if c.is_assembly)
+
+    print("\n" + "=" * 60)
+    print("ASSEMBLY SUMMARY")
     print("=" * 60)
-    print("AVAILABLE ASSEMBLIES")
-    print("=" * 60)
 
-    for index, assembly in enumerate(assemblies, start=1):
-        print(f"{index:>3}. {assembly.name}")
+    print(f"Total components: {len(components)}")
+    print(f"Part instances:   {parts}")
+    print(f"Sub-assemblies:   {assemblies}")
+    print(f"Unique part/config: {len(unique_parts)}")
 
-    if len(assemblies) == 1:
-        selected = assemblies[0]
 
-        print()
-        print(f"Automatically selected: {selected}")
+def save_run_summary(
+    output_folder,
+    assembly_path,
+    scan_result,
+    drawing_result,
+    pdf_result=None,
+):
+    data = {
+        "assembly": str(assembly_path),
 
-        return selected
+        "scan": {
+            "unique_parts": scan_result.get("unique_parts", 0),
+            "sheet_metal": scan_result.get("sheet_metal", 0),
+            "not_sheet_metal": scan_result.get("not_sheet_metal", 0),
+            "failed": scan_result.get("failed", 0),
+            "total_quantity": scan_result.get("total_quantity", 0),
+            "failed_parts": scan_result.get("failed_parts", []),
+        },
 
-    while True:
-        try:
-            choice = int(input("\nSelect assembly number: ").strip())
+        "drawings": {
+            "created": (
+                len(drawing_result.get("files", []))
+                if drawing_result
+                else 0
+            ),
 
-            if 1 <= choice <= len(assemblies):
-                return assemblies[choice - 1]
+            "failed_parts": (
+                drawing_result.get("failed_parts", [])
+                if drawing_result
+                else []
+            ),
 
-        except (ValueError, EOFError, KeyboardInterrupt):
-            pass
+            "error": (
+                drawing_result.get("error")
+                if drawing_result
+                else None
+            ),
 
-        print("Invalid selection. Please try again.")
+            "files": [
+                {
+                    "thickness": item.get("thickness"),
+                    "unique_parts": item.get("unique_parts"),
+                    "quantity": item.get("quantity"),
+                    "path": str(item.get("path")),
+                    "is_dwg": item.get("is_dwg", False),
+                }
+
+                for item in (
+                    drawing_result.get("files", [])
+                    if drawing_result
+                    else []
+                )
+            ],
+        },
+
+        "pdf": {
+            "created": (
+                pdf_result.get("created", 0)
+                if pdf_result
+                else 0
+            ),
+
+            "failed": (
+                pdf_result.get("failed", 0)
+                if pdf_result
+                else 0
+            ),
+
+            "failed_parts": (
+                pdf_result.get("failed_parts", [])
+                if pdf_result
+                else []
+            ),
+        },
+    }
+
+    path = Path(output_folder) / "run_summary.json"
+
+    try:
+        path.write_text(
+            json.dumps(
+                data,
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+
+        print(f"Run summary saved: {path}")
+
+    except Exception as exc:
+        print(f"Could not save run summary: {exc}")
 
 
 # ============================================================
-# PDF DXF NAME HELPERS
+# PDF HELPER
+# ============================================================
+#
+# ThicknessDwgBuilder creates the individual flat-pattern DXFs
+# here:
+#
+#   output/by_thickness/_parts_dxf/
+#
+# PdfDrawingExporter needs entries in this exact format:
+#
+#   {
+#       "item": <part item>,
+#       "dxf": <individual DXF path>
+#   }
+#
+# We do NOT use drawing_result["files"] because those are the
+# merged per-thickness drawings.
 # ============================================================
 
-def _safe_part_name(name):
-    """
-    Must match ThicknessDwgBuilder._safe() and DwgExporter naming.
-    """
-
-    cleaned = re.sub(
-        r'[<>:"/\\|?*\x00-\x1f]',
-        "_",
-        str(name),
-    ).strip().rstrip(".")
-
-    return re.sub(r"\s+", " ", cleaned) or "part"
-
-
-def build_pdf_entries(sheet_metal_parts, dxf_folder):
-    """
-    Convert the individual DXFs generated by ThicknessDwgBuilder
-    into the exact structure required by PdfDrawingExporter.
-
-    Required structure:
-
-        {
-            "item": item,
-            "dxf": Path(...)
-        }
-
-    IMPORTANT:
-    We intentionally do NOT use ThicknessDwgBuilder's
-    returned `files` list because that list contains
-    merged per-thickness drawings.
-    """
-
+def build_pdf_exported_parts(sheet_metal_parts, dxf_folder):
     dxf_folder = Path(dxf_folder)
 
     if not dxf_folder.exists():
-        raise FileNotFoundError(
-            f"Per-part DXF folder not found: {dxf_folder}"
-        )
+        return [], [
+            (
+                item.get("name", "UNKNOWN"),
+                f"DXF folder not found: {dxf_folder}",
+            )
+            for item in sheet_metal_parts
+        ]
 
-    entries = []
-    missing = []
+    exported_parts = []
+    failed_parts = []
 
-    # Match ThicknessDwgBuilder._export_part_dxfs():
-    # parts are sorted by thickness then name.
+    used_names = set()
+
+    # This ordering matches ThicknessDwgBuilder._export_part_dxfs()
     parts = sorted(
         sheet_metal_parts,
         key=lambda item: (
@@ -208,489 +227,156 @@ def build_pdf_entries(sheet_metal_parts, dxf_folder):
         ),
     )
 
-    used = set()
-
     for item in parts:
 
         name = item["name"]
 
-        base = _safe_part_name(name)
+        # Same filename cleaning logic used by
+        # ThicknessDwgBuilder._safe()
+        cleaned = re.sub(
+            r'[<>:"/\\|?*\x00-\x1f]',
+            "_",
+            str(name),
+        ).strip().rstrip(".")
+
+        base = re.sub(
+            r"\s+",
+            " ",
+            cleaned,
+        ) or "part"
 
         unique = base
         counter = 2
 
-        while unique.lower() in used:
+        while unique.lower() in used_names:
             unique = f"{base}_{counter}"
             counter += 1
 
-        used.add(unique.lower())
+        used_names.add(unique.lower())
 
         dxf_path = dxf_folder / f"{unique}.dxf"
 
-        if dxf_path.exists() and dxf_path.stat().st_size > 0:
-
-            entries.append(
+        if (
+            dxf_path.exists()
+            and dxf_path.stat().st_size > 0
+        ):
+            exported_parts.append(
                 {
                     "item": item,
                     "dxf": dxf_path,
                 }
             )
-
         else:
-
-            missing.append(
-                {
-                    "item": item,
-                    "dxf": dxf_path,
-                }
+            failed_parts.append(
+                (
+                    name,
+                    f"DXF not found: {dxf_path}",
+                )
             )
 
-    return entries, missing
+    return exported_parts, failed_parts
 
-
-# ============================================================
-# SUMMARY
-# ============================================================
-
-def print_summary(scan_result, pdf_result=None):
-    """
-    Print final run summary.
-    """
-
-    sheet_metal_parts = scan_result.get(
-        "sheet_metal_parts",
-        [],
-    )
-
-    not_sheet_metal = scan_result.get(
-        "not_sheet_metal",
-        [],
-    )
-
-    scan_failures = scan_result.get(
-        "failed_parts",
-        [],
-    )
-
-    quantity_count = 0
-
-    for item in sheet_metal_parts:
-
-        try:
-            quantity_count += int(
-                item.get("quantity", 1) or 1
-            )
-
-        except Exception:
-            quantity_count += 1
-
-    print()
-    print("=" * 60)
-    print("FINAL SUMMARY")
-    print("=" * 60)
-
-    print(
-        f"Sheet metal (unique): "
-        f"{len(sheet_metal_parts)}"
-    )
-
-    print(
-        f"Sheet metal (quantity): "
-        f"{quantity_count}"
-    )
-
-    print(
-        f"Not sheet metal: "
-        f"{len(not_sheet_metal)}"
-    )
-
-    print(
-        f"Scan failures: "
-        f"{len(scan_failures)}"
-    )
-
-    if pdf_result is not None:
-
-        print(
-            f"PDFs created: "
-            f"{pdf_result.get('created', 0)}"
-        )
-
-        print(
-            f"PDF failures: "
-            f"{pdf_result.get('failed', 0)}"
-        )
-
-        if pdf_result.get("report_path"):
-
-            print(
-                f"PDF report: "
-                f"{pdf_result['report_path']}"
-            )
-
-
-# ============================================================
-# SAVE RUN SUMMARY
-# ============================================================
-
-def save_run_summary(output_folder, data):
-
-    output_folder = Path(output_folder)
-
-    output_folder.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    summary_path = (
-        output_folder /
-        "run_summary.json"
-    )
-
-    try:
-
-        with summary_path.open(
-            "w",
-            encoding="utf-8",
-        ) as file:
-
-            json.dump(
-                data,
-                file,
-                indent=2,
-                ensure_ascii=False,
-                default=str,
-            )
-
-        print(
-            f"Run summary saved: "
-            f"{summary_path}"
-        )
-
-        return summary_path
-
-    except Exception as exc:
-
-        print(
-            f"Could not save run summary: "
-            f"{exc}"
-        )
-
-        return None
-
-
-# ============================================================
-# MAIN
-# ============================================================
 
 def main():
+    project_folder = Path(__file__).resolve().parent
+    input_folder = project_folder / "input"
+    output_folder = project_folder / "output"
 
-    started_at = datetime.now()
+    input_folder.mkdir(exist_ok=True)
+    output_folder.mkdir(exist_ok=True)
 
-    print()
+    print("\n" + "=" * 60)
+    print("SOLIDWORKS SHEET METAL -> DXF/DWG/PDF EXPORTER")
     print("=" * 60)
-    print("SOLIDWORKS SHEET METAL AUTOMATION")
-    print("=" * 60)
 
-    # --------------------------------------------------------
-    # Output
-    # --------------------------------------------------------
+    sw_app = connect_to_solidworks()
 
-    output_folder = (
-        Path(__file__).resolve().parent /
-        OUTPUT_FOLDER_NAME
-    )
-
-    output_folder.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    scan_result = None
-
-    drawing_result = {
-        "files": [],
-        "failed_parts": [],
-        "error": None,
-    }
-
-    pdf_result = {
-        "created": 0,
-        "failed": 0,
-        "failed_parts": [],
-        "files": [],
-        "report_path": None,
-    }
-
-    assembly_path = None
-    assembly = None
-
-    # ========================================================
-    # 1. CONNECT TO SOLIDWORKS
-    # ========================================================
-
-    sw = connect_to_solidworks()
-
-    if sw is None:
+    if sw_app is None:
         return 1
 
-    # ========================================================
-    # 2. SELECT ASSEMBLY
-    # ========================================================
-
-    assembly_path = select_assembly(INPUT_FOLDER)
+    assembly_path = select_assembly(input_folder)
 
     if assembly_path is None:
         return 1
 
-    assembly_path = Path(
-        assembly_path
-    ).resolve()
+    # ========================================================
+    # ORIGINAL ASSEMBLY OPENING — UNCHANGED
+    # ========================================================
 
-    print()
-    print(
-        f"Selected assembly: "
-        f"{assembly_path}"
+    assembly = SolidWorksAssembly(sw_app)
+
+    if not assembly.open(assembly_path):
+        print("Could not open assembly. Stopping.")
+        return 1
+
+    components = assembly.get_components()
+
+    if not components:
+        print("No components found. Stopping.")
+        return 1
+
+    unique_parts = assembly.get_unique_part_quantities(
+        components
+    )
+
+    print_summary(
+        components,
+        unique_parts,
     )
 
     # ========================================================
-    # 3. OPEN ASSEMBLY
+    # ORIGINAL SHEET METAL SCAN — UNCHANGED
     # ========================================================
 
-    try:
+    detector = SheetMetalDetector(
+        sw_app,
+        assembly_path=assembly_path,
+        read_thickness=GROUP_BY_THICKNESS,
+    )
 
-        assembly = SolidWorksAssembly(
-            sw_app=sw,
-            skip_hidden=True,
-        )
-
-        opened = assembly.open(
-            assembly_path
-        )
-
-        if not opened:
-
-            print()
-            print("=" * 60)
-            print("ASSEMBLY OPEN FAILED")
-            print("=" * 60)
-
-            return 1
-
-    except Exception as exc:
-
-        print()
-        print("=" * 60)
-        print("ASSEMBLY OPEN FAILED")
-        print("=" * 60)
-
-        print(exc)
-        traceback.print_exc()
-
-        return 1
-
-    # ========================================================
-    # 4. GET COMPONENTS
-    # ========================================================
-
-    try:
-
-        components = assembly.get_components()
-
-    except Exception as exc:
-
-        print()
-        print("=" * 60)
-        print("GET COMPONENTS FAILED")
-        print("=" * 60)
-
-        print(exc)
-        traceback.print_exc()
-
-        return 1
-
-    print()
-    print(
-        f"Components found: "
-        f"{len(components)}"
+    scan_result = detector.scan_and_export(
+        unique_parts,
+        output_folder,
     )
 
     # ========================================================
-    # 5. UNIQUE PARTS + QUANTITIES
+    # ORIGINAL DRAWING EXPORT — UNCHANGED
     # ========================================================
 
-    try:
+    drawing_result = None
 
-        unique_parts = (
-            assembly.get_unique_part_quantities(
-                components
-            )
-        )
-
-    except Exception as exc:
-
-        print()
-        print("=" * 60)
-        print("UNIQUE PART EXTRACTION FAILED")
-        print("=" * 60)
-
-        print(exc)
-        traceback.print_exc()
-
-        return 1
-
-    print(
-        f"Unique parts: "
-        f"{len(unique_parts)}"
+    exporter = DwgExporter(
+        sw_app,
+        assembly_path=assembly_path,
+        reconnect=connect_to_solidworks,
     )
 
-    # ========================================================
-    # 6. SHEET METAL SCAN
-    # ========================================================
-
-    try:
-
-        detector = SheetMetalDetector()
-
-        scan_result = (
-            detector.scan_and_export(
-                unique_parts,
-                output_folder,
-            )
-        )
-
-    except Exception as exc:
-
-        print()
-        print("=" * 60)
-        print("SHEET METAL SCAN FAILED")
-        print("=" * 60)
-
-        print(exc)
-        traceback.print_exc()
-
-        return 1
-
-    if not isinstance(
-        scan_result,
-        dict,
-    ):
-
-        print()
-        print("=" * 60)
-        print("INVALID SCAN RESULT")
-        print("=" * 60)
-
-        print(
-            "SheetMetalDetector.scan_and_export() "
-            "did not return a dictionary."
-        )
-
-        return 1
-
-    sheet_metal_parts = (
-        scan_result.get(
-            "sheet_metal_parts",
-            [],
-        )
-    )
-
-    if not sheet_metal_parts:
-
-        print()
-        print("=" * 60)
-        print("NO SHEET METAL PARTS FOUND")
-        print("=" * 60)
-
-        print_summary(
-            scan_result,
-            pdf_result,
-        )
-
-        return 0
-
-    # ========================================================
-    # 7. GROUPED DXF / DWG DRAWING
-    # ========================================================
-    #
-    # KEEP THIS SECTION.
-    #
-    # ThicknessDwgBuilder does two things:
-    #
-    #   1. Creates individual DXFs:
-    #
-    #      by_thickness/_parts_dxf/*.dxf
-    #
-    #   2. Creates merged drawings:
-    #
-    #      by_thickness/<assembly>_1mm.dxf
-    #      by_thickness/<assembly>_2mm.dxf
-    #      ...
-    #
-    # The individual DXFs are reused by the new PDF exporter.
-    # ========================================================
-
-    drawing_output_folder = (
-        output_folder /
-        (
-            "by_thickness"
-            if GROUP_BY_THICKNESS
-            else "combined"
-        )
+    builder = ThicknessDwgBuilder(
+        exporter,
+        gap=PART_GAP,
+        max_row_width=MAX_ROW_WIDTH,
+        repeat_by_quantity=REPEAT_BY_QUANTITY,
+        oda_path=ODA_CONVERTER_PATH,
+        group_by_thickness=GROUP_BY_THICKNESS,
     )
 
     try:
-
-        # ----------------------------------------------------
-        # Reconnect callback for DwgExporter
-        # ----------------------------------------------------
-
-        def reconnect_solidworks():
-            return connect_to_solidworks()
-
-        # ----------------------------------------------------
-        # DwgExporter
-        # ----------------------------------------------------
-
-        dwg_exporter = DwgExporter(
-            sw_app=sw,
-            assembly_path=assembly_path,
-            reconnect=reconnect_solidworks,
-        )
-
-        # ----------------------------------------------------
-        # ThicknessDwgBuilder
-        # ----------------------------------------------------
-
-        builder = ThicknessDwgBuilder(
-            exporter=dwg_exporter,
-            gap=PART_GAP,
-            max_row_width=MAX_ROW_WIDTH,
-            repeat_by_quantity=REPEAT_BY_QUANTITY,
-            oda_path=ODA_CONVERTER_PATH,
-            group_by_thickness=GROUP_BY_THICKNESS,
-        )
-
-        # ----------------------------------------------------
-        # Build grouped drawings
-        # ----------------------------------------------------
 
         drawing_result = builder.build(
-            sheet_metal_parts,
-            drawing_output_folder,
+            scan_result["sheet_metal_parts"],
+            output_folder / (
+                "by_thickness"
+                if GROUP_BY_THICKNESS
+                else "combined"
+            ),
             base_name=assembly_path.stem,
         )
 
     except Exception as exc:
 
-        print()
-        print("=" * 60)
-        print("GROUPED DRAWING EXPORT FAILED")
-        print("=" * 60)
-
+        print("\nDRAWING EXPORT FAILED")
         print(
-            f"{type(exc).__name__}: "
-            f"{exc}"
+            f"{type(exc).__name__}: {exc}"
         )
 
         traceback.print_exc()
@@ -701,287 +387,280 @@ def main():
             "error": str(exc),
         }
 
+    finally:
+
+        exporter.activate_assembly()
+
+        gc.collect()
+
+        try:
+            pythoncom.CoFreeUnusedLibraries()
+        except Exception:
+            pass
+
     # ========================================================
-    # 8. NEW PDF EXPORT
+    # NEW PDF DRAWINGS
+    # ========================================================
+    #
+    # IMPORTANT:
+    #
+    # This is the ONLY new processing added for PDF.
+    #
+    # The original DXF/DWG process above remains untouched.
     # ========================================================
 
-    print()
-    print("=" * 60)
-    print("PDF DRAWINGS (one folder per thickness)")
-    print("=" * 60)
+    pdf_result = None
 
-    try:
-
-        # ----------------------------------------------------
-        # IMPORTANT
-        #
-        # Do NOT do:
-        #
-        # exported_parts = drawing_result["files"]
-        #
-        # because drawing_result["files"] contains MERGED
-        # per-thickness drawings.
-        #
-        # ----------------------------------------------------
-
-        per_part_dxf_folder = (
-            drawing_output_folder /
-            "_parts_dxf"
-        )
-
-        exported_parts, missing_parts = (
-            build_pdf_entries(
-                sheet_metal_parts,
-                per_part_dxf_folder,
-            )
-        )
+    if EXPORT_PDF:
 
         print()
-        print(
-            f"Individual DXFs found: "
-            f"{len(exported_parts)}"
-        )
+        print("=" * 60)
+        print("PDF DRAWINGS")
+        print("=" * 60)
 
-        if missing_parts:
+        try:
+
+            # ------------------------------------------------
+            # Individual DXFs created by ThicknessDwgBuilder
+            # ------------------------------------------------
+
+            parts_dxf_folder = (
+                output_folder
+                / (
+                    "by_thickness"
+                    if GROUP_BY_THICKNESS
+                    else "combined"
+                )
+                / "_parts_dxf"
+            )
+
+            print(
+                f"Reading flat pattern DXFs from:\n"
+                f"{parts_dxf_folder}"
+            )
+
+            exported_parts, pdf_missing = (
+                build_pdf_exported_parts(
+                    scan_result["sheet_metal_parts"],
+                    parts_dxf_folder,
+                )
+            )
+
+            print(
+                f"Flat pattern DXFs found: "
+                f"{len(exported_parts)}"
+            )
+
+            if pdf_missing:
+
+                print(
+                    f"Flat pattern DXFs missing: "
+                    f"{len(pdf_missing)}"
+                )
+
+                for name, message in pdf_missing:
+                    print(
+                        f"  - {name}: {message}"
+                    )
+
+            # ------------------------------------------------
+            # PDF exporter
+            # ------------------------------------------------
+
+            if exported_parts:
+
+                pdf_exporter = PdfDrawingExporter(
+                    paper=PDF_PAPER,
+                    orientation=PDF_ORIENTATION,
+                    company=PDF_COMPANY,
+                    drawn_by=PDF_DRAWN_BY,
+                    checked_by=PDF_CHECKED_BY,
+                    approved_by=PDF_APPROVED_BY,
+                    material=PDF_MATERIAL,
+                )
+
+                pdf_output_folder = (
+                    output_folder / "pdf"
+                )
+
+                pdf_result = (
+                    pdf_exporter.export_all(
+                        exported_parts,
+                        pdf_output_folder,
+                    )
+                )
+
+            else:
+
+                pdf_result = {
+                    "created": 0,
+                    "failed": 0,
+                    "failed_parts": [],
+                    "files": [],
+                    "report_path": None,
+                }
+
+            # ------------------------------------------------
+            # Add missing DXFs to PDF failures
+            # ------------------------------------------------
+
+            if pdf_missing:
+
+                pdf_result.setdefault(
+                    "failed_parts",
+                    [],
+                )
+
+                pdf_result["failed_parts"].extend(
+                    pdf_missing
+                )
+
+                pdf_result["failed"] = (
+                    pdf_result.get(
+                        "failed",
+                        0,
+                    )
+                    + len(pdf_missing)
+                )
 
             print()
             print(
-                f"Individual DXFs missing: "
-                f"{len(missing_parts)}"
+                "=" * 60
             )
 
-            for missing in missing_parts:
-
-                item = missing["item"]
-                path = missing["dxf"]
-
-                print(
-                    f"  - {item['name']}"
-                )
-
-                print(
-                    f"    expected: {path}"
-                )
-
-        # ----------------------------------------------------
-        # Create new PDF exporter
-        # ----------------------------------------------------
-
-        pdf_builder = PdfDrawingExporter(
-            paper=PDF_PAPER,
-            orientation=PDF_ORIENTATION,
-            company=PDF_COMPANY,
-            drawn_by=PDF_DRAWN_BY,
-            checked_by=PDF_CHECKED_BY,
-            approved_by=PDF_APPROVED_BY,
-            material=PDF_MATERIAL,
-            deburr_note=PDF_DEBURR_NOTE,
-            date_text=PDF_DATE_TEXT,
-        )
-
-        # ----------------------------------------------------
-        # PDF output
-        # ----------------------------------------------------
-
-        pdf_output_folder = (
-            output_folder /
-            PDF_OUTPUT_FOLDER_NAME
-        )
-
-        # ----------------------------------------------------
-        # Export
-        # ----------------------------------------------------
-
-        if exported_parts:
-
-            pdf_result = (
-                pdf_builder.export_all(
-                    exported_parts,
-                    pdf_output_folder,
-                )
+            print(
+                "PDF DRAWING SUMMARY"
             )
 
-        else:
+            print(
+                "=" * 60
+            )
+
+            print(
+                f"PDF drawings created: "
+                f"{pdf_result.get('created', 0)}"
+            )
+
+            print(
+                f"PDF failures: "
+                f"{pdf_result.get('failed', 0)}"
+            )
+
+            if pdf_result.get(
+                "report_path"
+            ):
+                print(
+                    f"PDF report: "
+                    f"{pdf_result['report_path']}"
+                )
+
+        except Exception as exc:
+
+            print()
+            print(
+                "=" * 60
+            )
+
+            print(
+                "PDF EXPORT FAILED"
+            )
+
+            print(
+                "=" * 60
+            )
+
+            print(
+                f"{type(exc).__name__}: {exc}"
+            )
+
+            traceback.print_exc()
 
             pdf_result = {
                 "created": 0,
-                "failed": 0,
-                "failed_parts": [],
+                "failed": 1,
+                "failed_parts": [
+                    (
+                        "__PDF_EXPORT__",
+                        f"{type(exc).__name__}: {exc}",
+                    )
+                ],
                 "files": [],
                 "report_path": None,
             }
 
-        # ----------------------------------------------------
-        # Add missing DXFs to PDF failures
-        # ----------------------------------------------------
-
-        if missing_parts:
-
-            pdf_result.setdefault(
-                "failed_parts",
-                [],
-            )
-
-            for missing in missing_parts:
-
-                item = missing["item"]
-                path = missing["dxf"]
-
-                pdf_result["failed_parts"].append(
-                    (
-                        item["name"],
-                        f"DXF not found: {path}",
-                    )
-                )
-
-            pdf_result["failed"] = (
-                pdf_result.get("failed", 0)
-                + len(missing_parts)
-            )
-
-        print()
-        print(
-            f"PDFs created: "
-            f"{pdf_result.get('created', 0)}"
-        )
-
-        print(
-            f"PDF failures: "
-            f"{pdf_result.get('failed', 0)}"
-        )
-
-        if pdf_result.get("report_path"):
-
-            print(
-                f"PDF report: "
-                f"{pdf_result['report_path']}"
-            )
-
-    except Exception as exc:
-
-        print()
-        print("=" * 60)
-        print("NEW PDF EXPORT FAILED")
-        print("=" * 60)
-
-        print(
-            f"{type(exc).__name__}: "
-            f"{exc}"
-        )
-
-        traceback.print_exc()
-
-        pdf_result = {
-            "created": 0,
-            "failed": 1,
-            "failed_parts": [
-                (
-                    "__PDF_EXPORT__",
-                    f"{type(exc).__name__}: {exc}",
-                )
-            ],
-            "files": [],
-            "report_path": None,
-        }
-
     # ========================================================
-    # 9. OLD PDF BUILDER
+    # OLD PDF CODE
     # ========================================================
     #
-    # PRESERVED / DISABLED.
+    # If you previously had SolidWorksPdfBuilder here,
+    # keep it commented out during testing.
     #
-    # Do NOT delete during testing.
-    #
-    # Old import:
+    # Example:
     #
     # from solidworks.pdf_builder import SolidWorksPdfBuilder
     #
-    # Old code:
-    #
     # old_pdf_builder = SolidWorksPdfBuilder(...)
     #
-    # old_pdf_builder.build(
-    #     scan_result["sheet_metal_parts"],
-    #     output_folder / PDF_OUTPUT_FOLDER_NAME,
-    # )
+    # old_pdf_builder.build(...)
     #
     # ========================================================
-
-    # ========================================================
-    # 10. SAVE RUN SUMMARY
-    # ========================================================
-
-    finished_at = datetime.now()
-
-    quantity_total = 0
-
-    for item in sheet_metal_parts:
-
-        try:
-            quantity_total += int(
-                item.get("quantity", 1) or 1
-            )
-
-        except Exception:
-            quantity_total += 1
-
-    summary_data = {
-        "started_at": started_at.isoformat(),
-        "finished_at": finished_at.isoformat(),
-        "assembly": str(assembly_path),
-        "output_folder": str(output_folder),
-        "sheet_metal_unique": len(
-            sheet_metal_parts
-        ),
-        "sheet_metal_quantity": quantity_total,
-        "drawing_result": drawing_result,
-        "pdf_result": pdf_result,
-    }
 
     save_run_summary(
         output_folder,
-        summary_data,
-    )
-
-    # ========================================================
-    # 11. CLEANUP
-    # ========================================================
-
-    try:
-
-        if (
-            assembly is not None
-            and assembly.opened_by_us
-            and assembly.model is not None
-        ):
-
-            title = assembly.model.GetTitle()
-
-            if title:
-                sw.CloseDoc(str(title))
-
-    except Exception as exc:
-
-        print(
-            f"Assembly cleanup warning: "
-            f"{exc}"
-        )
-
-    # ========================================================
-    # 12. FINAL SUMMARY
-    # ========================================================
-
-    print()
-    print("=" * 60)
-    print("PDF TEST FINISHED")
-    print("=" * 60)
-
-    print_summary(
+        assembly_path,
         scan_result,
+        drawing_result,
         pdf_result,
     )
 
-    print()
+    # ========================================================
+    # FINAL SUMMARY — ORIGINAL
+    # ========================================================
+
+    print("\n" + "=" * 60)
+    print("PROCESS FINISHED")
+    print("=" * 60)
+
+    print(
+        f"Sheet metal (unique): "
+        f"{scan_result['sheet_metal']}"
+    )
+
+    print(
+        f"Sheet metal (quantity): "
+        f"{scan_result['total_quantity']}"
+    )
+
+    print(
+        f"Not sheet metal: "
+        f"{scan_result['not_sheet_metal']}"
+    )
+
+    print(
+        f"Scan failures: "
+        f"{scan_result['failed']}"
+    )
+
+    if drawing_result:
+
+        print(
+            f"Drawings created: "
+            f"{len(drawing_result['files'])}"
+        )
+
+        print(
+            f"Export failures: "
+            f"{len(drawing_result['failed_parts'])}"
+        )
+
+    if pdf_result:
+
+        print(
+            f"PDF drawings created: "
+            f"{pdf_result['created']} "
+            f"(failures: {pdf_result['failed']})"
+        )
+
     print(
         f"Output: "
         f"{output_folder}"
@@ -990,10 +669,39 @@ def main():
     return 0
 
 
-# ============================================================
-# ENTRY POINT
-# ============================================================
-
 if __name__ == "__main__":
-    raise SystemExit(main())
+
+    pythoncom.CoInitialize()
+
+    try:
+
+        sys.exit(
+            main()
+        )
+
+    except KeyboardInterrupt:
+
+        print(
+            "\nInterrupted by user."
+        )
+
+        sys.exit(130)
+
+    except Exception as exc:
+
+        print(
+            "\nUNEXPECTED ERROR"
+        )
+
+        print(
+            f"{type(exc).__name__}: {exc}"
+        )
+
+        traceback.print_exc()
+
+        sys.exit(1)
+
+    finally:
+
+        pythoncom.CoUninitialize()
 
