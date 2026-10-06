@@ -475,16 +475,7 @@ class PdfDrawingExporter:
                 )
 
             thickness = item.get("thickness")
-            # print("=" * 50)
-            # print("PART:", item.get("name"))
-            # print("THICKNESS:", thickness)
-            # print("THICKNESS TYPE:", type(thickness))
-            # print("THICKNESS SOURCE:", item.get("thickness_source"))
-            # print("ITEM:", item)
-            # print("=" * 50)
-        
             if thickness is not None:
-
                 estimated = (
                     " (estimated)"
                     if item.get("thickness_source") == "estimated"

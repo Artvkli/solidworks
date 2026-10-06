@@ -79,6 +79,7 @@ class ThicknessDwgBuilder:
             used.add(unique.lower())
 
             dxf_path = dxf_folder / f"{unique}.dxf"
+
             try:
                 ok, message = self.exporter.export_part(item, dxf_path)
             except Exception as e:
@@ -365,4 +366,9 @@ class ThicknessDwgBuilder:
             for name, message in failed:
                 print(f"  - {name}: {message}")
 
-        return {"files": files, "failed_parts": failed, "error": None}
+        return {
+            "files": files,
+            "failed_parts": failed,
+            "error": None,
+            "exported_parts": exported,  # [{"item": ..., "dxf": Path}] used for the PDF drawings
+        }
