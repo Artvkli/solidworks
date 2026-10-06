@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 
 from pathlib import Path
 import gc
@@ -14,10 +13,21 @@ except ImportError:
     raise
 
 from solidworks.assembly import SolidWorksAssembly, find_assemblies
+
 from solidworks.dwg_exporter import DwgExporter
 from solidworks.thickness_dwg import ThicknessDwgBuilder
 from solidworks.sheet_metal import SheetMetalDetector
-from solidworks.pdf_builder import SolidWorksPdfBuilder
+
+# ============================================================
+# OLD SOLIDWORKS PDF BUILDER
+# ============================================================
+# from solidworks.pdf_builder import SolidWorksPdfBuilder
+
+# ============================================================
+# NEW PDF BUILDER
+# ============================================================
+
+from solidworks.pdf_builder import PdfDrawingExporter
 
 
 # ============================================================
@@ -38,21 +48,16 @@ MAX_ROW_WIDTH = 6000.0
 # PDF output
 PDF_OUTPUT_FOLDER_NAME = "pdf_by_thickness"
 
-# If you have a custom SolidWorks Drawing Template (.drwdot),
-# put its full path here.
+# ============================================================
+# OLD SOLIDWORKS PDF SETTINGS
+# ============================================================
 #
-# Example:
-# PDF_DRAWING_TEMPLATE = r"C:\SolidWorks\Templates\AHU_A4.drwdot"
+# فعلاً حذف نشده‌اند.
+# فقط برای تست PDF جدید استفاده نمی‌شوند.
 #
-# None = use SolidWorks default drawing template.
+
 PDF_DRAWING_TEMPLATE = None
-
-# Optional bend-table template (.sldbndtbt).
-# None = automatically search common SolidWorks installation folders.
 PDF_BEND_TABLE_TEMPLATE = None
-
-# False = temporary SolidWorks drawings are closed after PDF export.
-# True  = keep the .slddrw files open/save them if supported by builder.
 PDF_KEEP_DRAWINGS = False
 
 
@@ -60,16 +65,28 @@ PDF_KEEP_DRAWINGS = False
 # SOLIDWORKS CONNECTION
 # ============================================================
 
-
 def connect_to_solidworks():
+
     print("\nConnecting to SolidWorks...")
+
     try:
-        sw_app = win32com.client.Dispatch("SldWorks.Application")
+
+        sw_app = win32com.client.Dispatch(
+            "SldWorks.Application"
+        )
+
         sw_app.Visible = True
+
         print("Connected successfully.")
+
         return sw_app
+
     except Exception as exc:
-        print(f"Could not connect to SolidWorks: {exc}")
+
+        print(
+            f"Could not connect to SolidWorks: {exc}"
+        )
+
         return None
 
 
@@ -77,23 +94,40 @@ def connect_to_solidworks():
 # ASSEMBLY SELECTION
 # ============================================================
 
-
 def select_assembly(input_folder):
-    assemblies = find_assemblies(input_folder)
+
+    assemblies = find_assemblies(
+        input_folder
+    )
 
     if not assemblies:
-        print(f"\nNo .SLDASM files found in:\n{input_folder}")
+
+        print(
+            f"\nNo .SLDASM files found in:\n"
+            f"{input_folder}"
+        )
+
         return None
 
     print("\nAssemblies found:")
 
-    for i, assembly in enumerate(assemblies, 1):
-        print(f"  {i}. {assembly.name}")
+    for i, assembly in enumerate(
+        assemblies,
+        1,
+    ):
 
-    # Current behavior: automatically select the first assembly.
+        print(
+            f"  {i}. {assembly.name}"
+        )
+
+    # Current behavior:
+    # automatically select the first assembly.
+
     selected = assemblies[0]
 
-    print(f"Selected: {selected}")
+    print(
+        f"Selected: {selected}"
+    )
 
     return selected
 
@@ -102,19 +136,59 @@ def select_assembly(input_folder):
 # SUMMARY
 # ============================================================
 
+def print_summary(
+    components,
+    unique_parts,
+):
 
-def print_summary(components, unique_parts):
-    parts = sum(1 for c in components if c.is_part)
-    assemblies = sum(1 for c in components if c.is_assembly)
+    parts = sum(
+        1
+        for c in components
+        if c.is_part
+    )
 
-    print("\n" + "=" * 60)
-    print("ASSEMBLY SUMMARY")
-    print("=" * 60)
-    print(f"Total components:  {len(components)}")
-    print(f"Part instances:    {parts}")
-    print(f"Sub-assemblies:     {assemblies}")
-    print(f"Unique part/config: {len(unique_parts)}")
+    assemblies = sum(
+        1
+        for c in components
+        if c.is_assembly
+    )
 
+    print(
+        "\n" + "=" * 60
+    )
+
+    print(
+        "ASSEMBLY SUMMARY"
+    )
+
+    print(
+        "=" * 60
+    )
+
+    print(
+        f"Total components:  {len(components)}"
+    )
+
+    print(
+        f"Part instances:    {parts}"
+    )
+
+    print(
+        f"Sub-assemblies:     {assemblies}"
+    )
+
+    print(
+        f"Unique part/config: {len(unique_parts)}"
+    )
+
+
+# ============================================================
+# OLD RUN SUMMARY
+# ============================================================
+#
+# فعلاً نگه داشته شده.
+# در تست PDF جدید استفاده نمی‌شود.
+#
 
 def save_run_summary(
     output_folder,
@@ -123,52 +197,128 @@ def save_run_summary(
     drawing_result,
     pdf_result=None,
 ):
+
     data = {
-        "assembly": str(assembly_path),
+
+        "assembly": str(
+            assembly_path
+        ),
+
         "scan": {
-            "unique_parts": scan_result.get("unique_parts", 0),
-            "sheet_metal": scan_result.get("sheet_metal", 0),
-            "not_sheet_metal": scan_result.get("not_sheet_metal", 0),
-            "failed": scan_result.get("failed", 0),
-            "total_quantity": scan_result.get("total_quantity", 0),
-            "failed_parts": scan_result.get("failed_parts", []),
+
+            "unique_parts":
+                scan_result.get(
+                    "unique_parts",
+                    0,
+                ),
+
+            "sheet_metal":
+                scan_result.get(
+                    "sheet_metal",
+                    0,
+                ),
+
+            "not_sheet_metal":
+                scan_result.get(
+                    "not_sheet_metal",
+                    0,
+                ),
+
+            "failed":
+                scan_result.get(
+                    "failed",
+                    0,
+                ),
+
+            "total_quantity":
+                scan_result.get(
+                    "total_quantity",
+                    0,
+                ),
+
+            "failed_parts":
+                scan_result.get(
+                    "failed_parts",
+                    [],
+                ),
         },
+
         "drawings": {
-            "created": (len(drawing_result.get("files", [])) if drawing_result else 0),
-            "failed_parts": (
-                drawing_result.get("failed_parts", []) if drawing_result else []
-            ),
-            "error": (drawing_result.get("error") if drawing_result else None),
-            "files": [
-                {
-                    "thickness": item.get("thickness"),
-                    "unique_parts": item.get("unique_parts"),
-                    "quantity": item.get("quantity"),
-                    "path": str(item.get("path")),
-                    "is_dwg": item.get("is_dwg", False),
-                }
-                for item in (drawing_result.get("files", []) if drawing_result else [])
-            ],
+
+            "created":
+                (
+                    len(
+                        drawing_result.get(
+                            "files",
+                            [],
+                        )
+                    )
+                    if drawing_result
+                    else 0
+                ),
+
+            "failed_parts":
+                (
+                    drawing_result.get(
+                        "failed_parts",
+                        [],
+                    )
+                    if drawing_result
+                    else []
+                ),
+
+            "error":
+                (
+                    drawing_result.get(
+                        "error"
+                    )
+                    if drawing_result
+                    else None
+                ),
         },
+
         "pdfs": {
-            "created": (len(pdf_result.get("files", [])) if pdf_result else 0),
-            "failed_parts": (pdf_result.get("failed_parts", []) if pdf_result else []),
-            "error": (pdf_result.get("error") if pdf_result else None),
-            "files": [
-                {
-                    "name": item.get("name"),
-                    "thickness": item.get("thickness"),
-                    "quantity": item.get("quantity"),
-                    "path": str(item.get("path")),
-                }
-                for item in (pdf_result.get("files", []) if pdf_result else [])
-            ],
+
+            "created":
+                (
+                    len(
+                        pdf_result.get(
+                            "files",
+                            [],
+                        )
+                    )
+                    if pdf_result
+                    else 0
+                ),
+
+            "failed_parts":
+                (
+                    pdf_result.get(
+                        "failed_parts",
+                        [],
+                    )
+                    if pdf_result
+                    else []
+                ),
+
+            "error":
+                (
+                    pdf_result.get(
+                        "error"
+                    )
+                    if pdf_result
+                    else None
+                ),
         },
     }
 
-    path = Path(output_folder) / "run_summary.json"
+    path = (
+        Path(output_folder)
+        / "run_summary.json"
+    )
 
     try:
+
         path.write_text(
             json.dumps(
                 data,
@@ -178,30 +328,59 @@ def save_run_summary(
             encoding="utf-8",
         )
 
-        print(f"Run summary saved: {path}")
+        print(
+            f"Run summary saved: {path}"
+        )
 
     except Exception as exc:
-        print(f"Could not save run summary: {exc}")
+
+        print(
+            f"Could not save run summary: {exc}"
+        )
 
 
 # ============================================================
 # MAIN
 # ============================================================
 
-
 def main():
-    project_folder = Path(__file__).resolve().parent
 
-    input_folder = project_folder / "input"
-    output_folder = project_folder / "output"
+    project_folder = (
+        Path(__file__).resolve().parent
+    )
 
-    input_folder.mkdir(exist_ok=True)
-    output_folder.mkdir(exist_ok=True)
+    input_folder = (
+        project_folder / "input"
+    )
 
-    print("\n" + "=" * 60)
-    print("MANDEGAR SYSTEM")
-    print("SOLIDWORKS SHEET METAL -> DXF / DWG / PDF EXPORTER")
-    print("=" * 60)
+    output_folder = (
+        project_folder / "output"
+    )
+
+    input_folder.mkdir(
+        exist_ok=True
+    )
+
+    output_folder.mkdir(
+        exist_ok=True
+    )
+
+    print(
+        "\n" + "=" * 60
+    )
+
+    print(
+        "MANDEGAR SYSTEM"
+    )
+
+    print(
+        "SOLIDWORKS SHEET METAL -> "
+        "DXF / DWG / PDF EXPORTER"
+    )
+
+    print(
+        "=" * 60
+    )
 
     # --------------------------------------------------------
     # 1. CONNECT TO SOLIDWORKS
@@ -216,7 +395,9 @@ def main():
     # 2. FIND ASSEMBLY
     # --------------------------------------------------------
 
-    assembly_path = select_assembly(input_folder)
+    assembly_path = select_assembly(
+        input_folder
+    )
 
     if assembly_path is None:
         return 1
@@ -225,27 +406,47 @@ def main():
     # 3. OPEN ASSEMBLY
     # --------------------------------------------------------
 
-    assembly = SolidWorksAssembly(sw_app)
+    assembly = SolidWorksAssembly(
+        sw_app
+    )
 
-    if not assembly.open(assembly_path):
-        print("Could not open assembly. Stopping.")
+    if not assembly.open(
+        assembly_path
+    ):
+
+        print(
+            "Could not open assembly. "
+            "Stopping."
+        )
+
         return 1
 
     # --------------------------------------------------------
     # 4. GET COMPONENTS
     # --------------------------------------------------------
 
-    components = assembly.get_components()
+    components = (
+        assembly.get_components()
+    )
 
     if not components:
-        print("No components found. Stopping.")
+
+        print(
+            "No components found. "
+            "Stopping."
+        )
+
         return 1
 
     # --------------------------------------------------------
     # 5. UNIQUE PARTS + QUANTITIES
     # --------------------------------------------------------
 
-    unique_parts = assembly.get_unique_part_quantities(components)
+    unique_parts = (
+        assembly.get_unique_part_quantities(
+            components
+        )
+    )
 
     print_summary(
         components,
@@ -280,6 +481,13 @@ def main():
     # --------------------------------------------------------
     # 8. CURRENT DXF / DWG BUILDER
     # --------------------------------------------------------
+    #
+    # فعلاً حذف نشده.
+    #
+    # فقط برای اینکه DXFهای Flat Pattern ساخته شوند
+    # این بخش را نگه می‌داریم.
+    #
+    # --------------------------------------------------------
 
     builder = ThicknessDwgBuilder(
         exporter,
@@ -290,123 +498,355 @@ def main():
         group_by_thickness=GROUP_BY_THICKNESS,
     )
 
-    # --------------------------------------------------------
-    # 9. PDF BUILDER
-    # --------------------------------------------------------
-
-    pdf_builder = SolidWorksPdfBuilder(
-        sw_app,
-        exporter=exporter,
-        drawing_template=PDF_DRAWING_TEMPLATE,
-        bend_table_template=PDF_BEND_TABLE_TEMPLATE,
-        keep_drawings=PDF_KEEP_DRAWINGS,
-        add_dimensions=True,
-        add_bend_table=True,
-        add_qty_note=True,
-    )
-
     drawing_result = None
     pdf_result = None
 
-    # --------------------------------------------------------
-    # 10. EXPORT CURRENT DWG / DXF
-    # --------------------------------------------------------
+    # ========================================================
+    # 9. OLD DWG / DXF COMBINED EXPORT
+    # ========================================================
+    #
+    # در تست فعلی این بخش اجرا نمی‌شود.
+    #
+    # اگر بعداً خواستی فعالش کنی، فقط کامنت‌ها را بردار.
+    #
+    # ========================================================
+
+    # try:
+    #
+    #     drawing_result = builder.build(
+    #         scan_result["sheet_metal_parts"],
+    #         output_folder / (
+    #             "by_thickness"
+    #             if GROUP_BY_THICKNESS
+    #             else "combined"
+    #         ),
+    #         base_name=assembly_path.stem,
+    #     )
+    #
+    # except Exception as exc:
+    #
+    #     print("\nDRAWING EXPORT FAILED")
+    #     print(f"{type(exc).__name__}: {exc}")
+    #     traceback.print_exc()
+    #
+    #     drawing_result = {
+    #         "files": [],
+    #         "failed_parts": [],
+    #         "error": str(exc),
+    #     }
+
+
+    # ========================================================
+    # 10. GENERATE DXF FLAT PATTERNS FOR PDF TEST
+    # ========================================================
+    #
+    # IMPORTANT:
+    #
+    # PdfDrawingExporter به DXF احتیاج دارد.
+    #
+    # بنابراین فعلاً ThicknessDwgBuilder را اجرا می‌کنیم
+    # تا DXFهای لازم تولید شوند.
+    #
+    # این بخش خروجی DWG نهایی را برای کاربر نمی‌سازد؛
+    # هدف آن فقط تهیه DXF برای PDF Builder جدید است.
+    #
+    # ========================================================
+
+    exported_parts = []
 
     try:
+
+        print()
+        print(
+            "=" * 60
+        )
+
+        print(
+            "PREPARING DXFs FOR PDF TEST"
+        )
+
+        print(
+            "=" * 60
+        )
+
         drawing_result = builder.build(
             scan_result["sheet_metal_parts"],
-            output_folder / ("by_thickness" if GROUP_BY_THICKNESS else "combined"),
+            output_folder / (
+                "by_thickness"
+                if GROUP_BY_THICKNESS
+                else "combined"
+            ),
             base_name=assembly_path.stem,
         )
 
-    except Exception as exc:
-        print("\nDRAWING EXPORT FAILED")
-        print(f"{type(exc).__name__}: {exc}")
-        traceback.print_exc()
+        # ----------------------------------------------------
+        # IMPORTANT
+        #
+        # اگر build() خروجی را دقیقاً به شکل:
+        #
+        # [
+        #     {
+        #         "item": {...},
+        #         "dxf": Path(...)
+        #     }
+        # ]
+        #
+        # برگرداند، مستقیماً استفاده می‌شود.
+        # ----------------------------------------------------
 
-        drawing_result = {
-            "files": [],
-            "failed_parts": [],
-            "error": str(exc),
-        }
-
-    # --------------------------------------------------------
-    # 11. EXPORT ONE PDF PER PART
-    # --------------------------------------------------------
-
-    try:
-        pdf_result = pdf_builder.build(
-            scan_result["sheet_metal_parts"],
-            output_folder / PDF_OUTPUT_FOLDER_NAME,
+        exported_parts = (
+            drawing_result.get(
+                "files",
+                []
+            )
         )
 
     except Exception as exc:
-        print("\nPDF EXPORT FAILED")
-        print(f"{type(exc).__name__}: {exc}")
+
+        print(
+            "\nDXF PREPARATION FAILED"
+        )
+
+        print(
+            f"{type(exc).__name__}: {exc}"
+        )
+
+        traceback.print_exc()
+
+        return 1
+
+
+    # ========================================================
+    # 11. OLD SOLIDWORKS PDF BUILDER
+    # ========================================================
+    #
+    # کاملاً نگه داشته شده ولی اجرا نمی‌شود.
+    #
+    # ========================================================
+
+    # pdf_builder = SolidWorksPdfBuilder(
+    #     sw_app,
+    #     exporter=exporter,
+    #     drawing_template=PDF_DRAWING_TEMPLATE,
+    #     bend_table_template=PDF_BEND_TABLE_TEMPLATE,
+    #     keep_drawings=PDF_KEEP_DRAWINGS,
+    #     add_dimensions=True,
+    #     add_bend_table=True,
+    #     add_qty_note=True,
+    # )
+
+    # try:
+    #
+    #     pdf_result = pdf_builder.build(
+    #         scan_result["sheet_metal_parts"],
+    #         output_folder / PDF_OUTPUT_FOLDER_NAME,
+    #     )
+    #
+    # except Exception as exc:
+    #
+    #     print("\nPDF EXPORT FAILED")
+    #     print(f"{type(exc).__name__}: {exc}")
+    #     traceback.print_exc()
+    #
+    #     pdf_result = {
+    #         "files": [],
+    #         "failed_parts": [],
+    #         "error": str(exc),
+    #     }
+
+
+    # ========================================================
+    # 12. NEW PDF DRAWING EXPORTER
+    # ========================================================
+    #
+    # این قسمت PDF Builder جدید تو است.
+    #
+    # ========================================================
+
+    pdf_builder = PdfDrawingExporter(
+
+        paper="A4",
+
+        orientation="auto",
+
+        company="TECHNICAL DEPARTMENT",
+
+        drawn_by="",
+
+        checked_by="",
+
+        approved_by="",
+
+        material="",
+
+        deburr_note=(
+            "DEBURR AND BREAK SHARP EDGES"
+        ),
+
+        date_text="",
+    )
+
+    # --------------------------------------------------------
+    # 13. EXPORT ONE PDF PER PART
+    # --------------------------------------------------------
+
+    try:
+
+        pdf_output_folder = (
+            output_folder
+            / PDF_OUTPUT_FOLDER_NAME
+        )
+
+        print()
+        print(
+            "=" * 60
+        )
+
+        print(
+            "NEW PDF DRAWING EXPORT"
+        )
+
+        print(
+            "=" * 60
+        )
+
+        pdf_result = (
+            pdf_builder.export_all(
+                exported_parts,
+                pdf_output_folder,
+            )
+        )
+
+    except Exception as exc:
+
+        print(
+            "\nNEW PDF EXPORT FAILED"
+        )
+
+        print(
+            f"{type(exc).__name__}: {exc}"
+        )
+
         traceback.print_exc()
 
         pdf_result = {
+            "created": 0,
+            "failed": 1,
+            "failed_parts": [
+                (
+                    "PDF EXPORT",
+                    str(exc),
+                )
+            ],
             "files": [],
-            "failed_parts": [],
-            "error": str(exc),
+            "report_path": None,
         }
 
+
     # --------------------------------------------------------
-    # 12. CLEANUP
+    # 14. CLEANUP
     # --------------------------------------------------------
 
     finally:
+
         try:
+
             exporter.activate_assembly()
+
         except Exception:
+
             pass
 
         gc.collect()
 
         try:
+
             pythoncom.CoFreeUnusedLibraries()
+
         except Exception:
+
             pass
 
-    # --------------------------------------------------------
-    # 13. SAVE RUN SUMMARY
-    # --------------------------------------------------------
 
-    save_run_summary(
-        output_folder,
-        assembly_path,
-        scan_result,
-        drawing_result,
-        pdf_result,
+    # ========================================================
+    # 15. OLD RUN SUMMARY
+    # ========================================================
+    #
+    # فعلاً غیرفعال است تا تست فقط روی PDF جدید باشد.
+    #
+    # ========================================================
+
+    # save_run_summary(
+    #     output_folder,
+    #     assembly_path,
+    #     scan_result,
+    #     drawing_result,
+    #     pdf_result,
+    # )
+
+
+    # ========================================================
+    # 16. FINAL SUMMARY
+    # ========================================================
+
+    print()
+    print(
+        "=" * 60
     )
 
-    # --------------------------------------------------------
-    # 14. FINAL SUMMARY
-    # --------------------------------------------------------
+    print(
+        "PDF TEST FINISHED"
+    )
 
-    print("\n" + "=" * 60)
-    print("PROCESS FINISHED")
-    print("=" * 60)
+    print(
+        "=" * 60
+    )
 
-    print(f"Sheet metal (unique): {scan_result['sheet_metal']}")
+    print(
+        f"Sheet metal (unique): "
+        f"{scan_result['sheet_metal']}"
+    )
 
-    print(f"Sheet metal (quantity): {scan_result['total_quantity']}")
+    print(
+        f"Sheet metal (quantity): "
+        f"{scan_result['total_quantity']}"
+    )
 
-    print(f"Not sheet metal: {scan_result['not_sheet_metal']}")
+    print(
+        f"Not sheet metal: "
+        f"{scan_result['not_sheet_metal']}"
+    )
 
-    print(f"Scan failures: {scan_result['failed']}")
-
-    if drawing_result:
-        print(f"Drawings created: {len(drawing_result['files'])}")
-
-        print(f"Drawing failures: {len(drawing_result['failed_parts'])}")
+    print(
+        f"Scan failures: "
+        f"{scan_result['failed']}"
+    )
 
     if pdf_result:
-        print(f"PDFs created: {len(pdf_result['files'])}")
 
-        print(f"PDF failures: {len(pdf_result['failed_parts'])}")
+        print(
+            f"PDFs created: "
+            f"{pdf_result['created']}"
+        )
 
-    print(f"Output: {output_folder}")
+        print(
+            f"PDF failures: "
+            f"{pdf_result['failed']}"
+        )
+
+        if pdf_result.get(
+            "report_path"
+        ):
+
+            print(
+                f"PDF report: "
+                f"{pdf_result['report_path']}"
+            )
+
+    print(
+        f"Output: "
+        f"{output_folder}"
+    )
 
     return 0
 
@@ -416,20 +856,38 @@ def main():
 # ============================================================
 
 if __name__ == "__main__":
+
     pythoncom.CoInitialize()
 
     try:
-        sys.exit(main())
+
+        sys.exit(
+            main()
+        )
 
     except KeyboardInterrupt:
-        print("\nInterrupted by user.")
+
+        print(
+            "\nInterrupted by user."
+        )
+
         sys.exit(130)
 
     except Exception as exc:
-        print("\nUNEXPECTED ERROR")
-        print(f"{type(exc).__name__}: {exc}")
+
+        print(
+            "\nUNEXPECTED ERROR"
+        )
+
+        print(
+            f"{type(exc).__name__}: {exc}"
+        )
+
         traceback.print_exc()
+
         sys.exit(1)
 
     finally:
+
         pythoncom.CoUninitialize()
+
