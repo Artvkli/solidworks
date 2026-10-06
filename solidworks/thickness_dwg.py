@@ -79,7 +79,6 @@ class ThicknessDwgBuilder:
             used.add(unique.lower())
 
             dxf_path = dxf_folder / f"{unique}.dxf"
-
             try:
                 ok, message = self.exporter.export_part(item, dxf_path)
             except Exception as e:

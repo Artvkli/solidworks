@@ -34,7 +34,7 @@ EXPORT_PDF = True
 
 # False = اجرای عادی کل برنامه
 # True  = فقط PDF از DXFهای قبلی ساخته می‌شود
-PDF_ONLY = True
+PDF_ONLY = False
 
 PDF_PAPER = "A4"
 PDF_ORIENTATION = "portrait"
