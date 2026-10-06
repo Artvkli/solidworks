@@ -158,16 +158,25 @@ class SolidWorksPdfBuilder:
                 )
             return str(self.drawing_template)
 
-        # Official SolidWorks enum value:
-        # swDefaultTemplateDrawing = 10.
-        template = self.sw_app.GetUserPreferenceStringValue(SW_DEFAULT_TEMPLATE_DRAWING)
-        if template and Path(str(template)).exists():
-            return str(template)
+        # Some SolidWorks/PyWin32 COM versions do not expose
+        # GetUserPreferenceStringValue through the late-bound COM object.
+        # GetDocumentTemplate is a safer API for obtaining the active drawing
+        # template. 6 = swDwgPaperA4size, matching the requested sample.
+        try:
+            template = self.sw_app.GetDocumentTemplate(
+                SW_DOC_DRAWING,
+                "",
+                6,
+                0.0,
+                0.0,
+            )
+            if template and Path(str(template)).exists():
+                return str(template)
+        except Exception:
+            pass
 
-        raise FileNotFoundError(
-            "No valid SolidWorks default drawing template was found. "
-            "Set drawing_template='C:\\\\...\\\\YourTemplate.drwdot'."
-        )
+        # Final fallback: let NewDocument try SolidWorks' configured default.
+        return ""
 
     def _find_bend_table_template(self):
         if self.bend_table_template:
