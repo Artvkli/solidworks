@@ -475,7 +475,10 @@ class PdfDrawingExporter:
                 )
 
             thickness = item.get("thickness")
+            print(item.thickness)
+        
             if thickness is not None:
+
                 estimated = (
                     " (estimated)"
                     if item.get("thickness_source") == "estimated"
