@@ -15,7 +15,7 @@ except ImportError:
 
 from solidworks.assembly import SolidWorksAssembly, find_assemblies
 from solidworks.dwg_exporter import DwgExporter
-from solidworks.pdf_drawings import PdfDrawingExporter
+from solidworks.pdf_builder import PdfDrawingExporter
 from solidworks.sw_drawings import SwDrawingPdfExporter
 from solidworks.thickness_dwg import ThicknessDwgBuilder
 from solidworks.sheet_metal import SheetMetalDetector
