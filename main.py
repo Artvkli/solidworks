@@ -15,7 +15,7 @@ except ImportError:
 
 from solidworks.assembly import SolidWorksAssembly, find_assemblies
 from solidworks.dwg_exporter import DwgExporter
-from solidworks.pdf_builder import PdfDrawingExporter
+from solidworks.pdf_drawings import PdfDrawingExporter
 from solidworks.sw_drawings import SwDrawingPdfExporter
 from solidworks.thickness_dwg import ThicknessDwgBuilder
 from solidworks.sheet_metal import SheetMetalDetector
@@ -35,7 +35,9 @@ PDF_MODE = "solidworks"
 SW_DRAWING_TEMPLATE = (
     None  # None = SolidWorks default drawing template; or r"C:\...\Drawing.drwdot"
 )
-PDF_FOLDED_VIEWS = True  # Front / Top / Right views next to the flat pattern
+PDF_FOLDED_VIEWS = True  # views next to the flat pattern
+# Views after the flat pattern, in this order: "Front", "Top", "Right", "Isometric" (the bent part in 3D)
+PDF_VIEWS = ("Front", "Isometric")
 PDF_BEND_TABLE = True
 PDF_DIMENSIONS = True  # model dimensions imported into the views
 # FIRST RUN: only the first N parts get a PDF, so problems show up quickly.
@@ -292,6 +294,7 @@ def run_pdf_test(sw_app, assembly_path, unique_parts, output_folder):
             reconnect=connect_to_solidworks,
             template=SW_DRAWING_TEMPLATE,
             folded_views=PDF_FOLDED_VIEWS,
+            view_names=PDF_VIEWS,
             bend_table=PDF_BEND_TABLE,
             dimensions=PDF_DIMENSIONS,
         )
@@ -425,6 +428,7 @@ def main():
                         reconnect=connect_to_solidworks,
                         template=SW_DRAWING_TEMPLATE,
                         folded_views=PDF_FOLDED_VIEWS,
+                        view_names=PDF_VIEWS,
                         bend_table=PDF_BEND_TABLE,
                         dimensions=PDF_DIMENSIONS,
                     )

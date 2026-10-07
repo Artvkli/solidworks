@@ -73,11 +73,13 @@ class SwDrawingPdfExporter(DwgExporter):
         folded_views=True,
         bend_table=True,
         dimensions=True,
+        view_names=("Front", "Isometric"),
     ):
         super().__init__(sw_app, assembly_path=assembly_path, reconnect=reconnect)
         self.template = template
         self.paper_size = paper_size
         self.folded_views = folded_views
+        self.view_names = tuple(view_names)
         self.bend_table = bend_table
         self.dimensions = dimensions
         self._template_path = None
@@ -236,7 +238,8 @@ class SwDrawingPdfExporter(DwgExporter):
     def pack_views(sizes, region, denominator, gap=VIEW_GAP):
         """
         sizes: {key: (width, height)} at 1:1.  Returns {key: (cx, cy)} at 1:denominator or None.
-        Rows are filled left to right; every row and the whole block are centred in the region.
+        Views keep the order of `sizes` (flat pattern first, then the others); rows are filled
+        left to right and every row and the whole block are centred in the region.
         """
         x0, y0, x1, y1 = region
         avail_w, avail_h = x1 - x0, y1 - y0
@@ -246,7 +249,6 @@ class SwDrawingPdfExporter(DwgExporter):
         ]
         if any(w > avail_w or h > avail_h for _, w, h in items):
             return None
-        items.sort(key=lambda it: -it[2])
 
         rows, current, current_w = [], [], 0.0
         for item in items:
@@ -290,12 +292,73 @@ class SwDrawingPdfExporter(DwgExporter):
     # BEND TABLE / DIMENSIONS / NOTE
     # =====================================================
 
+    @staticmethod
+    def _method_signature(obj, method_name):
+        """(parameter names, parameter variant types) of a COM method, read from its type library."""
+        try:
+            typeinfo = obj._oleobj_.GetTypeInfo()
+            attr = typeinfo.GetTypeAttr()
+            for index in range(attr.cFuncs):
+                desc = typeinfo.GetFuncDesc(index)
+                names = typeinfo.GetNames(desc.memid)
+                if names and names[0].lower() == method_name.lower():
+                    args = getattr(desc, "args", None) or desc[2]
+                    types = []
+                    for arg in args:
+                        try:
+                            types.append(int(arg[0][0]))
+                        except Exception:
+                            types.append(None)
+                    return list(names[1:]), types
+        except Exception:
+            pass
+        return None, None
+
+    @staticmethod
+    def _guess_arguments(names, types, x, y, template):
+        """One value per parameter, chosen from its name (and variant type when the name says nothing)."""
+        values = []
+        for position, name in enumerate(names):
+            key = str(name).lower()
+            vt = types[position] if position < len(types) else None
+            if "anchorpoint" in key or "useanchor" in key:
+                values.append(False)
+            elif key == "x":
+                values.append(x)
+            elif key == "y":
+                values.append(y)
+            elif "anchortype" in key or key == "anchor":
+                values.append(ANCHOR_BOTTOM_RIGHT)
+            elif "template" in key:
+                values.append(template)
+            elif vt == 11:  # VT_BOOL
+                values.append(False)
+            elif vt == 5:  # VT_R8
+                values.append(0.0)
+            elif vt == 8:  # VT_BSTR
+                values.append("")
+            else:
+                values.append(0)
+        return values
+
     def _insert_bend_table(self, flat_view, sheet_w, steps):
         x = sheet_w - 0.012
         y = TITLE_BLOCK_TOP + 0.004
         template = self._find_bend_table_template()
 
-        attempts = [
+        attempts = []
+
+        names, types = self._method_signature(flat_view, "InsertBendTable")
+        if names:
+            arguments = self._guess_arguments(names, types, x, y, template)
+            steps.append(
+                f"bend table signature: InsertBendTable({', '.join(map(str, names))})"
+            )
+            attempts.append(lambda: flat_view.InsertBendTable(*arguments))
+        else:
+            steps.append("bend table signature: could not be read from SolidWorks")
+
+        attempts += [
             lambda: flat_view.InsertBendTable(
                 False, x, y, ANCHOR_BOTTOM_RIGHT, template
             ),
@@ -417,7 +480,7 @@ class SwDrawingPdfExporter(DwgExporter):
             self._call(sheet, "SetScale", 1.0, 1.0, True, True)
 
             # ---- create the views at 1:1 (provisional spot) to learn their sizes ----
-            kinds = ["flat"] + (["Front", "Top", "Right"] if self.folded_views else [])
+            kinds = ["flat"] + (list(self.view_names) if self.folded_views else [])
             views, sizes = {}, {}
             for kind in kinds:
                 view = self._create_view(drawing, kind, path, configuration, 0.1, 0.15)
