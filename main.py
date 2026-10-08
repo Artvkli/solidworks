@@ -15,7 +15,7 @@ except ImportError:
 
 from solidworks.assembly import SolidWorksAssembly, find_assemblies
 from solidworks.dwg_exporter import DwgExporter
-from solidworks.pdf_builder import PdfDrawingExporter
+from solidworks.pdf_drawings import PdfDrawingExporter
 from solidworks.sw_drawings import SwDrawingPdfExporter
 from solidworks.thickness_dwg import ThicknessDwgBuilder
 from solidworks.sheet_metal import SheetMetalDetector
@@ -37,9 +37,11 @@ SW_DRAWING_TEMPLATE = (
 )
 PDF_FOLDED_VIEWS = True  # views next to the flat pattern
 # Views after the flat pattern, in this order: "Front", "Top", "Right", "Isometric" (the bent part in 3D)
-PDF_VIEWS = ("Front", "Isometric")
-PDF_BEND_TABLE = True
-PDF_DIMENSIONS = True  # model dimensions imported into the views
+# Current step: flat pattern + bend table only.
+PDF_VIEWS = ()
+PDF_BEND_TABLE = True  # Tag / Direction (UP, DOWN) / Angle / Inner Radius, bottom right + tags on the flat pattern
+PDF_DIMENSIONS = False  # model dimensions imported into the views (later step)
+PDF_QTY_NOTE = True  # "QTY=n" note at the bottom left
 # FIRST RUN: only the first N parts get a PDF, so problems show up quickly.
 # Set to None to export all parts.
 PDF_TEST_LIMIT = 3
@@ -297,6 +299,7 @@ def run_pdf_test(sw_app, assembly_path, unique_parts, output_folder):
             view_names=PDF_VIEWS,
             bend_table=PDF_BEND_TABLE,
             dimensions=PDF_DIMENSIONS,
+            qty_note=PDF_QTY_NOTE,
         )
         try:
             result = sw_pdf.export_all(
@@ -431,6 +434,7 @@ def main():
                         view_names=PDF_VIEWS,
                         bend_table=PDF_BEND_TABLE,
                         dimensions=PDF_DIMENSIONS,
+                        qty_note=PDF_QTY_NOTE,
                     )
                     try:
                         pdf_result = sw_pdf.export_all(

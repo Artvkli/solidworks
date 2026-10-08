@@ -54,6 +54,10 @@ MARGIN_TOP = 0.030
 TITLE_BLOCK_TOP = 0.056  # the default sheet format's title block ends about here
 VIEW_GAP = 0.020  # free space around each view (room for dimensions)
 ROW_HEIGHT_GUESS = 0.0065  # bend table row height when it cannot be read
+TABLE_MARGIN_RIGHT = 0.012  # gap between the bend table and the sheet border
+TABLE_WIDTH_GUESS = (
+    0.113  # bend table width when it cannot be read (like the company drawing)
+)
 
 
 class SwDrawingPdfExporter(DwgExporter):
@@ -73,13 +77,15 @@ class SwDrawingPdfExporter(DwgExporter):
         folded_views=True,
         bend_table=True,
         dimensions=True,
-        view_names=("Front", "Isometric"),
+        view_names=(),
+        qty_note=True,
     ):
         super().__init__(sw_app, assembly_path=assembly_path, reconnect=reconnect)
         self.template = template
         self.paper_size = paper_size
         self.folded_views = folded_views
         self.view_names = tuple(view_names)
+        self.qty_note = qty_note
         self.bend_table = bend_table
         self.dimensions = dimensions
         self._template_path = None
@@ -133,14 +139,27 @@ class SwDrawingPdfExporter(DwgExporter):
         return None
 
     def _find_bend_table_template(self):
+        roots = []
+
+        try:
+            executable = self.sw_app.GetExecutablePath()
+            if executable:
+                roots.append(Path(str(executable)))
+        except Exception:
+            pass
+
         program_data = os.environ.get("ProgramData")
-        if not program_data:
-            return ""
-        base = Path(program_data) / "SolidWorks"
-        if base.exists():
-            found = sorted(base.glob("**/*.sldbndtbt"), reverse=True)
-            if found:
-                return str(found[0])
+        if program_data:
+            roots.append(Path(program_data) / "SolidWorks")
+
+        for root in roots:
+            try:
+                if root.exists():
+                    found = sorted(root.glob("**/*.sldbndtbt"), reverse=True)
+                    if found:
+                        return str(found[0])
+            except Exception:
+                continue
         return ""
 
     # =====================================================
@@ -379,20 +398,77 @@ class SwDrawingPdfExporter(DwgExporter):
         steps.append("bend table: FAILED (" + " | ".join(errors) + ")")
         return None
 
-    def _bend_table_height(self, table):
+    def _table_size(self, table):
+        """(width, height) of a table annotation in metres (estimates when SolidWorks does not tell)."""
         rows = self._get(table, "RowCount")
+        columns = self._get(table, "ColumnCount")
+
         try:
             rows = int(rows)
         except Exception:
-            return None
-        total = 0.0
+            rows = 0
+        try:
+            columns = int(columns)
+        except Exception:
+            columns = 0
+
+        height = 0.0
         for row in range(rows):
-            height = self._call(table, "GetRowHeight", row)
+            value = self._call(table, "GetRowHeight", row)
             try:
-                total += float(height)
+                height += float(value)
             except Exception:
-                total += ROW_HEIGHT_GUESS
-        return total if total > 0 else rows * ROW_HEIGHT_GUESS
+                height += ROW_HEIGHT_GUESS
+        if height <= 0:
+            height = max(rows, 1) * ROW_HEIGHT_GUESS
+
+        width = 0.0
+        for column in range(columns):
+            value = self._call(table, "GetColumnWidth", column)
+            try:
+                width += float(value)
+            except Exception:
+                width = 0.0
+                break
+        if width <= 0:
+            width = TABLE_WIDTH_GUESS
+
+        return width, height
+
+    def _place_bend_table(self, table, sheet_w, steps):
+        """Moves the table to the bottom right corner, just above the title block. Returns its height."""
+        width, height = self._table_size(table)
+        x_left = sheet_w - TABLE_MARGIN_RIGHT - width
+        y_top = TITLE_BLOCK_TOP + 0.004 + height
+
+        try:
+            annotation = self._call(table, "GetAnnotation")
+            annotation.SetPosition2(x_left, y_top, 0.0)
+            steps.append(
+                f"bend table: placed bottom right ({width * 1000:.0f} x {height * 1000:.0f} mm)"
+            )
+        except Exception as exc:
+            steps.append(
+                f"bend table: could not be moved, left where SolidWorks put it ({str(exc)[:60]})"
+            )
+        return height
+
+    def _describe_table(self, table, steps):
+        """Writes the table text to the log so the bends can be checked against the model."""
+        try:
+            rows = int(self._get(table, "RowCount"))
+            columns = int(self._get(table, "ColumnCount"))
+        except Exception:
+            steps.append("bend table content: could not be read")
+            return
+
+        steps.append(f"bend table content ({max(rows - 1, 0)} bends):")
+        for row in range(min(rows, 40)):
+            cells = []
+            for column in range(columns):
+                value = self._call(table, "Text", row, column)
+                cells.append("" if value is None else str(value).strip())
+            steps.append("    " + " | ".join(cells))
 
     def _insert_dimensions(self, drawing, steps):
         errors = []
@@ -500,7 +576,10 @@ class SwDrawingPdfExporter(DwgExporter):
             if self.bend_table:
                 table = self._insert_bend_table(views["flat"], sheet_w, steps)
                 if table is not None:
-                    table_height = self._bend_table_height(table) or 0.05
+                    table_height = self._place_bend_table(table, sheet_w, steps)
+                    self._describe_table(table, steps)
+                else:
+                    steps.append("BEND TABLE MISSING in this drawing")
             bottom = TITLE_BLOCK_TOP + max(table_height + 0.010, 0.030) + 0.006
             region = (MARGIN_LEFT, bottom, sheet_w - MARGIN_RIGHT, sheet_h - MARGIN_TOP)
 
@@ -521,14 +600,15 @@ class SwDrawingPdfExporter(DwgExporter):
                 self._insert_dimensions(drawing, steps)
 
             # ---- QTY note ----
-            quantity = int(item.get("quantity", 1))
-            mirror = int(item.get("mirror_quantity", 0) or 0)
-            text = f"QTY={quantity}" + (
-                f" ({quantity - mirror} + {mirror} MIRROR)" if mirror else ""
-            )
-            self._insert_note(
-                drawing, text, MARGIN_LEFT + 0.004, TITLE_BLOCK_TOP + 0.012, steps
-            )
+            if self.qty_note:
+                quantity = int(item.get("quantity", 1))
+                mirror = int(item.get("mirror_quantity", 0) or 0)
+                text = f"QTY={quantity}" + (
+                    f" ({quantity - mirror} + {mirror} MIRROR)" if mirror else ""
+                )
+                self._insert_note(
+                    drawing, text, MARGIN_LEFT + 0.004, TITLE_BLOCK_TOP + 0.012, steps
+                )
 
             # ---- save the drawing, then the PDF ----
             slddrw_path.parent.mkdir(parents=True, exist_ok=True)
