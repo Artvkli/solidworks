@@ -9,6 +9,10 @@ SW_DOC_PART = 1
 SW_OPEN_SILENT = 1
 SW_OPEN_READONLY = 2
 ANCHOR_TOP_LEFT = 1  # swBOMConfigurationAnchor_TopLeft
+FIRST_TAG = "A"  # first bend tag letter
+SW_UNSUPPRESS = 0
+SW_SUPPRESS = 1
+SW_THIS_CONFIGURATION = 1
 MAX_PREFERENCE_INDEX = 80
 
 
@@ -30,6 +34,7 @@ class BendTableReader:
         self.drawing_template = drawing_template
         self.bend_template = bend_template
         self._templates_resolved = False
+        self._last_accessor = None
 
     # =====================================================
     # SAFE HELPERS
@@ -151,27 +156,38 @@ class BendTableReader:
     # =====================================================
 
     def _cell_text(self, table, row, col):
-        for name in ("DisplayedText", "Text", "GetCellText"):
-            value = self._call(table, name, row, col)
+        # ITableAnnotation: DisplayedText2(Row, Column, IncludeHidden) is the current accessor,
+        # DisplayedText(Row, Column) is the older (obsolete) one; Text* give the driving string.
+        attempts = (
+            ("DisplayedText2", (row, col, True)),
+            ("DisplayedText", (row, col)),
+            ("Text2", (row, col, True)),
+            ("Text", (row, col)),
+        )
+        for name, args in attempts:
+            value = self._call(table, name, *args)
             if isinstance(value, str):
+                self._last_accessor = name
                 return value.strip()
         return ""
 
     def _insert_bend_table(self, view, steps):
-        templates = []
-        if self.bend_template:
-            templates.append(self.bend_template)
-        templates.append("")
+        # IView.InsertBendTable(UseAnchorPoint, X, Y, AnchorType, StartValue, TableTemplate)
+        # StartValue is the first tag ("A"); TableTemplate is the full path of a .sldbndtbt file.
+        templates = [self.bend_template] if self.bend_template else [""]
 
         for template in templates:
-            try:
-                table = view.InsertBendTable(True, 0.2, 0.2, ANCHOR_TOP_LEFT, template)
-            except Exception as exc:
-                steps.append(f"InsertBendTable(template={template!r}) failed: {exc}")
-                continue
-            if table is not None:
-                return table
-            steps.append(f"InsertBendTable(template={template!r}) returned None")
+            for anchor in (ANCHOR_TOP_LEFT, 0, 2):
+                try:
+                    table = view.InsertBendTable(
+                        False, 0.05, 0.05, anchor, FIRST_TAG, template
+                    )
+                except Exception as exc:
+                    steps.append(f"InsertBendTable(anchor={anchor}) failed: {exc}")
+                    continue
+                if table is not None:
+                    return table
+                steps.append(f"InsertBendTable(anchor={anchor}) returned None")
         return None
 
     def _read_table(self, table, steps):
@@ -187,6 +203,7 @@ class BendTableReader:
         ):
             return None
 
+        self._last_accessor = None
         header = [self._cell_text(table, 0, c) for c in range(col_count)]
         rows = []
         for r in range(1, row_count):
@@ -194,7 +211,26 @@ class BendTableReader:
             if any(cells):
                 rows.append(cells)
 
+        steps.append(f"cells read with: {self._last_accessor}")
         return {"header": header, "rows": rows}
+
+    def _create_flat_view(self, drawing, path, config):
+        """CreateFlatPatternViewFromModelView3, first with the part's configuration, then with ''."""
+        configs = []
+        for name in (config, ""):
+            if name not in configs:
+                configs.append(name)
+
+        for name in configs:
+            try:
+                view = drawing.CreateFlatPatternViewFromModelView3(
+                    str(path), str(name), 0.15, 0.15, 0.0, False, False
+                )
+            except Exception:
+                view = None
+            if view is not None:
+                return view
+        return None
 
     def read_part(self, item):
         """Returns (table_dict_or_None, message, steps)."""
@@ -204,6 +240,7 @@ class BendTableReader:
 
         model, opened_by_us = self._open_part(path)
         drawing = None
+        restore_flat = None
         try:
             if model is None:
                 return None, "part could not be opened", steps
@@ -221,9 +258,19 @@ class BendTableReader:
                 return None, "NewDocument returned None", steps
             steps.append("temporary drawing created")
 
-            view = drawing.CreateFlatPatternViewFromModelView3(
-                str(path), str(config), 0.15, 0.15, 0.0, False, False
-            )
+            view = self._create_flat_view(drawing, path, config)
+            if view is None:
+                flat = self._call(model, "FeatureByName", "Flat-Pattern1")
+                if flat is not None and self._get(flat, "IsSuppressed", False):
+                    try:
+                        flat.SetSuppression2(SW_UNSUPPRESS, SW_THIS_CONFIGURATION, None)
+                        restore_flat = flat
+                        steps.append(
+                            "flat pattern was suppressed - un-suppressed for the view"
+                        )
+                    except Exception as exc:
+                        steps.append(f"could not un-suppress the flat pattern: {exc}")
+                    view = self._create_flat_view(drawing, path, config)
             if view is None:
                 return (
                     None,
@@ -248,6 +295,13 @@ class BendTableReader:
         except Exception as exc:
             return None, f"error: {type(exc).__name__}: {exc}", steps
         finally:
+            if restore_flat is not None:
+                try:
+                    restore_flat.SetSuppression2(
+                        SW_SUPPRESS, SW_THIS_CONFIGURATION, None
+                    )
+                except Exception:
+                    pass
             if drawing is not None:
                 self._close(drawing)  # closed without saving
             if opened_by_us and model is not None:
