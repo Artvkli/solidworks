@@ -13,7 +13,7 @@ except ImportError:
 
 from solidworks.assembly import SolidWorksAssembly, find_assemblies
 from solidworks.bend_table import BendTableReader
-from solidworks.bend_table_pdf import BendTablePdfWriter
+from solidworks.bend_table_pdf import BendTablePdfWriter, attach_flat_dxfs
 from solidworks.dwg_exporter import DwgExporter
 from solidworks.thickness_dwg import ThicknessDwgBuilder
 from solidworks.sheet_metal import SheetMetalDetector
@@ -36,6 +36,15 @@ USE_SCAN_CACHE = True
 # The DXF/DWG output is NOT changed by this. PDFs go to output/bend_tables_pdf/
 EXPORT_BEND_TABLE_PDF = True
 COMBINE_BEND_TABLE_PDF = True  # also write ONE PDF with all parts (one page per part)
+FLAT_VIEW_IN_PDF = (
+    True  # draw the flat pattern + length/width + bend positions on every PDF page.
+)
+# Uses the flat pattern DXFs of an earlier run (output/*/_parts_dxf/) when they
+# exist and exports only the missing ones.
+PROBE_BEND_TAGS = (
+    2  # save what SolidWorks exposes about the bend tags for the first N parts
+)
+# (output/tag_probe/). 0 = off. Needed to place the A, B, C... tags later.
 BEND_TABLE_LIMIT = None  # e.g. 3 = test on the first 3 parts only, None = all parts
 DRAWING_TEMPLATE_PATH = (
     None  # full path of a .drwdot file, only if it is not found automatically
@@ -239,6 +248,12 @@ def main():
         if USE_SCAN_CACHE:
             save_scan_cache(output_folder, assembly_path, scan_result)
 
+    exporter = DwgExporter(
+        sw_app,
+        assembly_path=assembly_path,
+        reconnect=connect_to_solidworks,
+    )
+
     # ---- bend tables: read from SolidWorks, then written to PDF (DXF/DWG untouched) ----
     if EXPORT_BEND_TABLE_PDF:
         try:
@@ -247,10 +262,26 @@ def main():
                 assembly_path=assembly_path,
                 drawing_template=DRAWING_TEMPLATE_PATH,
                 bend_template=BEND_TABLE_TEMPLATE_PATH,
+                probe_folder=output_folder / "tag_probe" if PROBE_BEND_TAGS else None,
+                probe_limit=PROBE_BEND_TAGS,
             )
             reader.read_all(
                 scan_result["sheet_metal_parts"], output_folder, limit=BEND_TABLE_LIMIT
             )
+
+            if FLAT_VIEW_IN_PDF:
+                print("\n" + "=" * 60 + "\nFLAT PATTERNS FOR THE PDF\n" + "=" * 60)
+                attach_flat_dxfs(
+                    scan_result["sheet_metal_parts"],
+                    search_folders=[
+                        output_folder / "by_thickness" / "_parts_dxf",
+                        output_folder / "combined" / "_parts_dxf",
+                        output_folder / "flat_dxf",
+                    ],
+                    export_folder=output_folder / "flat_dxf",
+                    exporter=exporter,
+                )
+
             BendTablePdfWriter().write_all(
                 scan_result["sheet_metal_parts"],
                 output_folder / "bend_tables_pdf",
@@ -265,11 +296,6 @@ def main():
             traceback.print_exc()
 
     drawing_result = None
-    exporter = DwgExporter(
-        sw_app,
-        assembly_path=assembly_path,
-        reconnect=connect_to_solidworks,
-    )
     builder = ThicknessDwgBuilder(
         exporter,
         gap=PART_GAP,

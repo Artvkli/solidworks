@@ -1,5 +1,7 @@
 import csv
 import gc
+import json
+import re
 import time
 from pathlib import Path
 
@@ -29,7 +31,13 @@ class BendTableReader:
     """
 
     def __init__(
-        self, sw_app, assembly_path=None, drawing_template=None, bend_template=None
+        self,
+        sw_app,
+        assembly_path=None,
+        drawing_template=None,
+        bend_template=None,
+        probe_folder=None,
+        probe_limit=0,
     ):
         self.sw_app = sw_app
         self.assembly_path = Path(assembly_path).resolve() if assembly_path else None
@@ -38,6 +46,9 @@ class BendTableReader:
         self._templates_resolved = False
         self._last_accessor = None
         self._constants_cache = None  # None = not tried yet, False = not available
+        self.probe_folder = Path(probe_folder) if probe_folder else None
+        self.probe_limit = int(probe_limit or 0)
+        self._probed = 0
 
     # =====================================================
     # SAFE HELPERS
@@ -395,6 +406,10 @@ class BendTableReader:
             steps.append("bend table inserted")
 
             table = self._read_table(table_obj, steps)
+            try:
+                self._probe_view(view, drawing, item, steps)
+            except Exception as exc:
+                steps.append(f"probe failed (ignored): {exc}")
             if table is None:
                 return None, "bend table could not be read", steps
             if not table["rows"]:
@@ -418,6 +433,95 @@ class BendTableReader:
                 self._close(model)
             del drawing, model
             gc.collect()
+
+    # =====================================================
+    # PROBE: what does SolidWorks expose about the bend tags?
+    # =====================================================
+
+    @staticmethod
+    def _plain(value):
+        """Turn COM results into something JSON can hold."""
+        if isinstance(value, (str, int, float, bool)) or value is None:
+            return value
+        if isinstance(value, (list, tuple)):
+            return [BendTableReader._plain(v) for v in value]
+        return f"<{type(value).__name__}>"
+
+    def _probe_view(self, view, drawing, item, steps):
+        """
+        Saves, for the first few parts, the raw data SolidWorks has for the flat pattern view:
+        its scale and outline, its bend lines, its notes (the bend tags are probably notes), and the whole
+        temporary drawing as a DXF. Nothing here changes the PDF; it only collects facts so that the A, B, C...
+        tags can be placed on the right bend lines without guessing. Every step is optional.
+        """
+        if self.probe_folder is None or self._probed >= self.probe_limit:
+            return
+        self._probed += 1
+
+        safe = (
+            re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", str(item["name"])).strip() or "part"
+        )
+        data = {"part": item["name"]}
+
+        try:
+            self.probe_folder.mkdir(parents=True, exist_ok=True)
+        except Exception as exc:
+            steps.append(f"probe: cannot create {self.probe_folder}: {exc}")
+            return
+
+        data["scale"] = self._plain(self._get(view, "ScaleDecimal"))
+        data["outline"] = self._plain(self._call(view, "GetOutline"))
+        data["position"] = self._plain(self._call(view, "Position"))
+        data["bend_line_count"] = self._plain(self._call(view, "GetBendLineCount"))
+
+        lines = []
+        try:
+            for seg in self._call(view, "GetBendLines") or []:
+                start = self._call(seg, "GetStartPoint2")
+                end = self._call(seg, "GetEndPoint2")
+                lines.append(
+                    {
+                        "start": [self._get(start, a) for a in ("X", "Y", "Z")],
+                        "end": [self._get(end, a) for a in ("X", "Y", "Z")],
+                    }
+                )
+        except Exception as exc:
+            data["bend_lines_error"] = str(exc)
+        data["bend_lines"] = lines
+
+        notes = []
+        try:
+            for note in self._call(view, "GetNotes") or []:
+                annotation = self._call(note, "GetAnnotation")
+                notes.append(
+                    {
+                        "text": self._plain(self._call(note, "GetText")),
+                        "position": self._plain(self._call(annotation, "GetPosition")),
+                    }
+                )
+        except Exception as exc:
+            data["notes_error"] = str(exc)
+        data["notes"] = notes
+
+        try:
+            (self.probe_folder / f"{safe}_probe.json").write_text(
+                json.dumps(data, ensure_ascii=False, indent=1, default=str),
+                encoding="utf-8",
+            )
+            steps.append(
+                f"probe: scale={data['scale']}, bend lines={len(lines)}, notes={len(notes)} -> {safe}_probe.json"
+            )
+        except Exception as exc:
+            steps.append(f"probe: could not write the json: {exc}")
+
+        try:
+            dxf = self.probe_folder / f"{safe}_drawing.dxf"
+            drawing.SaveAs3(str(dxf), 0, 0)
+            steps.append(
+                f"probe: temporary drawing exported -> {dxf.name} ({'ok' if dxf.exists() else 'no file'})"
+            )
+        except Exception as exc:
+            steps.append(f"probe: drawing DXF export failed: {exc}")
 
     # =====================================================
     # ALL PARTS
