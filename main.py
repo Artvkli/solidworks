@@ -24,6 +24,14 @@ ODA_CONVERTER_PATH = None
 PART_GAP = 20.0
 MAX_ROW_WIDTH = 6000.0
 
+# ---- test mode ----
+# PDF_ONLY = True  -> ONLY the bend table PDFs. No flat pattern DXF export, no merging, no DWG.
+# PDF_ONLY = False -> the normal full run (DXF/DWG as before).
+PDF_ONLY = True
+# USE_SCAN_CACHE = True -> the sheet metal scan of the last run (output/scan_cache.json) is reused
+# instead of scanning every part again. Delete that file (or set False) to scan again.
+USE_SCAN_CACHE = True
+
 # ---- bend tables (Tag / Direction / Angle / Inner Radius) written to PDF ----
 # The DXF/DWG output is NOT changed by this. PDFs go to output/bend_tables_pdf/
 EXPORT_BEND_TABLE_PDF = True
@@ -113,6 +121,69 @@ def save_run_summary(output_folder, assembly_path, scan_result, drawing_result):
         print(f"Could not save run summary: {exc}")
 
 
+SCAN_CACHE_NAME = "scan_cache.json"
+SCAN_CACHE_FIELDS = (
+    "unique_parts",
+    "sheet_metal",
+    "not_sheet_metal",
+    "failed",
+    "failed_parts",
+    "total_quantity",
+    "sheet_metal_parts",
+    "mirror_links",
+)
+
+
+def _scan_cache_key(assembly_path):
+    try:
+        mtime = Path(assembly_path).stat().st_mtime
+    except OSError:
+        mtime = None
+    return {
+        "assembly": str(assembly_path),
+        "mtime": mtime,
+        "group_by_thickness": GROUP_BY_THICKNESS,
+    }
+
+
+def save_scan_cache(output_folder, assembly_path, scan_result):
+    data = {
+        "key": _scan_cache_key(assembly_path),
+        "result": {k: scan_result.get(k) for k in SCAN_CACHE_FIELDS},
+    }
+    path = Path(output_folder) / SCAN_CACHE_NAME
+    try:
+        path.write_text(
+            json.dumps(data, ensure_ascii=False, indent=1, default=str),
+            encoding="utf-8",
+        )
+        print(f"Scan saved for the next run: {path}")
+    except Exception as exc:
+        print(f"Could not save the scan cache: {exc}")
+
+
+def load_scan_cache(output_folder, assembly_path):
+    path = Path(output_folder) / SCAN_CACHE_NAME
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if data.get("key") != _scan_cache_key(assembly_path):
+            print(
+                "The saved scan belongs to another assembly or other settings - scanning again."
+            )
+            return None
+        result = data["result"]
+        if not result.get("sheet_metal_parts"):
+            return None
+        result["thickness_groups"] = {}
+        result["csv_path"] = None
+        return result
+    except Exception as exc:
+        print(f"Could not read the scan cache ({exc}) - scanning again.")
+        return None
+
+
 def main():
     project_folder = Path(__file__).resolve().parent
     input_folder = project_folder / "input"
@@ -137,18 +208,36 @@ def main():
         print("Could not open assembly. Stopping.")
         return 1
 
-    components = assembly.get_components()
-    if not components:
-        print("No components found. Stopping.")
-        return 1
-
-    unique_parts = assembly.get_unique_part_quantities(components)
-    print_summary(components, unique_parts)
-
-    detector = SheetMetalDetector(
-        sw_app, assembly_path=assembly_path, read_thickness=GROUP_BY_THICKNESS
+    scan_result = (
+        load_scan_cache(output_folder, assembly_path) if USE_SCAN_CACHE else None
     )
-    scan_result = detector.scan_and_export(unique_parts, output_folder)
+    detector = None
+
+    if scan_result is not None:
+        print("\n" + "=" * 60)
+        print("USING THE SAVED SCAN (no parts are scanned again)")
+        print("=" * 60)
+        print(
+            f"Sheet metal parts: {scan_result['sheet_metal']}  |  total quantity: {scan_result['total_quantity']}"
+        )
+        print(
+            f"Delete {Path(output_folder) / SCAN_CACHE_NAME} (or set USE_SCAN_CACHE = False) to scan again."
+        )
+    else:
+        components = assembly.get_components()
+        if not components:
+            print("No components found. Stopping.")
+            return 1
+
+        unique_parts = assembly.get_unique_part_quantities(components)
+        print_summary(components, unique_parts)
+
+        detector = SheetMetalDetector(
+            sw_app, assembly_path=assembly_path, read_thickness=GROUP_BY_THICKNESS
+        )
+        scan_result = detector.scan_and_export(unique_parts, output_folder)
+        if USE_SCAN_CACHE:
+            save_scan_cache(output_folder, assembly_path, scan_result)
 
     # ---- bend tables: read from SolidWorks, then written to PDF (DXF/DWG untouched) ----
     if EXPORT_BEND_TABLE_PDF:
@@ -191,11 +280,16 @@ def main():
     )
 
     try:
-        drawing_result = builder.build(
-            scan_result["sheet_metal_parts"],
-            output_folder / ("by_thickness" if GROUP_BY_THICKNESS else "combined"),
-            base_name=assembly_path.stem,
-        )
+        if PDF_ONLY:
+            print(
+                "\nPDF_ONLY is on: flat pattern DXF export, merging and DWG conversion are skipped."
+            )
+        else:
+            drawing_result = builder.build(
+                scan_result["sheet_metal_parts"],
+                output_folder / ("by_thickness" if GROUP_BY_THICKNESS else "combined"),
+                base_name=assembly_path.stem,
+            )
     except Exception as exc:
         print("\nDRAWING EXPORT FAILED")
         print(f"{type(exc).__name__}: {exc}")

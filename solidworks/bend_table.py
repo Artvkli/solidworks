@@ -1,5 +1,6 @@
 import csv
 import gc
+import time
 from pathlib import Path
 
 import pythoncom
@@ -300,15 +301,18 @@ class BendTableReader:
             if name not in configs:
                 configs.append(name)
 
-        for name in configs:
-            try:
-                view = drawing.CreateFlatPatternViewFromModelView3(
-                    str(path), str(name), 0.15, 0.15, 0.0, False, False
-                )
-            except Exception:
-                view = None
-            if view is not None:
-                return view
+        for round_number in range(2):
+            for name in configs:
+                try:
+                    view = drawing.CreateFlatPatternViewFromModelView3(
+                        str(path), str(name), 0.15, 0.15, 0.0, False, False
+                    )
+                except Exception:
+                    view = None
+                if view is not None:
+                    return view
+            if round_number == 0:
+                time.sleep(0.5)
         return None
 
     def read_part(self, item):
@@ -332,25 +336,51 @@ class BendTableReader:
                     steps,
                 )
 
-            drawing = self.sw_app.NewDocument(self.drawing_template, 0, 0.0, 0.0)
-            if drawing is None:
-                return None, "NewDocument returned None", steps
-            steps.append("temporary drawing created")
-            self._use_millimeters(drawing, steps)
+            # make sure the part (and its flat pattern) is up to date before a drawing uses it
+            self._call(model, "ForceRebuild3", True)
 
-            view = self._create_flat_view(drawing, path, config)
-            if view is None:
-                flat = self._call(model, "FeatureByName", "Flat-Pattern1")
-                if flat is not None and self._get(flat, "IsSuppressed", False):
-                    try:
-                        flat.SetSuppression2(SW_UNSUPPRESS, SW_THIS_CONFIGURATION, None)
-                        restore_flat = flat
-                        steps.append(
-                            "flat pattern was suppressed - un-suppressed for the view"
-                        )
-                    except Exception as exc:
-                        steps.append(f"could not un-suppress the flat pattern: {exc}")
-                    view = self._create_flat_view(drawing, path, config)
+            # In two real runs the FIRST part of the run failed to get a flat pattern view while all the
+            # following ones worked. So: if the view is not created, close that drawing, wait a moment
+            # and try again with a brand new temporary drawing.
+            view = None
+            for attempt in (1, 2):
+                drawing = self.sw_app.NewDocument(self.drawing_template, 0, 0.0, 0.0)
+                if drawing is None:
+                    return None, "NewDocument returned None", steps
+                steps.append(f"temporary drawing created (attempt {attempt})")
+                self._use_millimeters(drawing, steps)
+
+                view = self._create_flat_view(drawing, path, config)
+                if view is None:
+                    flat = self._call(model, "FeatureByName", "Flat-Pattern1")
+                    if (
+                        flat is not None
+                        and restore_flat is None
+                        and self._get(flat, "IsSuppressed", False)
+                    ):
+                        try:
+                            flat.SetSuppression2(
+                                SW_UNSUPPRESS, SW_THIS_CONFIGURATION, None
+                            )
+                            restore_flat = flat
+                            steps.append(
+                                "flat pattern was suppressed - un-suppressed for the view"
+                            )
+                        except Exception as exc:
+                            steps.append(
+                                f"could not un-suppress the flat pattern: {exc}"
+                            )
+                        view = self._create_flat_view(drawing, path, config)
+
+                if view is not None:
+                    break
+
+                steps.append(f"flat pattern view was not created on attempt {attempt}")
+                if attempt == 1:
+                    self._close(drawing)
+                    drawing = None
+                    time.sleep(1.0)
+
             if view is None:
                 return (
                     None,
