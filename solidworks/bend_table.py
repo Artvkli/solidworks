@@ -13,6 +13,7 @@ FIRST_TAG = "A"  # first bend tag letter
 SW_UNSUPPRESS = 0
 SW_SUPPRESS = 1
 SW_THIS_CONFIGURATION = 1
+NO_OPTION_SPECIFIED = 0  # swUserPreferenceOption_e.swDetailingNoOptionSpecified
 MAX_PREFERENCE_INDEX = 80
 
 
@@ -35,6 +36,7 @@ class BendTableReader:
         self.bend_template = bend_template
         self._templates_resolved = False
         self._last_accessor = None
+        self._constants_cache = None  # None = not tried yet, False = not available
 
     # =====================================================
     # SAFE HELPERS
@@ -117,6 +119,83 @@ class BendTableReader:
         steps.append(
             f"bend table template: {self.bend_template or '(SolidWorks default)'}"
         )
+
+    # =====================================================
+    # UNITS  (the bend table shows values in the DRAWING's units)
+    # =====================================================
+
+    def _constants(self):
+        """
+        SolidWorks enumeration values (swUnitSystem, swUnitsLinear, ...), read from the
+        swconst.tlb that is installed with YOUR SolidWorks, so the numbers always match its version.
+        """
+        if self._constants_cache is not None:
+            return self._constants_cache or None
+        self._constants_cache = False
+
+        try:
+            import win32com.client as client
+            from win32com.client import gencache
+
+            exe = self._get(self.sw_app, "GetExecutablePath")
+            if not exe:
+                return None
+            install = Path(str(exe))
+            if install.suffix:
+                install = install.parent
+
+            for tlb_path in sorted(install.glob("*.tlb")):
+                if "swconst" not in tlb_path.name.lower():
+                    continue
+                tlb = pythoncom.LoadTypeLib(str(tlb_path))
+                guid, lcid, _syskind, major, minor, _flags = tlb.GetLibAttr()
+                gencache.EnsureModule(str(guid), lcid, major, minor)
+                try:
+                    getattr(client.constants, "swUnitSystem_MMGS")
+                except AttributeError:
+                    continue
+                self._constants_cache = client.constants
+                return self._constants_cache
+        except Exception:
+            pass
+        return None
+
+    def _use_millimeters(self, drawing, steps):
+        """
+        The default drawing template may be in INCHES: a 2 mm radius then shows as 0.08.
+        Switch the temporary drawing to MMGS (millimetres) before the bend table is created.
+        """
+        constants = self._constants()
+        if constants is None:
+            steps.append(
+                "units: SolidWorks constants (swconst.tlb) could not be loaded - the drawing units were NOT "
+                "changed. If radii look like inches (2 mm -> 0.08), set DRAWING_TEMPLATE_PATH to a metric template."
+            )
+            return False
+
+        try:
+            extension = self._call(drawing, "Extension")
+            extension.SetUserPreferenceInteger(
+                getattr(constants, "swUnitSystem"),
+                NO_OPTION_SPECIFIED,
+                getattr(constants, "swUnitSystem_MMGS"),
+            )
+            extension.SetUserPreferenceInteger(
+                getattr(constants, "swUnitsLinear"),
+                NO_OPTION_SPECIFIED,
+                getattr(constants, "swMM"),
+            )
+            current = extension.GetUserPreferenceInteger(
+                getattr(constants, "swUnitsLinear"), NO_OPTION_SPECIFIED
+            )
+            ok = current == getattr(constants, "swMM")
+            steps.append(
+                f"units: drawing linear unit = {'millimetres' if ok else f'NOT millimetres (code {current})'}"
+            )
+            return ok
+        except Exception as exc:
+            steps.append(f"units: could not set millimetres: {exc}")
+            return False
 
     # =====================================================
     # PART OPEN / CLOSE
@@ -257,6 +336,7 @@ class BendTableReader:
             if drawing is None:
                 return None, "NewDocument returned None", steps
             steps.append("temporary drawing created")
+            self._use_millimeters(drawing, steps)
 
             view = self._create_flat_view(drawing, path, config)
             if view is None:
