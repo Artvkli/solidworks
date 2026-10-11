@@ -504,10 +504,12 @@ class BendTableReader:
         data["notes"] = notes
 
         try:
-            (self.probe_folder / f"{safe}_probe.json").write_text(
+            json_path = self.probe_folder / f"{safe}_probe.json"
+            json_path.write_text(
                 json.dumps(data, ensure_ascii=False, indent=1, default=str),
                 encoding="utf-8",
             )
+            item["view_json"] = str(json_path)
             steps.append(
                 f"probe: scale={data['scale']}, bend lines={len(lines)}, notes={len(notes)} -> {safe}_probe.json"
             )
@@ -517,6 +519,8 @@ class BendTableReader:
         try:
             dxf = self.probe_folder / f"{safe}_drawing.dxf"
             drawing.SaveAs3(str(dxf), 0, 0)
+            if dxf.exists() and dxf.stat().st_size > 0:
+                item["view_dxf"] = str(dxf)
             steps.append(
                 f"probe: temporary drawing exported -> {dxf.name} ({'ok' if dxf.exists() else 'no file'})"
             )

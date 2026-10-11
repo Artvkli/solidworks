@@ -37,14 +37,11 @@ USE_SCAN_CACHE = True
 EXPORT_BEND_TABLE_PDF = True
 COMBINE_BEND_TABLE_PDF = True  # also write ONE PDF with all parts (one page per part)
 FLAT_VIEW_IN_PDF = (
-    True  # draw the flat pattern + length/width + bend positions on every PDF page.
+    True  # draw the flat pattern, its A/B/C... bend tags, the length/width and the bend
 )
-# Uses the flat pattern DXFs of an earlier run (output/*/_parts_dxf/) when they
-# exist and exports only the missing ones.
-PROBE_BEND_TAGS = (
-    2  # save what SolidWorks exposes about the bend tags for the first N parts
-)
-# (output/tag_probe/). 0 = off. Needed to place the A, B, C... tags later.
+# positions on every PDF page. The view is taken from SolidWorks' own temporary
+# drawing (saved in output/flat_view/). Only if that is missing, the flat pattern
+# DXFs of an earlier run (output/*/_parts_dxf/) are used, without tags.
 BEND_TABLE_LIMIT = None  # e.g. 3 = test on the first 3 parts only, None = all parts
 DRAWING_TEMPLATE_PATH = (
     None  # full path of a .drwdot file, only if it is not found automatically
@@ -262,8 +259,8 @@ def main():
                 assembly_path=assembly_path,
                 drawing_template=DRAWING_TEMPLATE_PATH,
                 bend_template=BEND_TABLE_TEMPLATE_PATH,
-                probe_folder=output_folder / "tag_probe" if PROBE_BEND_TAGS else None,
-                probe_limit=PROBE_BEND_TAGS,
+                probe_folder=output_folder / "flat_view" if FLAT_VIEW_IN_PDF else None,
+                probe_limit=10**9,
             )
             reader.read_all(
                 scan_result["sheet_metal_parts"], output_folder, limit=BEND_TABLE_LIMIT
@@ -272,7 +269,11 @@ def main():
             if FLAT_VIEW_IN_PDF:
                 print("\n" + "=" * 60 + "\nFLAT PATTERNS FOR THE PDF\n" + "=" * 60)
                 attach_flat_dxfs(
-                    scan_result["sheet_metal_parts"],
+                    [
+                        p
+                        for p in scan_result["sheet_metal_parts"]
+                        if not p.get("view_dxf")
+                    ],
                     search_folders=[
                         output_folder / "by_thickness" / "_parts_dxf",
                         output_folder / "combined" / "_parts_dxf",

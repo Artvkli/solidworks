@@ -124,13 +124,35 @@ class BendTablePdfWriter:
 
     def _load_view(self, item):
         """The flat pattern view of this part, or None (with the reason kept in self.messages)."""
+        from solidworks.flat_view import FlatPatternView
+
+        # 1. best: the view exactly as SolidWorks drew it (with its bend lines and tag positions)
+        dxf, data = item.get("view_dxf"), item.get("view_json")
+        if dxf and data and Path(dxf).exists() and Path(data).exists():
+            tag_names = [
+                row[0] for row in (item.get("bend_table") or {}).get("rows", []) if row
+            ]
+            view, message = FlatPatternView.from_drawing_dxf(dxf, data, tag_names)
+            if view is not None:
+                for line in view.info:
+                    if (
+                        "could not be identified" in line
+                        or "WARNING" in line
+                        or "not placed" in line
+                    ):
+                        self.messages.append(f"{item['name']}: {line}")
+                return view
+            self.messages.append(
+                f"{item['name']}: SolidWorks view not usable ({message}) - using the flat pattern DXF"
+            )
+
+        # 2. fallback: the flat pattern DXF (shape, overall size and bend positions, but no tags)
         path = item.get("flat_dxf")
         if not path:
             return None
         if not Path(path).exists():
             self.messages.append(f"{item['name']}: flat pattern DXF not found ({path})")
             return None
-        from solidworks.flat_view import FlatPatternView
 
         view, message = FlatPatternView.load(path)
         if view is None:

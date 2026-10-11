@@ -1,3 +1,4 @@
+import json
 import math
 from pathlib import Path
 
@@ -6,6 +7,133 @@ BEND_LAYER_WORDS = ("BEND",)
 DASHED_WORDS = ("DASH", "CENTER", "PHANTOM", "HIDDEN", "DOT")
 AXIS_TOLERANCE = 0.01  # a bend line is "vertical/horizontal" if it leans less than 1 %
 POSITION_TOLERANCE = 0.05  # mm: bend lines closer than this share one dimension
+MATCH_TOLERANCE = (
+    0.6  # mm: a SolidWorks bend line and a DXF line are "the same" within this
+)
+TAG_MAX_DISTANCE = (
+    15.0  # sheet mm: a tag belongs to a bend line only if it sits this close to it
+)
+GEOMETRY_TYPES = (
+    "LINE",
+    "ARC",
+    "CIRCLE",
+    "LWPOLYLINE",
+    "POLYLINE",
+    "SPLINE",
+    "ELLIPSE",
+)
+# the 8 ways a view can sit relative to its sketch: 4 rotations, each with or without a mirror
+ORIENTATIONS = [
+    (1, 0, 0, 1),
+    (0, -1, 1, 0),
+    (-1, 0, 0, -1),
+    (0, 1, -1, 0),
+    (-1, 0, 0, 1),
+    (1, 0, 0, -1),
+    (0, 1, 1, 0),
+    (0, -1, -1, 0),
+]
+
+
+def _dist(a, b):
+    return math.hypot(a[0] - b[0], a[1] - b[1])
+
+
+def _point_segment_distance(p, a, b):
+    ax, ay = a
+    bx, by = b
+    dx, dy = bx - ax, by - ay
+    length_sq = dx * dx + dy * dy
+    if length_sq < 1e-12:
+        return _dist(p, a)
+    t = max(0.0, min(1.0, ((p[0] - ax) * dx + (p[1] - ay) * dy) / length_sq))
+    return _dist(p, (ax + t * dx, ay + t * dy))
+
+
+def match_bend_lines(probe_lines, dxf_lines, tolerance=MATCH_TOLERANCE):
+    """
+    SolidWorks tells us the bend lines in the flat pattern's own sketch coordinates; the drawing DXF has the
+    same lines in sheet coordinates, but turned and moved. Find the rotation / mirror / shift that puts ALL
+    probe lines exactly on DXF lines, and return the indexes of those DXF lines.
+
+    probe_lines: [((x1, y1), (x2, y2)), ...] in mm.   dxf_lines: [(key, (x1, y1), (x2, y2)), ...] in mm.
+    Returns (set_of_keys or None, message).
+    """
+    if not probe_lines or not dxf_lines:
+        return None, "no bend lines to match"
+
+    def close(a, b):
+        return _dist(a, b) <= tolerance
+
+    first_a, first_b = probe_lines[0]
+    first_len = _dist(first_a, first_b)
+    solutions = set()
+
+    for m00, m01, m10, m11 in ORIENTATIONS:
+
+        def move(p, m=(m00, m01, m10, m11)):
+            return (m[0] * p[0] + m[1] * p[1], m[2] * p[0] + m[3] * p[1])
+
+        for key, s, e in dxf_lines:
+            if abs(_dist(s, e) - first_len) > tolerance:
+                continue
+            for u, v in ((s, e), (e, s)):
+                a0, b0 = move(first_a), move(first_b)
+                shift = (u[0] - a0[0], u[1] - a0[1])
+                if not close((b0[0] + shift[0], b0[1] + shift[1]), v):
+                    continue
+
+                matched = set()
+                for pa, pb in probe_lines:
+                    A = move(pa)
+                    B = move(pb)
+                    A = (A[0] + shift[0], A[1] + shift[1])
+                    B = (B[0] + shift[0], B[1] + shift[1])
+                    hit = next(
+                        (
+                            k
+                            for k, s2, e2 in dxf_lines
+                            if (close(A, s2) and close(B, e2))
+                            or (close(A, e2) and close(B, s2))
+                        ),
+                        None,
+                    )
+                    if hit is None:
+                        matched = None
+                        break
+                    matched.add(hit)
+                if matched:
+                    solutions.add(frozenset(matched))
+
+    if not solutions:
+        return None, "the SolidWorks bend lines were not found in the DXF"
+    if len(solutions) > 1:
+        return None, f"{len(solutions)} different placements fit - ambiguous"
+    return set(next(iter(solutions))), "OK"
+
+
+def assign_tags(bend_lines, tags, max_distance):
+    """
+    Each tag sits right next to its bend line. Pair them by distance, nearest pairs first, one line per tag.
+    bend_lines: [((x1, y1), (x2, y2)), ...]   tags: [(text, (x, y)), ...]
+    Returns [{"tag": text, "pos": (x, y), "line": index}, ...] (only pairs within max_distance).
+    """
+    pairs = []
+    for ti, (_text, pos) in enumerate(tags):
+        for li, (a, b) in enumerate(bend_lines):
+            pairs.append((_point_segment_distance(pos, a, b), ti, li))
+    pairs.sort()
+
+    used_tags, used_lines, result = set(), set(), []
+    for distance, ti, li in pairs:
+        if distance > max_distance:
+            break
+        if ti in used_tags or li in used_lines:
+            continue
+        used_tags.add(ti)
+        used_lines.add(li)
+        result.append({"tag": tags[ti][0], "pos": tags[ti][1], "line": li})
+    return result
 
 
 def _round_pos(value):
@@ -18,10 +146,12 @@ class FlatPatternView:
     PDF page with its overall length / width and the positions of the bend lines.
     """
 
-    def __init__(self, paths, info=None):
+    def __init__(self, paths, info=None, tags=None, labels=None):
         # paths: list of {"points": [(x, y), ...], "bend": bool}
         self.paths = paths
         self.info = info or []
+        self.tags = tags or []  # [{"tag": "A", "pos": (x, y), "line": index}, ...]
+        self.labels = labels or []  # [("Fixed Face", (x, y)), ...]
         self.scale_label = ""
 
     # =====================================================
@@ -86,6 +216,100 @@ class FlatPatternView:
             )
         return view, "OK"
 
+    @classmethod
+    def from_drawing_dxf(cls, dxf_path, json_path, tag_names=()):
+        """
+        The flat pattern view exactly as SolidWorks drew it in the temporary drawing: geometry from the
+        exported drawing DXF, the bend lines and the tag notes from the JSON saved next to it.
+        Returns (view_or_None, message).
+        """
+        try:
+            import ezdxf
+            from ezdxf import path as ezpath
+        except ImportError:
+            return None, "ezdxf is not installed (pip install ezdxf)"
+
+        try:
+            data = json.loads(Path(json_path).read_text(encoding="utf-8"))
+            doc = ezdxf.readfile(str(dxf_path))
+        except Exception as exc:
+            return None, f"cannot read the view data: {exc}"
+
+        scale = float(data.get("scale") or 1.0) or 1.0  # sheet size / real size
+
+        paths, dxf_lines = [], []
+        for entity in doc.modelspace():
+            kind = entity.dxftype()
+            if kind not in GEOMETRY_TYPES:
+                continue  # blocks (table, notes, centre marks) and text are not part of the shape
+            try:
+                geometry = ezpath.make_path(entity)
+            except Exception:
+                continue
+            for sub in geometry.sub_paths():
+                points = [
+                    (v.x / scale, v.y / scale) for v in sub.flattening(0.05 * scale)
+                ]
+                if len(points) < 2:
+                    continue
+                paths.append({"points": points, "bend": False})
+                if kind == "LINE" and len(points) == 2:
+                    dxf_lines.append((len(paths) - 1, points[0], points[1]))
+
+        if not paths:
+            return None, "the drawing DXF has no geometry"
+
+        info = []
+        probe = []
+        for line in data.get("bend_lines", []):
+            try:
+                probe.append(
+                    (
+                        (line["start"][0] * 1000.0, line["start"][1] * 1000.0),
+                        (line["end"][0] * 1000.0, line["end"][1] * 1000.0),
+                    )
+                )
+            except Exception:
+                continue
+
+        matched, message = match_bend_lines(probe, dxf_lines)
+        bend_lines = []
+        if matched is None:
+            info.append(f"bend lines could not be identified - {message}")
+        else:
+            for index in sorted(matched):
+                paths[index]["bend"] = True
+            bend_lines = [
+                (paths[i]["points"][0], paths[i]["points"][-1]) for i in sorted(matched)
+            ]
+            info.append(f"{len(matched)} bend line(s) identified from SolidWorks")
+
+        # the notes in the view: bend tags (A, B, ...) and other labels such as "Fixed Face"
+        wanted = {str(t).strip() for t in tag_names}
+        tag_notes, labels = [], []
+        for note in data.get("notes", []):
+            text = str(note.get("text") or "").strip()
+            position = note.get("position")
+            if not text or not position or len(position) < 2:
+                continue
+            at = (position[0] * 1000.0 / scale, position[1] * 1000.0 / scale)
+            (tag_notes if text in wanted else labels).append((text, at))
+
+        tags = []
+        if bend_lines and tag_notes:
+            tags = assign_tags(bend_lines, tag_notes, TAG_MAX_DISTANCE / scale)
+            info.append(
+                f"tags placed: {', '.join(t['tag'] for t in tags)} of {len(tag_notes)}"
+            )
+            if len(tags) != len(tag_notes) or len(tags) != len(bend_lines):
+                info.append(
+                    f"WARNING: {len(tag_notes)} tag(s), {len(bend_lines)} bend line(s), {len(tags)} paired - check this part"
+                )
+        elif tag_notes:
+            info.append("tags not placed: bend lines were not identified")
+
+        return cls(paths, info, tags, labels), "OK"
+
     # =====================================================
     # GEOMETRY
     # =====================================================
@@ -110,11 +334,17 @@ class FlatPatternView:
 
     def rotated(self):
         """The same view turned 90 degrees (x, y) -> (-y, x)."""
+
+        def turn(p):
+            return (-p[1], p[0])
+
         paths = [
-            {"points": [(-y, x) for x, y in p["points"]], "bend": p["bend"]}
+            {"points": [turn(q) for q in p["points"]], "bend": p["bend"]}
             for p in self.paths
         ]
-        return FlatPatternView(paths, list(self.info))
+        tags = [dict(t, pos=turn(t["pos"])) for t in self.tags]
+        labels = [(text, turn(pos)) for text, pos in self.labels]
+        return FlatPatternView(paths, list(self.info), tags, labels)
 
     def bend_positions(self):
         """(x positions of vertical bend lines, y positions of horizontal bend lines, number of slanted ones)."""
@@ -291,6 +521,15 @@ class FlatPatternView:
             c.drawPath(p, stroke=1, fill=0)
         c.setDash()
 
+        # ---- bend tags and labels, where SolidWorks put them ----
+        c.setFillColorRGB(0, 0, 0)
+        for tag in view.tags:
+            c.setFont(font + "-Bold", 10)
+            c.drawCentredString(px(tag["pos"][0]), py(tag["pos"][1]) - 8.0, tag["tag"])
+        for text, pos in view.labels:
+            c.setFont(font, 9)
+            c.drawCentredString(px(pos[0]), py(pos[1]) - 3.0, text)
+
         # ---- dimensions ----
         gray = 0.25
         c.setStrokeColorRGB(gray, gray, gray)
@@ -351,5 +590,6 @@ class FlatPatternView:
         return (
             f"{width:.1f} x {height:.1f} mm, scale {self.scale_label}, "
             f"{len(xs)} vertical / {len(ys)} horizontal / {slanted} slanted bend line(s)"
+            + (f", {len(view.tags)} tag(s)" if view.tags else "")
             + (", turned 90 degrees" if view is not self else "")
         )
