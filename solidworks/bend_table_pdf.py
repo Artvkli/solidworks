@@ -25,14 +25,7 @@ def attach_flat_dxfs(items, search_folders, export_folder, exporter=None):
             continue
 
         filename = f"{safe_name(item['name'])}.dxf"
-        found = next(
-            (
-                Path(f) / filename
-                for f in search_folders
-                if (Path(f) / filename).exists()
-            ),
-            None,
-        )
+        found = next((Path(f) / filename for f in search_folders if (Path(f) / filename).exists()), None)
 
         if found is not None:
             item["flat_dxf"] = str(found)
@@ -49,13 +42,9 @@ def attach_flat_dxfs(items, search_folders, export_folder, exporter=None):
             exported += 1
         else:
             failed += 1
-            print(
-                f"  flat pattern DXF for {item['name']} could not be exported: {str(message)[:160]}"
-            )
+            print(f"  flat pattern DXF for {item['name']} could not be exported: {str(message)[:160]}")
 
-    print(
-        f"Flat pattern DXFs: {reused} reused, {exported} exported now, {failed} missing"
-    )
+    print(f"Flat pattern DXFs: {reused} reused, {exported} exported now, {failed} missing")
     return {"reused": reused, "exported": exported, "failed": failed}
 
 
@@ -73,9 +62,7 @@ class BendTablePdfWriter:
     FONT_BOLD = "Helvetica-Bold"
     MIN_VIEW_HEIGHT = 260.0  # space kept free for the view on the first page
 
-    def __init__(
-        self, margin=22.0, row_height=17.0, font_size=10.5, max_rows_per_page=36
-    ):
+    def __init__(self, margin=22.0, row_height=17.0, font_size=10.5, max_rows_per_page=36):
         self.margin = margin
         self.row_height = row_height
         self.font_size = font_size
@@ -105,9 +92,7 @@ class BendTablePdfWriter:
         header = [str(c) for c in (table.get("header") or [])]
         columns = max([len(header)] + [len(r) for r in rows]) if rows else len(header)
         if not header or all(not h for h in header):
-            header = DEFAULT_HEADER[:columns] + [""] * max(
-                0, columns - len(DEFAULT_HEADER)
-            )
+            header = DEFAULT_HEADER[:columns] + [""] * max(0, columns - len(DEFAULT_HEADER))
         header += [""] * (columns - len(header))
         rows = [r + [""] * (columns - len(r)) for r in rows]
         return header, rows
@@ -129,22 +114,14 @@ class BendTablePdfWriter:
         # 1. best: the view exactly as SolidWorks drew it (with its bend lines and tag positions)
         dxf, data = item.get("view_dxf"), item.get("view_json")
         if dxf and data and Path(dxf).exists() and Path(data).exists():
-            tag_names = [
-                row[0] for row in (item.get("bend_table") or {}).get("rows", []) if row
-            ]
+            tag_names = [row[0] for row in (item.get("bend_table") or {}).get("rows", []) if row]
             view, message = FlatPatternView.from_drawing_dxf(dxf, data, tag_names)
             if view is not None:
                 for line in view.info:
-                    if (
-                        "could not be identified" in line
-                        or "WARNING" in line
-                        or "not placed" in line
-                    ):
+                    if "could not be identified" in line or "WARNING" in line or "not placed" in line:
                         self.messages.append(f"{item['name']}: {line}")
                 return view
-            self.messages.append(
-                f"{item['name']}: SolidWorks view not usable ({message}) - using the flat pattern DXF"
-            )
+            self.messages.append(f"{item['name']}: SolidWorks view not usable ({message}) - using the flat pattern DXF")
 
         # 2. fallback: the flat pattern DXF (shape, overall size and bend positions, but no tags)
         path = item.get("flat_dxf")
@@ -187,15 +164,28 @@ class BendTablePdfWriter:
         # ---- flat pattern view (above the table), first page only ----
         scale_text = "-"
         if view is not None and page_no == 1:
-            area = (m + 14.0, top + 26.0, page_w - m - 14.0, page_h - m - 14.0)
+            low, high = top + 26.0, page_h - m - 14.0
+            left, right = m + 14.0, page_w - m - 14.0
+            flat_area = (left, low, right, high)
+
+            # the part after bending goes to the top of the page (like in the sample), the flat pattern below it
+            folded = view.folded_selection(item.get("thickness")) if getattr(view, "folded", None) else []
+            if folded:
+                band = (high - low) * 0.38
+                try:
+                    description = view.draw_folded(c, (left, high - band, right, high), item.get("thickness"))
+                    if description:
+                        flat_area = (left, low, right, high - band - 6.0)
+                        self.messages.append(f"{item['name']}: folded views drawn - {description}")
+                except Exception as exc:
+                    self.messages.append(f"{item['name']}: folded views failed - {type(exc).__name__}: {exc}")
+
             try:
-                description = view.draw(c, area)
+                description = view.draw(c, flat_area)
                 scale_text = view.scale_label
                 self.messages.append(f"{item['name']}: view drawn - {description}")
             except Exception as exc:
-                self.messages.append(
-                    f"{item['name']}: view drawing failed - {type(exc).__name__}: {exc}"
-                )
+                self.messages.append(f"{item['name']}: view drawing failed - {type(exc).__name__}: {exc}")
 
         # ---- title block (bottom) ----
         c.setLineWidth(0.6)
@@ -217,12 +207,7 @@ class BendTablePdfWriter:
         cell(m, "DWG NO. / PART", name, 14 if len(name) <= 28 else 10)
 
         thickness = item.get("thickness")
-        cell(
-            cuts[0],
-            "THICKNESS",
-            f"{thickness:g} mm" if thickness is not None else "-",
-            12,
-        )
+        cell(cuts[0], "THICKNESS", f"{thickness:g} mm" if thickness is not None else "-", 12)
         cell(cuts[1], "SCALE", scale_text, 12)
         cell(cuts[2], "SHEET", f"{page_no} OF {page_count}", 12)
 
@@ -257,16 +242,12 @@ class BendTablePdfWriter:
         # with a view, the first page keeps room for it, so it holds fewer table rows
         page_h = c._pagesize[1]
         room = page_h - 2 * self.margin - 56.0 - 14.0 - 26.0 - self.MIN_VIEW_HEIGHT
-        first = (
-            max(5, min(self.max_rows_per_page, int(room // self.row_height) - 1))
-            if view
-            else self.max_rows_per_page
-        )
+        first = max(5, min(self.max_rows_per_page, int(room // self.row_height) - 1)) if view else self.max_rows_per_page
 
         chunks, index = [], 0
         while index < len(rows) or not chunks:
             size = first if not chunks else self.max_rows_per_page
-            chunks.append(rows[index : index + size])
+            chunks.append(rows[index:index + size])
             index += size
 
         for number, chunk in enumerate(chunks, start=1):
@@ -299,13 +280,7 @@ class BendTablePdfWriter:
         except ImportError:
             print("The 'reportlab' package is required for PDF output.")
             print("Install it with:  pip install reportlab")
-            return {
-                "written": 0,
-                "files": [],
-                "combined": None,
-                "skipped": [],
-                "error": "reportlab missing",
-            }
+            return {"written": 0, "files": [], "combined": None, "skipped": [], "error": "reportlab missing"}
 
         output_folder = Path(output_folder)
         output_folder.mkdir(parents=True, exist_ok=True)
@@ -329,9 +304,7 @@ class BendTablePdfWriter:
                 before = len(self.messages)
                 pages = self.write_part(item, path)
                 files.append(path)
-                print(
-                    f"{item['name']} -> {path.name} ({len(item['bend_table']['rows'])} bends, {pages} page(s))"
-                )
+                print(f"{item['name']} -> {path.name} ({len(item['bend_table']['rows'])} bends, {pages} page(s))")
                 for line in self.messages[before:]:
                     print(f"    {line}")
             except Exception as exc:
@@ -358,10 +331,4 @@ class BendTablePdfWriter:
             for name in skipped:
                 print(f"  - {name}")
 
-        return {
-            "written": len(files),
-            "files": files,
-            "combined": combined,
-            "skipped": skipped,
-            "error": None,
-        }
+        return {"written": len(files), "files": files, "combined": combined, "skipped": skipped, "error": None}

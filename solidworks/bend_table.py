@@ -18,6 +18,8 @@ SW_SUPPRESS = 1
 SW_THIS_CONFIGURATION = 1
 NO_OPTION_SPECIFIED = 0  # swUserPreferenceOption_e.swDetailingNoOptionSpecified
 MAX_PREFERENCE_INDEX = 80
+FOLDED_VIEWS = (("*Front", "Front"), ("*Top", "Top"), ("*Right", "Right"))  # standard model views
+FOLDED_GAP = 0.4  # metres between views on the (huge, virtual) sheet so their geometry can be told apart
 
 
 class BendTableReader:
@@ -30,15 +32,8 @@ class BendTableReader:
     directions, angles and radii are exactly what SolidWorks shows (same as the sample PDF).
     """
 
-    def __init__(
-        self,
-        sw_app,
-        assembly_path=None,
-        drawing_template=None,
-        bend_template=None,
-        probe_folder=None,
-        probe_limit=0,
-    ):
+    def __init__(self, sw_app, assembly_path=None, drawing_template=None, bend_template=None,
+                 probe_folder=None, probe_limit=0, folded_views=False):
         self.sw_app = sw_app
         self.assembly_path = Path(assembly_path).resolve() if assembly_path else None
         self.drawing_template = drawing_template
@@ -49,6 +44,8 @@ class BendTableReader:
         self.probe_folder = Path(probe_folder) if probe_folder else None
         self.probe_limit = int(probe_limit or 0)
         self._probed = 0
+        self.folded_views = bool(folded_views)
+        self._folded_info = []
 
     # =====================================================
     # SAFE HELPERS
@@ -107,11 +104,7 @@ class BendTableReader:
                     value = self.sw_app.GetUserPreferenceStringValue(index)
                 except Exception:
                     continue
-                if (
-                    isinstance(value, str)
-                    and value.lower().endswith(".drwdot")
-                    and Path(value).exists()
-                ):
+                if isinstance(value, str) and value.lower().endswith(".drwdot") and Path(value).exists():
                     self.drawing_template = value
                     break
 
@@ -121,16 +114,12 @@ class BendTableReader:
                 self.drawing_template = str(found[0])
 
         if not self.bend_template and install:
-            found = sorted(install.glob("lang/english/*.sldbndtbt")) or sorted(
-                install.glob("lang/*/*.sldbndtbt")
-            )
+            found = sorted(install.glob("lang/english/*.sldbndtbt")) or sorted(install.glob("lang/*/*.sldbndtbt"))
             if found:
                 self.bend_template = str(found[0])
 
         steps.append(f"drawing template: {self.drawing_template}")
-        steps.append(
-            f"bend table template: {self.bend_template or '(SolidWorks default)'}"
-        )
+        steps.append(f"bend table template: {self.bend_template or '(SolidWorks default)'}")
 
     # =====================================================
     # UNITS  (the bend table shows values in the DRAWING's units)
@@ -188,22 +177,14 @@ class BendTableReader:
         try:
             extension = self._call(drawing, "Extension")
             extension.SetUserPreferenceInteger(
-                getattr(constants, "swUnitSystem"),
-                NO_OPTION_SPECIFIED,
-                getattr(constants, "swUnitSystem_MMGS"),
+                getattr(constants, "swUnitSystem"), NO_OPTION_SPECIFIED, getattr(constants, "swUnitSystem_MMGS")
             )
             extension.SetUserPreferenceInteger(
-                getattr(constants, "swUnitsLinear"),
-                NO_OPTION_SPECIFIED,
-                getattr(constants, "swMM"),
+                getattr(constants, "swUnitsLinear"), NO_OPTION_SPECIFIED, getattr(constants, "swMM")
             )
-            current = extension.GetUserPreferenceInteger(
-                getattr(constants, "swUnitsLinear"), NO_OPTION_SPECIFIED
-            )
+            current = extension.GetUserPreferenceInteger(getattr(constants, "swUnitsLinear"), NO_OPTION_SPECIFIED)
             ok = current == getattr(constants, "swMM")
-            steps.append(
-                f"units: drawing linear unit = {'millimetres' if ok else f'NOT millimetres (code {current})'}"
-            )
+            steps.append(f"units: drawing linear unit = {'millimetres' if ok else f'NOT millimetres (code {current})'}")
             return ok
         except Exception as exc:
             steps.append(f"units: could not set millimetres: {exc}")
@@ -223,12 +204,8 @@ class BendTableReader:
 
         try:
             model = self.sw_app.OpenDoc6(
-                str(path),
-                SW_DOC_PART,
-                SW_OPEN_SILENT | SW_OPEN_READONLY,
-                "",
-                self._byref_i4(),
-                self._byref_i4(),
+                str(path), SW_DOC_PART, SW_OPEN_SILENT | SW_OPEN_READONLY, "",
+                self._byref_i4(), self._byref_i4(),
             )
             return model, model is not None
         except Exception:
@@ -270,9 +247,7 @@ class BendTableReader:
         for template in templates:
             for anchor in (ANCHOR_TOP_LEFT, 0, 2):
                 try:
-                    table = view.InsertBendTable(
-                        False, 0.05, 0.05, anchor, FIRST_TAG, template
-                    )
+                    table = view.InsertBendTable(False, 0.05, 0.05, anchor, FIRST_TAG, template)
                 except Exception as exc:
                     steps.append(f"InsertBendTable(anchor={anchor}) failed: {exc}")
                     continue
@@ -286,12 +261,7 @@ class BendTableReader:
         col_count = self._get(table, "ColumnCount")
         steps.append(f"table size: rows={row_count} columns={col_count}")
 
-        if (
-            not isinstance(row_count, int)
-            or not isinstance(col_count, int)
-            or row_count < 1
-            or col_count < 1
-        ):
+        if not isinstance(row_count, int) or not isinstance(col_count, int) or row_count < 1 or col_count < 1:
             return None
 
         self._last_accessor = None
@@ -341,11 +311,7 @@ class BendTableReader:
 
             self._resolve_templates(steps)
             if not self.drawing_template:
-                return (
-                    None,
-                    "no drawing template found (set DRAWING_TEMPLATE_PATH in main.py)",
-                    steps,
-                )
+                return None, "no drawing template found (set DRAWING_TEMPLATE_PATH in main.py)", steps
 
             # make sure the part (and its flat pattern) is up to date before a drawing uses it
             self._call(model, "ForceRebuild3", True)
@@ -364,23 +330,13 @@ class BendTableReader:
                 view = self._create_flat_view(drawing, path, config)
                 if view is None:
                     flat = self._call(model, "FeatureByName", "Flat-Pattern1")
-                    if (
-                        flat is not None
-                        and restore_flat is None
-                        and self._get(flat, "IsSuppressed", False)
-                    ):
+                    if flat is not None and restore_flat is None and self._get(flat, "IsSuppressed", False):
                         try:
-                            flat.SetSuppression2(
-                                SW_UNSUPPRESS, SW_THIS_CONFIGURATION, None
-                            )
+                            flat.SetSuppression2(SW_UNSUPPRESS, SW_THIS_CONFIGURATION, None)
                             restore_flat = flat
-                            steps.append(
-                                "flat pattern was suppressed - un-suppressed for the view"
-                            )
+                            steps.append("flat pattern was suppressed - un-suppressed for the view")
                         except Exception as exc:
-                            steps.append(
-                                f"could not un-suppress the flat pattern: {exc}"
-                            )
+                            steps.append(f"could not un-suppress the flat pattern: {exc}")
                         view = self._create_flat_view(drawing, path, config)
 
                 if view is not None:
@@ -393,11 +349,7 @@ class BendTableReader:
                     time.sleep(1.0)
 
             if view is None:
-                return (
-                    None,
-                    "flat pattern view was not created (does the part have a flat pattern?)",
-                    steps,
-                )
+                return None, "flat pattern view was not created (does the part have a flat pattern?)", steps
             steps.append("flat pattern view created")
 
             table_obj = self._insert_bend_table(view, steps)
@@ -406,6 +358,17 @@ class BendTableReader:
             steps.append("bend table inserted")
 
             table = self._read_table(table_obj, steps)
+
+            self._folded_info = []
+            if self.folded_views and self.probe_folder is not None:
+                if restore_flat is not None:
+                    steps.append("folded views skipped: the flat pattern had to be un-suppressed, so the part is flat")
+                else:
+                    try:
+                        self._add_folded_views(drawing, model, path, view, steps)
+                    except Exception as exc:
+                        steps.append(f"folded views failed (ignored): {exc}")
+
             try:
                 self._probe_view(view, drawing, item, steps)
             except Exception as exc:
@@ -422,9 +385,7 @@ class BendTableReader:
         finally:
             if restore_flat is not None:
                 try:
-                    restore_flat.SetSuppression2(
-                        SW_SUPPRESS, SW_THIS_CONFIGURATION, None
-                    )
+                    restore_flat.SetSuppression2(SW_SUPPRESS, SW_THIS_CONFIGURATION, None)
                 except Exception:
                     pass
             if drawing is not None:
@@ -433,6 +394,82 @@ class BendTableReader:
                 self._close(model)
             del drawing, model
             gc.collect()
+
+    # =====================================================
+    # FOLDED VIEWS: the part as it is after bending
+    # =====================================================
+
+    @staticmethod
+    def _boxes_overlap(a, b, margin=0.01):
+        return not (a[2] + margin < b[0] or b[2] + margin < a[0] or a[3] + margin < b[1] or b[3] + margin < a[1])
+
+    def _add_folded_views(self, drawing, model, path, flat_view, steps):
+        """
+        Adds the standard Front / Top / Right views of the folded part to the temporary drawing, each far
+        away from the others (the DXF export has no notion of views, the outlines SolidWorks reports are what
+        tells them apart afterwards). Which of them are worth showing is decided later, from their geometry.
+        """
+        self._folded_info = []
+
+        outline = self._call(flat_view, "GetOutline")
+        try:
+            flat_box = [float(v) for v in outline][:4]
+            if len(flat_box) != 4:
+                raise ValueError
+        except Exception:
+            steps.append("folded views: the flat pattern view outline is unknown - skipped")
+            return
+
+        box = self._call(model, "GetPartBox", True)
+        try:
+            b = [float(v) for v in box]
+            dx, dy, dz = abs(b[3] - b[0]), abs(b[4] - b[1]), abs(b[5] - b[2])
+        except Exception:
+            dx = dy = dz = 0.5
+            steps.append("folded views: part size unknown, spacing assumed")
+
+        sizes = {"*Front": (dx, dy), "*Top": (dx, dz), "*Right": (dz, dy)}
+        cursor = flat_box[0]
+        y_base = flat_box[3] + FOLDED_GAP
+        boxes = [flat_box]
+        placed = []
+
+        for view_name, label in FOLDED_VIEWS:
+            w, h = sizes[view_name]
+            try:
+                created = drawing.CreateDrawViewFromModelView3(
+                    str(path), view_name, cursor + w / 2.0, y_base + h / 2.0, 0.0
+                )
+            except Exception as exc:
+                steps.append(f"folded view {label}: CreateDrawViewFromModelView3 failed: {exc}")
+                continue
+            if created is None:
+                steps.append(f"folded view {label}: not created")
+                continue
+
+            try:
+                view_box = [float(v) for v in self._call(created, "GetOutline")][:4]
+                if len(view_box) != 4:
+                    raise ValueError
+            except Exception:
+                steps.append(f"folded view {label}: outline unknown - ignored")
+                continue
+
+            if any(self._boxes_overlap(view_box, other) for other in boxes):
+                steps.append(f"folded view {label}: overlaps another view - ignored")
+                continue
+
+            boxes.append(view_box)
+            placed.append({
+                "name": label,
+                "view": view_name,
+                "outline": view_box,
+                "scale": self._plain(self._get(created, "ScaleDecimal")),
+            })
+            cursor = view_box[2] + FOLDED_GAP
+
+        self._folded_info = placed
+        steps.append(f"folded views created: {', '.join(p['name'] for p in placed) or 'none'}")
 
     # =====================================================
     # PROBE: what does SolidWorks expose about the bend tags?
@@ -458,9 +495,7 @@ class BendTableReader:
             return
         self._probed += 1
 
-        safe = (
-            re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", str(item["name"])).strip() or "part"
-        )
+        safe = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", str(item["name"])).strip() or "part"
         data = {"part": item["name"]}
 
         try:
@@ -479,12 +514,10 @@ class BendTableReader:
             for seg in self._call(view, "GetBendLines") or []:
                 start = self._call(seg, "GetStartPoint2")
                 end = self._call(seg, "GetEndPoint2")
-                lines.append(
-                    {
-                        "start": [self._get(start, a) for a in ("X", "Y", "Z")],
-                        "end": [self._get(end, a) for a in ("X", "Y", "Z")],
-                    }
-                )
+                lines.append({
+                    "start": [self._get(start, a) for a in ("X", "Y", "Z")],
+                    "end": [self._get(end, a) for a in ("X", "Y", "Z")],
+                })
         except Exception as exc:
             data["bend_lines_error"] = str(exc)
         data["bend_lines"] = lines
@@ -493,22 +526,18 @@ class BendTableReader:
         try:
             for note in self._call(view, "GetNotes") or []:
                 annotation = self._call(note, "GetAnnotation")
-                notes.append(
-                    {
-                        "text": self._plain(self._call(note, "GetText")),
-                        "position": self._plain(self._call(annotation, "GetPosition")),
-                    }
-                )
+                notes.append({
+                    "text": self._plain(self._call(note, "GetText")),
+                    "position": self._plain(self._call(annotation, "GetPosition")),
+                })
         except Exception as exc:
             data["notes_error"] = str(exc)
         data["notes"] = notes
+        data["folded_views"] = list(self._folded_info)
 
         try:
             json_path = self.probe_folder / f"{safe}_probe.json"
-            json_path.write_text(
-                json.dumps(data, ensure_ascii=False, indent=1, default=str),
-                encoding="utf-8",
-            )
+            json_path.write_text(json.dumps(data, ensure_ascii=False, indent=1, default=str), encoding="utf-8")
             item["view_json"] = str(json_path)
             steps.append(
                 f"probe: scale={data['scale']}, bend lines={len(lines)}, notes={len(notes)} -> {safe}_probe.json"
@@ -521,9 +550,7 @@ class BendTableReader:
             drawing.SaveAs3(str(dxf), 0, 0)
             if dxf.exists() and dxf.stat().st_size > 0:
                 item["view_dxf"] = str(dxf)
-            steps.append(
-                f"probe: temporary drawing exported -> {dxf.name} ({'ok' if dxf.exists() else 'no file'})"
-            )
+            steps.append(f"probe: temporary drawing exported -> {dxf.name} ({'ok' if dxf.exists() else 'no file'})")
         except Exception as exc:
             steps.append(f"probe: drawing DXF export failed: {exc}")
 
@@ -575,24 +602,13 @@ class BendTableReader:
             output_folder.mkdir(parents=True, exist_ok=True)
             with path.open("w", newline="", encoding="utf-8-sig") as f:
                 writer = csv.writer(f)
-                writer.writerow(
-                    [
-                        "Part",
-                        "Configuration",
-                        "Tag",
-                        "Direction",
-                        "Angle",
-                        "Inner Radius",
-                    ]
-                )
+                writer.writerow(["Part", "Configuration", "Tag", "Direction", "Angle", "Inner Radius"])
                 for item in items:
                     table = item.get("bend_table")
                     if not table:
                         continue
                     for row in table["rows"]:
-                        writer.writerow(
-                            [item["name"], item.get("configuration") or ""] + list(row)
-                        )
+                        writer.writerow([item["name"], item.get("configuration") or ""] + list(row))
             print(f"Bend table CSV saved: {path}")
             return path
         except Exception as exc:

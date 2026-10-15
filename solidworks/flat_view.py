@@ -2,36 +2,18 @@ import json
 import math
 from pathlib import Path
 
-PT_PER_MM = 72.0 / 25.4  # 1:1 on paper
+PT_PER_MM = 72.0 / 25.4          # 1:1 on paper
 BEND_LAYER_WORDS = ("BEND",)
 DASHED_WORDS = ("DASH", "CENTER", "PHANTOM", "HIDDEN", "DOT")
-AXIS_TOLERANCE = 0.01  # a bend line is "vertical/horizontal" if it leans less than 1 %
-POSITION_TOLERANCE = 0.05  # mm: bend lines closer than this share one dimension
-MATCH_TOLERANCE = (
-    0.6  # mm: a SolidWorks bend line and a DXF line are "the same" within this
-)
-TAG_MAX_DISTANCE = (
-    15.0  # sheet mm: a tag belongs to a bend line only if it sits this close to it
-)
-GEOMETRY_TYPES = (
-    "LINE",
-    "ARC",
-    "CIRCLE",
-    "LWPOLYLINE",
-    "POLYLINE",
-    "SPLINE",
-    "ELLIPSE",
-)
+AXIS_TOLERANCE = 0.01            # a bend line is "vertical/horizontal" if it leans less than 1 %
+POSITION_TOLERANCE = 0.05        # mm: bend lines closer than this share one dimension
+MATCH_TOLERANCE = 0.6            # mm: a SolidWorks bend line and a DXF line are "the same" within this
+TAG_MAX_DISTANCE = 15.0          # sheet mm: a tag belongs to a bend line only if it sits this close to it
+GEOMETRY_TYPES = ("LINE", "ARC", "CIRCLE", "LWPOLYLINE", "POLYLINE", "SPLINE", "ELLIPSE")
 # the 8 ways a view can sit relative to its sketch: 4 rotations, each with or without a mirror
 ORIENTATIONS = [
-    (1, 0, 0, 1),
-    (0, -1, 1, 0),
-    (-1, 0, 0, -1),
-    (0, 1, -1, 0),
-    (-1, 0, 0, 1),
-    (1, 0, 0, -1),
-    (0, 1, 1, 0),
-    (0, -1, -1, 0),
+    (1, 0, 0, 1), (0, -1, 1, 0), (-1, 0, 0, -1), (0, 1, -1, 0),
+    (-1, 0, 0, 1), (1, 0, 0, -1), (0, 1, 1, 0), (0, -1, -1, 0),
 ]
 
 
@@ -69,8 +51,7 @@ def match_bend_lines(probe_lines, dxf_lines, tolerance=MATCH_TOLERANCE):
     first_len = _dist(first_a, first_b)
     solutions = set()
 
-    for m00, m01, m10, m11 in ORIENTATIONS:
-
+    for (m00, m01, m10, m11) in ORIENTATIONS:
         def move(p, m=(m00, m01, m10, m11)):
             return (m[0] * p[0] + m[1] * p[1], m[2] * p[0] + m[3] * p[1])
 
@@ -90,12 +71,7 @@ def match_bend_lines(probe_lines, dxf_lines, tolerance=MATCH_TOLERANCE):
                     A = (A[0] + shift[0], A[1] + shift[1])
                     B = (B[0] + shift[0], B[1] + shift[1])
                     hit = next(
-                        (
-                            k
-                            for k, s2, e2 in dxf_lines
-                            if (close(A, s2) and close(B, e2))
-                            or (close(A, e2) and close(B, s2))
-                        ),
+                        (k for k, s2, e2 in dxf_lines if (close(A, s2) and close(B, e2)) or (close(A, e2) and close(B, s2))),
                         None,
                     )
                     if hit is None:
@@ -146,12 +122,13 @@ class FlatPatternView:
     PDF page with its overall length / width and the positions of the bend lines.
     """
 
-    def __init__(self, paths, info=None, tags=None, labels=None):
+    def __init__(self, paths, info=None, tags=None, labels=None, folded=None):
         # paths: list of {"points": [(x, y), ...], "bend": bool}
         self.paths = paths
         self.info = info or []
-        self.tags = tags or []  # [{"tag": "A", "pos": (x, y), "line": index}, ...]
+        self.tags = tags or []      # [{"tag": "A", "pos": (x, y), "line": index}, ...]
         self.labels = labels or []  # [("Fixed Face", (x, y)), ...]
+        self.folded = folded or []  # [{"name": "Front", "paths": [...], "bbox": (x0, y0, x1, y1)}, ...] real mm
         self.scale_label = ""
 
     # =====================================================
@@ -211,16 +188,16 @@ class FlatPatternView:
         info = [f"layers: {layers}"]
         view = cls(paths, info)
         if not view.bend_lines():
-            info.append(
-                "bend lines could not be identified (no layer containing 'BEND' and no dashed linetype)"
-            )
+            info.append("bend lines could not be identified (no layer containing 'BEND' and no dashed linetype)")
         return view, "OK"
 
     @classmethod
     def from_drawing_dxf(cls, dxf_path, json_path, tag_names=()):
         """
         The flat pattern view exactly as SolidWorks drew it in the temporary drawing: geometry from the
-        exported drawing DXF, the bend lines and the tag notes from the JSON saved next to it.
+        exported drawing DXF, the bend lines, tag notes and view outlines from the JSON saved next to it.
+        The same drawing may also hold the folded views (Front / Top / Right) far away from the flat one;
+        the outlines in the JSON tell which geometry belongs to which view.
         Returns (view_or_None, message).
         """
         try:
@@ -235,40 +212,81 @@ class FlatPatternView:
         except Exception as exc:
             return None, f"cannot read the view data: {exc}"
 
-        scale = float(data.get("scale") or 1.0) or 1.0  # sheet size / real size
+        def positive(value):
+            try:
+                value = float(value)
+                return value if value > 0 else 1.0
+            except Exception:
+                return 1.0
 
-        paths, dxf_lines = [], []
+        flat_scale = positive(data.get("scale"))   # sheet size / real size
+
+        def box_mm(outline, margin=8.0):
+            try:
+                x0, y0, x1, y1 = [float(v) * 1000.0 for v in outline][:4]
+                return (x0 - margin, y0 - margin, x1 + margin, y1 + margin)
+            except Exception:
+                return None
+
+        flat_box = box_mm(data.get("outline"))
+        folded_defs = []
+        for entry in data.get("folded_views", []) or []:
+            box = box_mm(entry.get("outline"))
+            if box is not None:
+                folded_defs.append((str(entry.get("name") or "View"), box, positive(entry.get("scale"))))
+
+        # 1. every drawable entity, in sheet millimetres
+        flatten = 0.05 * min([flat_scale] + [sc for _n, _b, sc in folded_defs])
+        raw = []
         for entity in doc.modelspace():
             kind = entity.dxftype()
             if kind not in GEOMETRY_TYPES:
-                continue  # blocks (table, notes, centre marks) and text are not part of the shape
+                continue   # blocks (table, notes, centre marks) and text are not part of any shape
             try:
                 geometry = ezpath.make_path(entity)
             except Exception:
                 continue
             for sub in geometry.sub_paths():
-                points = [
-                    (v.x / scale, v.y / scale) for v in sub.flattening(0.05 * scale)
-                ]
-                if len(points) < 2:
-                    continue
-                paths.append({"points": points, "bend": False})
-                if kind == "LINE" and len(points) == 2:
-                    dxf_lines.append((len(paths) - 1, points[0], points[1]))
+                points = [(v.x, v.y) for v in sub.flattening(flatten)]
+                if len(points) >= 2:
+                    raw.append({"points": points, "kind": kind})
+
+        # 2. which view does each piece of geometry belong to?
+        def inside(point, box):
+            return box[0] <= point[0] <= box[2] and box[1] <= point[1] <= box[3]
+
+        flat_items = []
+        folded_items = [[] for _ in folded_defs]
+        for item in raw:
+            xs = [p[0] for p in item["points"]]
+            ys = [p[1] for p in item["points"]]
+            centre = ((min(xs) + max(xs)) / 2.0, (min(ys) + max(ys)) / 2.0)
+            if flat_box is None or inside(centre, flat_box):
+                flat_items.append(item)
+                continue
+            for index, (_name, box, _sc) in enumerate(folded_defs):
+                if inside(centre, box):
+                    folded_items[index].append(item)
+                    break
+
+        paths, dxf_lines = [], []
+        for item in flat_items:
+            points = [(x / flat_scale, y / flat_scale) for x, y in item["points"]]
+            paths.append({"points": points, "bend": False})
+            if item["kind"] == "LINE" and len(points) == 2:
+                dxf_lines.append((len(paths) - 1, points[0], points[1]))
 
         if not paths:
-            return None, "the drawing DXF has no geometry"
+            return None, "the drawing DXF has no geometry for the flat pattern view"
 
         info = []
         probe = []
         for line in data.get("bend_lines", []):
             try:
-                probe.append(
-                    (
-                        (line["start"][0] * 1000.0, line["start"][1] * 1000.0),
-                        (line["end"][0] * 1000.0, line["end"][1] * 1000.0),
-                    )
-                )
+                probe.append((
+                    (line["start"][0] * 1000.0, line["start"][1] * 1000.0),
+                    (line["end"][0] * 1000.0, line["end"][1] * 1000.0),
+                ))
             except Exception:
                 continue
 
@@ -279,9 +297,7 @@ class FlatPatternView:
         else:
             for index in sorted(matched):
                 paths[index]["bend"] = True
-            bend_lines = [
-                (paths[i]["points"][0], paths[i]["points"][-1]) for i in sorted(matched)
-            ]
+            bend_lines = [(paths[i]["points"][0], paths[i]["points"][-1]) for i in sorted(matched)]
             info.append(f"{len(matched)} bend line(s) identified from SolidWorks")
 
         # the notes in the view: bend tags (A, B, ...) and other labels such as "Fixed Face"
@@ -292,15 +308,13 @@ class FlatPatternView:
             position = note.get("position")
             if not text or not position or len(position) < 2:
                 continue
-            at = (position[0] * 1000.0 / scale, position[1] * 1000.0 / scale)
+            at = (position[0] * 1000.0 / flat_scale, position[1] * 1000.0 / flat_scale)
             (tag_notes if text in wanted else labels).append((text, at))
 
         tags = []
         if bend_lines and tag_notes:
-            tags = assign_tags(bend_lines, tag_notes, TAG_MAX_DISTANCE / scale)
-            info.append(
-                f"tags placed: {', '.join(t['tag'] for t in tags)} of {len(tag_notes)}"
-            )
+            tags = assign_tags(bend_lines, tag_notes, TAG_MAX_DISTANCE / flat_scale)
+            info.append(f"tags placed: {', '.join(t['tag'] for t in tags)} of {len(tag_notes)}")
             if len(tags) != len(tag_notes) or len(tags) != len(bend_lines):
                 info.append(
                     f"WARNING: {len(tag_notes)} tag(s), {len(bend_lines)} bend line(s), {len(tags)} paired - check this part"
@@ -308,7 +322,22 @@ class FlatPatternView:
         elif tag_notes:
             info.append("tags not placed: bend lines were not identified")
 
-        return cls(paths, info, tags, labels), "OK"
+        # 3. the folded views, in real millimetres
+        folded = []
+        for (name, _box, scale), items in zip(folded_defs, folded_items):
+            if not items:
+                continue
+            fpaths = [
+                {"points": [(x / scale, y / scale) for x, y in it["points"]], "kind": it["kind"]}
+                for it in items
+            ]
+            xs = [p[0] for fp in fpaths for p in fp["points"]]
+            ys = [p[1] for fp in fpaths for p in fp["points"]]
+            folded.append({"name": name, "paths": fpaths, "bbox": (min(xs), min(ys), max(xs), max(ys))})
+        if folded_defs:
+            info.append(f"folded views found: {', '.join(f['name'] for f in folded) or 'none'}")
+
+        return cls(paths, info, tags, labels, folded), "OK"
 
     # =====================================================
     # GEOMETRY
@@ -334,7 +363,6 @@ class FlatPatternView:
 
     def rotated(self):
         """The same view turned 90 degrees (x, y) -> (-y, x)."""
-
         def turn(p):
             return (-p[1], p[0])
 
@@ -372,14 +400,8 @@ class FlatPatternView:
         px, py = -uy, ux
         p = c.beginPath()
         p.moveTo(x, y)
-        p.lineTo(
-            x - ux * size * 2.2 + px * size * 0.55,
-            y - uy * size * 2.2 + py * size * 0.55,
-        )
-        p.lineTo(
-            x - ux * size * 2.2 - px * size * 0.55,
-            y - uy * size * 2.2 - py * size * 0.55,
-        )
+        p.lineTo(x - ux * size * 2.2 + px * size * 0.55, y - uy * size * 2.2 + py * size * 0.55)
+        p.lineTo(x - ux * size * 2.2 - px * size * 0.55, y - uy * size * 2.2 - py * size * 0.55)
         p.close()
         c.drawPath(p, stroke=0, fill=1)
 
@@ -393,9 +415,7 @@ class FlatPatternView:
             self._arrow(c, xa, y_dim, 1, 0)
             self._arrow(c, xb, y_dim, -1, 0)
         c.setFont(font, size)
-        c.drawCentredString(
-            (xa + xb) / 2.0, y_dim + (2.5 if sign > 0 else -size - 1.5), text
-        )
+        c.drawCentredString((xa + xb) / 2.0, y_dim + (2.5 if sign > 0 else -size - 1.5), text)
 
     def _vdim(self, c, ya, yb, x_dim, x_from, text, font, size):
         """Vertical dimension between page y positions ya < yb, dimension line at x_dim."""
@@ -412,6 +432,162 @@ class FlatPatternView:
         c.rotate(90)
         c.drawCentredString(0, 0, text)
         c.restoreState()
+
+    # =====================================================
+    # FOLDED VIEWS (the part after bending)
+    # =====================================================
+
+    def folded_selection(self, thickness=None):
+        """
+        The folded views worth showing, biggest first (at most 3).
+        A view that is only a thin strip (the part seen edge-on) is dropped: it tells nothing the others do not.
+        """
+        minimum = max(4.0, 3.0 * float(thickness)) if thickness else 4.0
+        chosen = []
+        for view in self.folded:
+            x0, y0, x1, y1 = view["bbox"]
+            if min(x1 - x0, y1 - y0) >= minimum:
+                chosen.append(view)
+        chosen.sort(key=lambda v: -((v["bbox"][2] - v["bbox"][0]) * (v["bbox"][3] - v["bbox"][1])))
+        return chosen[:3]
+
+    @staticmethod
+    def _step_marks(view):
+        """
+        Positions of the corners of a simple profile (straight edges only), for step dimensions such as
+        21.5 / 24.5 in the sample. None when the outline is too detailed to dimension this way.
+        """
+        xs, ys = set(), set()
+        for path in view["paths"]:
+            if path["kind"] == "LINE":
+                corners = (path["points"][0], path["points"][-1])
+            elif path["kind"] in ("LWPOLYLINE", "POLYLINE"):
+                corners = path["points"]   # a polyline with arcs has many points -> too detailed -> no step dimensions
+            else:
+                continue                   # circles, arcs and splines are details, not profile corners
+            for x, y in corners:
+                xs.add(round(x, 1))
+                ys.add(round(y, 1))
+        x0, y0, x1, y1 = view["bbox"]
+        xs |= {round(x0, 1), round(x1, 1)}
+        ys |= {round(y0, 1), round(y1, 1)}
+        xm, ym = sorted(xs), sorted(ys)
+        return (xm if 3 <= len(xm) <= 7 else None), (ym if 3 <= len(ym) <= 7 else None)
+
+    def draw_folded(self, c, area, thickness=None, font="Helvetica", font_size=8.5):
+        """
+        Draws the chosen folded views side by side in area = (x0, y0, x1, y1), all at the same scale, each with
+        its overall size after bending (and the step dimensions when the profile is simple).
+        Returns a description, or None when nothing was drawn.
+        """
+        views = self.folded_selection(thickness)
+        if not views:
+            return None
+
+        ax0, ay0, ax1, ay1 = area
+        aw, ah = ax1 - ax0, ay1 - ay0
+        marks = [self._step_marks(v) for v in views]
+        any_x = any(m[0] for m in marks)
+        any_y = any(m[1] for m in marks)
+
+        top = 30.0
+        bottom = 70.0 if any_x else 40.0
+        gap = 78.0 if any_y else 52.0
+        side = 44.0 if any_y else 20.0
+        cap = 5.0 * PT_PER_MM
+
+        widths = [v["bbox"][2] - v["bbox"][0] for v in views]
+        heights = [v["bbox"][3] - v["bbox"][1] for v in views]
+        usable_h = ah - top - bottom
+        n = len(views)
+
+        # one scale for all views ...
+        k_common = max(min((aw - 2 * side - gap * (n - 1)) / sum(widths), usable_h / max(heights), cap), 1e-6)
+        ks = [k_common] * n
+
+        # ... except views that would come out tiny (a profile next to a 2 m long face view): they get their own,
+        # larger scale, like a detail view, and their scale is written under them
+        extent = [max(w, h) for w, h in zip(widths, heights)]
+        big = [i for i in range(n) if extent[i] * k_common >= 80.0]
+        if big and len(big) < n:
+            small = [i for i in range(n) if i not in big]
+            for i in small:
+                ks[i] = max(min(110.0 / extent[i], usable_h / heights[i], cap), 1e-6)
+            used = sum(widths[i] * ks[i] for i in small) + gap * (n - 1)
+            k_big = min(
+                (aw - 2 * side - used) / sum(widths[i] for i in big),
+                usable_h / max(heights[i] for i in big),
+                cap,
+            )
+            if k_big > 0:
+                for i in big:
+                    ks[i] = k_big
+            else:
+                ks = [k_common] * n
+
+        def scale_text(k):
+            ratio = k / PT_PER_MM
+            return f"{ratio:.3g}:1" if ratio >= 1 else f"1:{1.0 / ratio:.3g}"
+
+        total = sum(w * kk for w, kk in zip(widths, ks)) + gap * (n - 1)
+        cursor = ax0 + side + (aw - 2 * side - total) / 2.0
+        base_y = ay0 + bottom + (usable_h - max(h * kk for h, kk in zip(heights, ks))) / 2.0
+
+        c.saveState()
+        for view, (xmarks, ymarks), k in zip(views, marks, ks):
+            x0, y0, x1, y1 = view["bbox"]
+            ox = cursor
+            cursor += (x1 - x0) * k + gap
+
+            def px(x, ox=ox, x0=x0):
+                return ox + (x - x0) * k
+
+            def py(y, y0=y0):
+                return base_y + (y - y0) * k
+
+            c.setStrokeColorRGB(0, 0, 0)
+            c.setLineWidth(0.7)
+            c.setDash()
+            for path in view["paths"]:
+                pts = path["points"]
+                p = c.beginPath()
+                p.moveTo(px(pts[0][0]), py(pts[0][1]))
+                for x, y in pts[1:]:
+                    p.lineTo(px(x), py(y))
+                c.drawPath(p, stroke=1, fill=0)
+
+            gray = 0.25
+            c.setStrokeColorRGB(gray, gray, gray)
+            c.setFillColorRGB(gray, gray, gray)
+            c.setLineWidth(0.4)
+            left_x, right_x = px(x0), px(x1)
+            bottom_y, top_y = py(y0), py(y1)
+
+            self._hdim(c, left_x, right_x, top_y + 20.0, top_y, f"{x1 - x0:.1f}", font, font_size)
+            self._vdim(c, bottom_y, top_y, right_x + 20.0, right_x, f"{y1 - y0:.1f}", font, font_size)
+
+            levels_x = []
+            if xmarks:
+                levels_x = self._levels(xmarks, k, font, font_size)
+                for i in range(len(xmarks) - 1):
+                    self._hdim(c, px(xmarks[i]), px(xmarks[i + 1]), bottom_y - (14.0 + 13.0 * levels_x[i]), bottom_y,
+                               f"{xmarks[i + 1] - xmarks[i]:.1f}", font, font_size)
+            if ymarks:
+                levels = self._levels(ymarks, k, font, font_size)
+                for i in range(len(ymarks) - 1):
+                    self._vdim(c, py(ymarks[i]), py(ymarks[i + 1]), left_x - (14.0 + 13.0 * levels[i]), left_x,
+                               f"{ymarks[i + 1] - ymarks[i]:.1f}", font, font_size)
+
+            # the name and scale of the view, right under its dimensions
+            rows = (max(levels_x) + 1) if xmarks else 0
+            c.setFillColorRGB(0, 0, 0)
+            c.setFont(font, 7)
+            c.drawString(left_x, bottom_y - (30.0 + 13.0 * rows), f"{view['name'].upper()} VIEW   SCALE {scale_text(k)}")
+        c.restoreState()
+
+        return ", ".join(
+            f"{v['name']} {w:.1f} x {h:.1f} ({scale_text(kk)})" for v, w, h, kk in zip(views, widths, heights, ks)
+        )
 
     @staticmethod
     def _chain_marks(low, high, positions):
@@ -456,22 +632,10 @@ class FlatPatternView:
         k = 1.0
 
         for _ in range(4):
-            k = min(
-                (aw - left - right) / width,
-                (ah - top - bottom) / height,
-                5.0 * PT_PER_MM,
-            )
+            k = min((aw - left - right) / width, (ah - top - bottom) / height, 5.0 * PT_PER_MM)
             k = max(k, 1e-6)
-            new_bottom = (
-                22.0 + 13.0 * (max(self._levels(xmarks, k, font, size)) + 1)
-                if xmarks
-                else 14.0
-            )
-            new_left = (
-                22.0 + 13.0 * (max(self._levels(ymarks, k, font, size)) + 1)
-                if ymarks
-                else 14.0
-            )
+            new_bottom = 22.0 + 13.0 * (max(self._levels(xmarks, k, font, size)) + 1) if xmarks else 14.0
+            new_left = 22.0 + 13.0 * (max(self._levels(ymarks, k, font, size)) + 1) if ymarks else 14.0
             if abs(new_bottom - bottom) < 0.5 and abs(new_left - left) < 0.5:
                 break
             bottom, left = new_bottom, new_left
@@ -539,19 +703,8 @@ class FlatPatternView:
         left_x, right_x = px(x0), px(x1)
         bottom_y, top_y = py(y0), py(y1)
 
-        self._hdim(
-            c, left_x, right_x, top_y + 22.0, top_y, f"{width:.1f}", font, font_size
-        )
-        self._vdim(
-            c,
-            bottom_y,
-            top_y,
-            right_x + 22.0,
-            right_x,
-            f"{height:.1f}",
-            font,
-            font_size,
-        )
+        self._hdim(c, left_x, right_x, top_y + 22.0, top_y, f"{width:.1f}", font, font_size)
+        self._vdim(c, bottom_y, top_y, right_x + 22.0, right_x, f"{height:.1f}", font, font_size)
 
         xs, ys, slanted = view.bend_positions()
         xmarks = self._chain_marks(x0, x1, xs)
@@ -560,29 +713,13 @@ class FlatPatternView:
         if xmarks:
             levels = self._levels(xmarks, k, font, font_size)
             for i in range(len(xmarks) - 1):
-                self._hdim(
-                    c,
-                    px(xmarks[i]),
-                    px(xmarks[i + 1]),
-                    bottom_y - (16.0 + 13.0 * levels[i]),
-                    bottom_y,
-                    f"{xmarks[i + 1] - xmarks[i]:.1f}",
-                    font,
-                    font_size,
-                )
+                self._hdim(c, px(xmarks[i]), px(xmarks[i + 1]), bottom_y - (16.0 + 13.0 * levels[i]), bottom_y,
+                           f"{xmarks[i + 1] - xmarks[i]:.1f}", font, font_size)
         if ymarks:
             levels = self._levels(ymarks, k, font, font_size)
             for i in range(len(ymarks) - 1):
-                self._vdim(
-                    c,
-                    py(ymarks[i]),
-                    py(ymarks[i + 1]),
-                    left_x - (16.0 + 13.0 * levels[i]),
-                    left_x,
-                    f"{ymarks[i + 1] - ymarks[i]:.1f}",
-                    font,
-                    font_size,
-                )
+                self._vdim(c, py(ymarks[i]), py(ymarks[i + 1]), left_x - (16.0 + 13.0 * levels[i]), left_x,
+                           f"{ymarks[i + 1] - ymarks[i]:.1f}", font, font_size)
         c.restoreState()
 
         ratio = k / PT_PER_MM
