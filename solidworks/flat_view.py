@@ -9,6 +9,12 @@ AXIS_TOLERANCE = 0.01            # a bend line is "vertical/horizontal" if it le
 POSITION_TOLERANCE = 0.05        # mm: bend lines closer than this share one dimension
 MATCH_TOLERANCE = 0.6            # mm: a SolidWorks bend line and a DXF line are "the same" within this
 TAG_MAX_DISTANCE = 15.0          # sheet mm: a tag belongs to a bend line only if it sits this close to it
+BEND_CENTER_TOLERANCE = 0.08     # mm: arcs sharing a centre within this belong to one bend (inner + outer face)
+TOUCH_TOLERANCE = 0.08           # mm: two end points are "the same point" within this
+TANGENT_TOLERANCE = 0.04         # |cos| of the angle between a leg line and the radius at its end
+# A leg that is as long as the overall width / height of its view is not dimensioned a second time.
+# Set to False to see every leg, including those equal to the overall size.
+SKIP_LEGS_EQUAL_TO_OVERALL = True
 GEOMETRY_TYPES = ("LINE", "ARC", "CIRCLE", "LWPOLYLINE", "POLYLINE", "SPLINE", "ELLIPSE")
 # the 8 ways a view can sit relative to its sketch: 4 rotations, each with or without a mirror
 ORIENTATIONS = [
@@ -246,10 +252,17 @@ class FlatPatternView:
                 geometry = ezpath.make_path(entity)
             except Exception:
                 continue
+            arc = None
+            if kind == "ARC":
+                try:
+                    centre = entity.ocs().to_wcs(entity.dxf.center)
+                    arc = {"center": (centre.x, centre.y), "radius": float(entity.dxf.radius)}
+                except Exception:
+                    arc = None
             for sub in geometry.sub_paths():
                 points = [(v.x, v.y) for v in sub.flattening(flatten)]
                 if len(points) >= 2:
-                    raw.append({"points": points, "kind": kind})
+                    raw.append({"points": points, "kind": kind, "arc": arc})
 
         # 2. which view does each piece of geometry belong to?
         def inside(point, box):
@@ -327,10 +340,12 @@ class FlatPatternView:
         for (name, _box, scale), items in zip(folded_defs, folded_items):
             if not items:
                 continue
-            fpaths = [
-                {"points": [(x / scale, y / scale) for x, y in it["points"]], "kind": it["kind"]}
-                for it in items
-            ]
+            fpaths = []
+            for it in items:
+                arc = it.get("arc")
+                if arc:
+                    arc = {"center": (arc["center"][0] / scale, arc["center"][1] / scale), "radius": arc["radius"] / scale}
+                fpaths.append({"points": [(x / scale, y / scale) for x, y in it["points"]], "kind": it["kind"], "arc": arc})
             xs = [p[0] for fp in fpaths for p in fp["points"]]
             ys = [p[1] for fp in fpaths for p in fp["points"]]
             folded.append({"name": name, "paths": fpaths, "bbox": (min(xs), min(ys), max(xs), max(ys))})
@@ -452,48 +467,202 @@ class FlatPatternView:
         return chosen[:3]
 
     @staticmethod
-    def _step_marks(view):
+    def _legs(view, thickness=None):
         """
-        Positions of the corners of a simple profile (straight edges only), for step dimensions such as
-        21.5 / 24.5 in the sample. None when the outline is too detailed to dimension this way.
+        The legs of a bent profile and their lengths, for dimensions such as the lip length or the height of a
+        flange. Taken from the bends themselves: every bend is a pair of concentric arcs (inner and outer face,
+        radii differing by the sheet thickness). The outer arc's tangents meet in the "virtual sharp" of that bend;
+        a leg is measured between the virtual sharps of its two bends (projected on the leg), or from the last
+        virtual sharp to the free end of the leg. Details such as holes and slots are not bends and are ignored.
+
+        Returns [{"a": (x, y), "b": (x, y), "length": mm, "n": (nx, ny)}, ...]; n points to the outside.
         """
-        xs, ys = set(), set()
-        for path in view["paths"]:
-            if path["kind"] == "LINE":
-                corners = (path["points"][0], path["points"][-1])
-            elif path["kind"] in ("LWPOLYLINE", "POLYLINE"):
-                corners = path["points"]   # a polyline with arcs has many points -> too detailed -> no step dimensions
-            else:
-                continue                   # circles, arcs and splines are details, not profile corners
-            for x, y in corners:
-                xs.add(round(x, 1))
-                ys.add(round(y, 1))
-        x0, y0, x1, y1 = view["bbox"]
-        xs |= {round(x0, 1), round(x1, 1)}
-        ys |= {round(y0, 1), round(y1, 1)}
-        xm, ym = sorted(xs), sorted(ys)
-        return (xm if 3 <= len(xm) <= 7 else None), (ym if 3 <= len(ym) <= 7 else None)
+        def unit(v):
+            length = math.hypot(v[0], v[1])
+            return (v[0] / length, v[1] / length) if length > 1e-9 else (0.0, 0.0)
+
+        def dot(u, v):
+            return u[0] * v[0] + u[1] * v[1]
+
+        def sub(p, q):
+            return (p[0] - q[0], p[1] - q[1])
+
+        paths = view["paths"]
+
+        # ---- bends: concentric arc pairs ----
+        groups = []
+        for path in paths:
+            if path["kind"] == "ARC" and path.get("arc"):
+                cx, cy = path["arc"]["center"]
+                for group in groups:
+                    if math.hypot(group["c"][0] - cx, group["c"][1] - cy) <= BEND_CENTER_TOLERANCE:
+                        group["arcs"].append(path)
+                        break
+                else:
+                    groups.append({"c": (cx, cy), "arcs": [path]})
+
+        bends = []
+        for group in groups:
+            if len(group["arcs"]) != 2:
+                continue
+            inner, outer = sorted(group["arcs"], key=lambda p: p["arc"]["radius"])
+            gap = outer["arc"]["radius"] - inner["arc"]["radius"]
+            fits = abs(gap - thickness) <= max(0.25, 0.1 * thickness) if thickness else 0.3 <= gap <= 25.0
+            if not fits:
+                continue
+
+            c, radius = group["c"], outer["arc"]["radius"]
+            pts = outer["points"]
+            p1, p2, mid = pts[0], pts[-1], pts[len(pts) // 2]
+            u1, u2 = unit(sub(p1, c)), unit(sub(p2, c))
+            bisector = unit((u1[0] + u2[0], u1[1] + u2[1]))
+            cos_half = dot(u1, bisector)
+            if cos_half < math.cos(math.radians(85)) or cos_half > math.cos(math.radians(10)):
+                continue                       # a bend of 20..170 degrees only
+            if dot(unit(sub(mid, c)), bisector) <= 0:
+                continue                       # the long way round: not a bend
+            sharp = (c[0] + bisector[0] * radius / cos_half, c[1] + bisector[1] * radius / cos_half)
+            bends.append({
+                "c": c,
+                "sharp": sharp,
+                "ends": {
+                    "outer": [p1, p2],
+                    "inner": [inner["points"][0], inner["points"][-1]],
+                },
+            })
+
+        if not bends:
+            return []
+
+        lines = [
+            (i, p["points"][0], p["points"][-1])
+            for i, p in enumerate(paths)
+            if p["kind"] == "LINE" and len(p["points"]) == 2
+        ]
+
+        def touching_bend(point, exclude):
+            for index, bend in enumerate(bends):
+                if index == exclude:
+                    continue
+                for face in ("outer", "inner"):
+                    if any(math.hypot(point[0] - e[0], point[1] - e[1]) <= TOUCH_TOLERANCE for e in bend["ends"][face]):
+                        return index
+            return None
+
+        pair_legs, free_legs = {}, {}
+        for bi, bend in enumerate(bends):
+            for face in ("outer", "inner"):
+                for end in bend["ends"][face]:
+                    for line_index, start, finish in lines:
+                        if math.hypot(end[0] - start[0], end[1] - start[1]) <= TOUCH_TOLERANCE:
+                            far = finish
+                        elif math.hypot(end[0] - finish[0], end[1] - finish[1]) <= TOUCH_TOLERANCE:
+                            far = start
+                        else:
+                            continue
+                        direction = unit(sub(far, end))
+                        if abs(dot(direction, unit(sub(end, bend["c"])))) > TANGENT_TOLERANCE:
+                            continue           # the line does not leave the arc tangentially
+
+                        other = touching_bend(far, bi)
+                        if other is not None:                      # a leg between two bends
+                            key = (min(bi, other), max(bi, other))
+                            pair_legs.setdefault(key, (bi, other, direction))
+                        elif face == "outer":                      # a leg that ends freely (lip, flange end)
+                            free_legs.setdefault((bi, line_index), (bi, far, direction))
+
+        bx0, by0, bx1, by1 = view["bbox"]
+        profile_centre = ((bx0 + bx1) / 2.0, (by0 + by1) / 2.0)
+
+        def leg(a, b, d, c, length):
+            # "outside" = away from the middle of the whole profile; only a leg that runs through the middle
+            # falls back to the side away from its own bend's centre
+            perpendicular = (-d[1], d[0])
+            mid = ((a[0] + b[0]) / 2.0, (a[1] + b[1]) / 2.0)
+            score = dot(perpendicular, sub(mid, profile_centre))
+            if abs(score) < 1.0:
+                score = dot(perpendicular, sub(mid, c))
+            if score < 0:
+                perpendicular = (-perpendicular[0], -perpendicular[1])
+            return {"a": a, "b": b, "d": d, "length": length, "n": perpendicular}
+
+        legs = []
+        for bi, bj, d in pair_legs.values():
+            a, b = bends[bi]["sharp"], bends[bj]["sharp"]
+            legs.append(leg(a, b, d, bends[bi]["c"], abs(dot(sub(b, a), d))))
+        for bi, far, d in free_legs.values():
+            a = bends[bi]["sharp"]
+            legs.append(leg(a, far, d, bends[bi]["c"], abs(dot(sub(far, a), d))))
+        return [l for l in legs if l["length"] > 0.05]
+
+    @staticmethod
+    def _pack(spans):
+        """Row for each (centre, width) so that dimensions on the same side never overlap."""
+        order = sorted(range(len(spans)), key=lambda i: spans[i][0] - spans[i][1] / 2.0)
+        levels, last_end = [0] * len(spans), []
+        for i in order:
+            start = spans[i][0] - spans[i][1] / 2.0
+            level = 0
+            while True:
+                if level >= len(last_end):
+                    last_end.append(-1e12)
+                if start >= last_end[level]:
+                    last_end[level] = spans[i][0] + spans[i][1] / 2.0
+                    break
+                level += 1
+            levels[i] = level
+        return levels
+
+    def _aligned_dim(self, c, a, b, n, offset, text, font, size):
+        """Dimension between page points a and b, its line pushed `offset` points along the unit normal n."""
+        a2 = (a[0] + n[0] * offset, a[1] + n[1] * offset)
+        b2 = (b[0] + n[0] * offset, b[1] + n[1] * offset)
+        for p, q in ((a, a2), (b, b2)):
+            c.line(p[0] + n[0] * 3.0, p[1] + n[1] * 3.0, q[0] + n[0] * 3.0, q[1] + n[1] * 3.0)
+        c.line(a2[0], a2[1], b2[0], b2[1])
+
+        length = math.hypot(b2[0] - a2[0], b2[1] - a2[1])
+        if length > 1e-6:
+            d = ((b2[0] - a2[0]) / length, (b2[1] - a2[1]) / length)
+            if length > 9.0:
+                self._arrow(c, a2[0], a2[1], d[0], d[1])
+                self._arrow(c, b2[0], b2[1], -d[0], -d[1])
+            angle = math.degrees(math.atan2(d[1], d[0]))
+            if angle > 90.0:
+                angle -= 180.0
+            elif angle <= -90.0:
+                angle += 180.0
+            lift = size * 0.6 + 2.0
+            cx = (a2[0] + b2[0]) / 2.0 + n[0] * lift
+            cy = (a2[1] + b2[1]) / 2.0 + n[1] * lift
+            c.saveState()
+            c.setFont(font, size)
+            c.translate(cx, cy)
+            c.rotate(angle)
+            c.drawCentredString(0, -size * 0.35, text)
+            c.restoreState()
 
     def draw_folded(self, c, area, thickness=None, font="Helvetica", font_size=8.5):
         """
-        Draws the chosen folded views side by side in area = (x0, y0, x1, y1), all at the same scale, each with
-        its overall size after bending (and the step dimensions when the profile is simple).
+        Draws the chosen folded views side by side in area = (x0, y0, x1, y1): the overall size after bending,
+        and the length of every leg (lips, flange heights, web) measured to the virtual sharps of the bends.
         Returns a description, or None when nothing was drawn.
         """
+        from reportlab.pdfbase.pdfmetrics import stringWidth
+
         views = self.folded_selection(thickness)
         if not views:
             return None
 
         ax0, ay0, ax1, ay1 = area
         aw, ah = ax1 - ax0, ay1 - ay0
-        marks = [self._step_marks(v) for v in views]
-        any_x = any(m[0] for m in marks)
-        any_y = any(m[1] for m in marks)
+        legs_per_view = [self._legs(v, thickness) for v in views]
 
-        top = 30.0
-        bottom = 70.0 if any_x else 40.0
-        gap = 78.0 if any_y else 52.0
-        side = 44.0 if any_y else 20.0
+        room = 39.0                        # three rows of dimensions on every side
+        top = 30.0 + room
+        bottom = 40.0 + room
+        side = 20.0 + room
+        gap = 52.0 + 2 * room
         cap = 5.0 * PT_PER_MM
 
         widths = [v["bbox"][2] - v["bbox"][0] for v in views]
@@ -534,7 +703,7 @@ class FlatPatternView:
         base_y = ay0 + bottom + (usable_h - max(h * kk for h, kk in zip(heights, ks))) / 2.0
 
         c.saveState()
-        for view, (xmarks, ymarks), k in zip(views, marks, ks):
+        for view, legs, k in zip(views, legs_per_view, ks):
             x0, y0, x1, y1 = view["bbox"]
             ox = cursor
             cursor += (x1 - x0) * k + gap
@@ -562,31 +731,55 @@ class FlatPatternView:
             c.setLineWidth(0.4)
             left_x, right_x = px(x0), px(x1)
             bottom_y, top_y = py(y0), py(y1)
+            width, height = x1 - x0, y1 - y0
 
-            self._hdim(c, left_x, right_x, top_y + 20.0, top_y, f"{x1 - x0:.1f}", font, font_size)
-            self._vdim(c, bottom_y, top_y, right_x + 20.0, right_x, f"{y1 - y0:.1f}", font, font_size)
+            # ---- leg dimensions (the overall size is dimensioned below, so a leg equal to it is not repeated) ----
+            items = []
+            for leg in legs:
+                if SKIP_LEGS_EQUAL_TO_OVERALL:
+                    horizontal = abs(leg["d"][1]) < 0.02
+                    vertical = abs(leg["d"][0]) < 0.02
+                    if horizontal and abs(leg["length"] - width) < 0.15:
+                        continue
+                    if vertical and abs(leg["length"] - height) < 0.15:
+                        continue
+                a = (px(leg["a"][0]), py(leg["a"][1]))
+                b = (px(leg["b"][0]), py(leg["b"][1]))
+                text = f"{leg['length']:.1f}"
+                text_width = stringWidth(text, font, font_size) + 4.0
+                side_key = (round(leg["n"][0]), round(leg["n"][1]))
+                along_x = abs(leg["n"][1]) >= abs(leg["n"][0])      # top / bottom dimensions run along x
+                centre = ((a[0] + b[0]) / 2.0) if along_x else ((a[1] + b[1]) / 2.0)
+                span = abs(b[0] - a[0]) if along_x else abs(b[1] - a[1])
+                items.append({"a": a, "b": b, "n": leg["n"], "text": text, "key": side_key,
+                              "span": (centre, max(span, text_width))})
 
-            levels_x = []
-            if xmarks:
-                levels_x = self._levels(xmarks, k, font, font_size)
-                for i in range(len(xmarks) - 1):
-                    self._hdim(c, px(xmarks[i]), px(xmarks[i + 1]), bottom_y - (14.0 + 13.0 * levels_x[i]), bottom_y,
-                               f"{xmarks[i + 1] - xmarks[i]:.1f}", font, font_size)
-            if ymarks:
-                levels = self._levels(ymarks, k, font, font_size)
-                for i in range(len(ymarks) - 1):
-                    self._vdim(c, py(ymarks[i]), py(ymarks[i + 1]), left_x - (14.0 + 13.0 * levels[i]), left_x,
-                               f"{ymarks[i + 1] - ymarks[i]:.1f}", font, font_size)
+            rows_per_side = {}
+            for key in {i["key"] for i in items}:
+                group = [i for i in items if i["key"] == key]
+                for entry, level in zip(group, self._pack([i["span"] for i in group])):
+                    entry["level"] = level
+                rows_per_side[key] = max(i["level"] for i in group) + 1
+            for entry in items:
+                self._aligned_dim(c, entry["a"], entry["b"], entry["n"], 14.0 + 13.0 * entry["level"],
+                                  entry["text"], font, font_size)
 
-            # the name and scale of the view, right under its dimensions
-            rows = (max(levels_x) + 1) if xmarks else 0
+            # ---- overall size after bending, outside the leg dimensions ----
+            self._hdim(c, left_x, right_x, top_y + 20.0 + 13.0 * rows_per_side.get((0, 1), 0), top_y,
+                       f"{width:.1f}", font, font_size)
+            self._vdim(c, bottom_y, top_y, right_x + 20.0 + 13.0 * rows_per_side.get((1, 0), 0), right_x,
+                       f"{height:.1f}", font, font_size)
+
+            # ---- the name and scale of the view, below everything else ----
             c.setFillColorRGB(0, 0, 0)
             c.setFont(font, 7)
-            c.drawString(left_x, bottom_y - (30.0 + 13.0 * rows), f"{view['name'].upper()} VIEW   SCALE {scale_text(k)}")
+            c.drawString(left_x, bottom_y - (30.0 + 13.0 * rows_per_side.get((0, -1), 0)),
+                         f"{view['name'].upper()} VIEW   SCALE {scale_text(k)}")
         c.restoreState()
 
         return ", ".join(
-            f"{v['name']} {w:.1f} x {h:.1f} ({scale_text(kk)})" for v, w, h, kk in zip(views, widths, heights, ks)
+            f"{v['name']} {w:.1f} x {h:.1f} ({scale_text(kk)}, {len(lg)} leg(s))"
+            for v, w, h, kk, lg in zip(views, widths, heights, ks, legs_per_view)
         )
 
     @staticmethod
