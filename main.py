@@ -70,6 +70,7 @@ def select_assembly(input_folder):
     print(f"Selected: {selected}")
     return selected
 
+#print
 
 def print_summary(components, unique_parts):
     parts = sum(1 for c in components if c.is_part)
