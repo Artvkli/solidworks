@@ -672,7 +672,8 @@ class FlatPatternView:
 
         # one scale for all views ...
         k_common = max(min((aw - 2 * side - gap * (n - 1)) / sum(widths), usable_h / max(heights), cap), 1e-6)
-        ks = [k_common] * n
+        #  ۲۰ در صد بزرگتر
+        ks = [k_common * 1.2] * n
 
         # ... except views that would come out tiny (a profile next to a 2 m long face view): they get their own,
         # larger scale, like a detail view, and their scale is written under them
