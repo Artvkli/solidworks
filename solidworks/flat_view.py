@@ -658,11 +658,12 @@ class FlatPatternView:
         aw, ah = ax1 - ax0, ay1 - ay0
         legs_per_view = [self._legs(v, thickness) for v in views]
 
-        room = 39.0                        # three rows of dimensions on every side
-        top = 30.0 + room
-        bottom = 40.0 + room
-        side = 20.0 + room
-        gap = 52.0 + 2 * room
+        # Reduce margins to give folded views more drawing space
+        room = 15.0
+        top = 20.0 + room
+        bottom = 25.0 + room
+        side = 12.0 + room
+        gap = 20.0 + 2 * room
         cap = 5.0 * PT_PER_MM
 
         widths = [v["bbox"][2] - v["bbox"][0] for v in views]
