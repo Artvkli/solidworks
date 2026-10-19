@@ -1023,8 +1023,8 @@ class FlatPatternView:
 
         placed_tags = []
         min_gap = 24.0
-        shift_x = 14.0
-        shift_y = 12.0
+        shift_x = 12.0
+        shift_y = 10.0
 
         for tag in view.tags:
             tx = px(tag["pos"][0])
