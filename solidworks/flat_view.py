@@ -670,11 +670,26 @@ class FlatPatternView:
         usable_h = ah - top - bottom
         n = len(views)
 
-        # one scale for all views ...
-        k_common = max(min((aw - 2 * side - gap * (n - 1)) / sum(widths), usable_h / max(heights), cap), 1e-6)
-        #  ۲۰ در صد بزرگتر
-        ks = [k_common * 1.2] * n
+        # Maximum scale that fits the available drawing area
+        k_fit = max(
+            min(
+                (aw - 2 * side - gap * (n - 1)) / sum(widths),
+                usable_h / max(heights),
+                cap,
+            ),
+            1e-6,
+        )
 
+        # Increase scale, but do not exceed the available area
+        k_common = k_fit
+        ks = [k_common] * n
+        print("DEBUG folded views:")
+        print(f"  area: aw={aw:.1f}, ah={ah:.1f}")
+        print(f"  usable_h={usable_h:.1f}, cap={cap:.4f}")
+        print(f"  widths={widths}")
+        print(f"  heights={heights}")
+        print(f"  k_common={k_common:.6f}")
+        print(f"  ks after big/small={ks}")
         # ... except views that would come out tiny (a profile next to a 2 m long face view): they get their own,
         # larger scale, like a detail view, and their scale is written under them
         extent = [max(w, h) for w, h in zip(widths, heights)]
