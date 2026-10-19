@@ -940,13 +940,15 @@ class FlatPatternView:
     #     )
 
 
+    
     def draw(self, c, area, font="Helvetica", font_size=8.5):
         """
-        Draw the flat pattern with:
+        Draw flat pattern dimensions:
         - Overall width and height.
-        - Each vertical bend dimensioned from its nearest left/right edge.
-        - Each horizontal bend dimensioned from its nearest bottom/top edge.
-        - No chain dimensions between bend lines.
+        - Vertical bends measured from the nearest left/right edge.
+        - Horizontal bends measured from the nearest bottom/top edge.
+        - Larger bend dimensions are placed farther outward.
+        - Bend dimensions are sorted from largest to smallest.
         """
         ax0, ay0, ax1, ay1 = area
         aw, ah = ax1 - ax0, ay1 - ay0
@@ -964,7 +966,6 @@ class FlatPatternView:
         width, height = x1 - x0, y1 - y0
         drawn_w, drawn_h = width * k, height * k
 
-        # Centre the drawing inside the available area.
         ox = ax0 + left + (aw - left - right - drawn_w) / 2.0
         oy = ay0 + bottom + (ah - top - bottom - drawn_h) / 2.0
 
@@ -981,6 +982,7 @@ class FlatPatternView:
         for path in view.paths:
             pts = path["points"]
             c.setLineWidth(0.35 if path["bend"] else 0.7)
+
             if path["bend"]:
                 c.setDash(3, 2)
             else:
@@ -988,26 +990,31 @@ class FlatPatternView:
 
             p = c.beginPath()
             p.moveTo(px(pts[0][0]), py(pts[0][1]))
+
             for x, y in pts[1:]:
                 p.lineTo(px(x), py(y))
+
             c.drawPath(p, stroke=1, fill=0)
 
         c.setDash()
-
-        # ---- Bend tags and labels ----
         c.setFillColorRGB(0, 0, 0)
 
+        # ---- Bend tags and labels ----
         for tag in view.tags:
             c.setFont(font + "-Bold", 10)
             c.drawCentredString(
                 px(tag["pos"][0]),
                 py(tag["pos"][1]) - 8.0,
-                tag["tag"]
+                tag["tag"],
             )
 
         for text, pos in view.labels:
             c.setFont(font, 9)
-            c.drawCentredString(px(pos[0]), py(pos[1]) - 3.0, text)
+            c.drawCentredString(
+                px(pos[0]),
+                py(pos[1]) - 3.0,
+                text,
+            )
 
         # ---- Dimensions ----
         gray = 0.25
@@ -1018,30 +1025,35 @@ class FlatPatternView:
         left_x, right_x = px(x0), px(x1)
         bottom_y, top_y = py(y0), py(y1)
 
-        # Overall flat-pattern dimensions: unchanged.
+        # Overall dimensions: retain the existing placement.
         self._hdim(
             c, left_x, right_x,
             top_y + 22.0, top_y,
-            f"{width:.1f}", font, font_size
+            f"{width:.1f}", font, font_size,
         )
+
         self._vdim(
             c, bottom_y, top_y,
             right_x + 22.0, right_x,
-            f"{height:.1f}", font, font_size
+            f"{height:.1f}", font, font_size,
         )
 
-        
-        # Bend dimensions: larger dimensions are placed farther outward.
         xs, ys, slanted = view.bend_positions()
 
-        # ---------------------------------
-        # Vertical bend lines (x positions)
-        # ---------------------------------
-        # A bend is measured from its nearest left/right outer edge.
+        # Helper: assign outer rows by descending dimension value.
+        # Largest dimension gets the outermost row.
+        def draw_dimension_group(items, draw_one, base_offset=16.0, row_gap=13.0):
+            items.sort(key=lambda item: item["value"], reverse=True)
+
+            for rank, item in enumerate(items):
+                draw_one(item, base_offset + rank * row_gap)
+
+        # ---- Vertical bend lines ----
+        # Measure each bend from its nearest left/right edge.
         x_groups = {"left": [], "right": []}
 
         for x in xs:
-            if x <= x0 or x >= x1:
+            if not (x0 + 1e-3 < x < x1 - 1e-3):
                 continue
 
             left_dist = x - x0
@@ -1049,30 +1061,24 @@ class FlatPatternView:
 
             if left_dist <= right_dist:
                 side = "left"
-                xa, xb = px(x0), px(x)
+                xa, xb = left_x, px(x)
                 value = left_dist
             else:
                 side = "right"
-                xa, xb = px(x), px(x1)
+                xa, xb = px(x), right_x
                 value = right_dist
 
-            label = self._fmt(value)
             x_groups[side].append({
                 "xa": xa,
                 "xb": xb,
                 "value": value,
-                "label": label,
-                "center": (xa + xb) / 2,
-                "width": max(18, len(label) * font_size * 0.65),
+                "label": f"{value:.1f}",
             })
 
         for side, items in x_groups.items():
-            # Sort labels from largest dimension to smallest.
-            items.sort(key=lambda item: item["value"], reverse=True)
-
-            # Larger dimensions go farther outward (lower on the page).
-            for rank, item in enumerate(items):
-                offset = 16 + rank * 13
+            def draw_x_dimension(item, offset):
+                # Use the lower side for horizontal dimension lines.
+                # Each successive row moves farther outward.
                 y_dim = bottom_y - offset
 
                 self._hdim(
@@ -1082,61 +1088,14 @@ class FlatPatternView:
                     y_dim,
                     bottom_y,
                     item["label"],
-                    font_name,
+                    font,
                     font_size,
                 )
 
-        # ----------------------------------
-        # Horizontal bend lines (y positions)
-        # ----------------------------------
-        y_items = []
-
-        for y in ys:
-            if y <= y0 or y >= y1:
-                continue
-
-            bottom_dist = y - y0
-            top_dist = y1 - y
-
-            if bottom_dist <= top_dist:
-                ya, yb = py(y0), py(y)
-                value = bottom_dist
-            else:
-                ya, yb = py(y), py(y1)
-                value = top_dist
-
-            label = self._fmt(value)
-            y_items.append({
-                "ya": ya,
-                "yb": yb,
-                "value": value,
-                "label": label,
-                "center": (ya + yb) / 2,
-                "width": max(18, len(label) * font_size * 0.65),
-            })
-
-        # Sort from largest to smallest.
-        y_items.sort(key=lambda item: item["value"], reverse=True)
-
-        # Larger dimensions go farther outward (left side of the pattern).
-        for rank, item in enumerate(y_items):
-            offset = 16 + rank * 13
-            x_dim = left_x - offset
-
-            self._vdim(
-                c,
-                item["ya"],
-                item["yb"],
-                x_dim,
-                left_x,
-                item["label"],
-                font_name,
-                font_size,
-            )
-
+            draw_dimension_group(items, draw_x_dimension)
 
         # ---- Horizontal bend lines ----
-        # Each bend is measured from its nearest outer edge.
+        # Measure each bend from its nearest bottom/top edge.
         horizontal_dims = []
 
         for y in ys:
@@ -1147,56 +1106,35 @@ class FlatPatternView:
             top_dist = y1 - y
 
             if bottom_dist <= top_dist:
-                a, b = py(y0), py(y)
+                ya, yb = bottom_y, py(y)
                 value = bottom_dist
-                side_key = "bottom"
             else:
-                a, b = py(y), py(y1)
+                ya, yb = py(y), top_y
                 value = top_dist
-                side_key = "top"
-
-            centre = (a + b) / 2.0
-            label_width = max(18.0, len(f"{value:.1f}") * font_size * 0.65)
 
             horizontal_dims.append({
-                "a": a,
-                "b": b,
+                "ya": min(ya, yb),
+                "yb": max(ya, yb),
                 "value": value,
-                "side": side_key,
-                "centre": centre,
-                "label_width": label_width,
+                "label": f"{value:.1f}",
             })
 
-        for side_key in ("left", "right"):
-            # Vertical dimension labels are placed on the left or right
-            # of the drawing depending on which outer edge is nearest.
-            indices = [
-                i for i, d in enumerate(horizontal_dims)
-                if d["side"] in ("bottom", "top")
-            ]
+        def draw_y_dimension(item, offset):
+            # Each successive row moves farther to the left.
+            x_dim = left_x - offset
 
-            # Keep labels from overlapping by assigning separate rows.
-            # The spans are based on their vertical positions.
-            spans = [
-                (horizontal_dims[i]["centre"], horizontal_dims[i]["label_width"])
-                for i in indices
-            ]
-            levels = self._pack(spans)
-
-            # Draw only once; the side loop is intentionally avoided below.
-            break
-
-        for i, level in zip(indices, levels):
-            d = horizontal_dims[i]
             self._vdim(
                 c,
-                min(d["a"], d["b"]),
-                max(d["a"], d["b"]),
-                left_x - (16.0 + 13.0 * level),
+                item["ya"],
+                item["yb"],
+                x_dim,
                 left_x,
-                f"{d['value']:.1f}",
-                font, font_size
+                item["label"],
+                font,
+                font_size,
             )
+
+        draw_dimension_group(horizontal_dims, draw_y_dimension)
 
         c.restoreState()
 
