@@ -751,41 +751,24 @@ class FlatPatternView:
             width, height = x1 - x0, y1 - y0
 
             # ---- leg dimensions (the overall size is dimensioned below, so a leg equal to it is not repeated) ----
-            items = []
-            for leg in legs:
-                if SKIP_LEGS_EQUAL_TO_OVERALL:
-                    horizontal = abs(leg["d"][1]) < 0.02
-                    vertical = abs(leg["d"][0]) < 0.02
-                    if horizontal and abs(leg["length"] - width) < 0.15:
-                        continue
-                    if vertical and abs(leg["length"] - height) < 0.15:
-                        continue
-                a = (px(leg["a"][0]), py(leg["a"][1]))
-                b = (px(leg["b"][0]), py(leg["b"][1]))
-                text = f"{leg['length']:.1f}"
-                text_width = stringWidth(text, font, font_size) + 4.0
-                side_key = (round(leg["n"][0]), round(leg["n"][1]))
-                along_x = abs(leg["n"][1]) >= abs(leg["n"][0])      # top / bottom dimensions run along x
-                centre = ((a[0] + b[0]) / 2.0) if along_x else ((a[1] + b[1]) / 2.0)
-                span = abs(b[0] - a[0]) if along_x else abs(b[1] - a[1])
-                items.append({"a": a, "b": b, "n": leg["n"], "text": text, "key": side_key,
-                              "span": (centre, max(span, text_width))})
-
+            
+            # ---- ONLY overall dimensions after bending ----
+            # Do not draw individual flange / leg dimensions.
+            # Keep only the overall width and overall height.
             rows_per_side = {}
-            for key in {i["key"] for i in items}:
-                group = [i for i in items if i["key"] == key]
-                for entry, level in zip(group, self._pack([i["span"] for i in group])):
-                    entry["level"] = level
-                rows_per_side[key] = max(i["level"] for i in group) + 1
-            for entry in items:
-                self._aligned_dim(c, entry["a"], entry["b"], entry["n"], 14.0 + 13.0 * entry["level"],
-                                  entry["text"], font, font_size)
 
-            # ---- overall size after bending, outside the leg dimensions ----
-            self._hdim(c, left_x, right_x, top_y + 20.0 + 13.0 * rows_per_side.get((0, 1), 0), top_y,
-                       f"{width:.1f}", font, font_size)
-            self._vdim(c, bottom_y, top_y, right_x + 20.0 + 13.0 * rows_per_side.get((1, 0), 0), right_x,
-                       f"{height:.1f}", font, font_size)
+            # ---- overall size after bending ----
+            self._hdim(
+                c, left_x, right_x,
+                top_y + 20.0, top_y,
+                f"{width:.1f}", font, font_size
+            )
+            self._vdim(
+                c, bottom_y, top_y,
+                right_x + 20.0, right_x,
+                f"{height:.1f}", font, font_size
+            )
+
 
             # ---- the name and scale of the view, below everything else ----
             c.setFillColorRGB(0, 0, 0)
