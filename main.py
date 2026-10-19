@@ -1,8 +1,9 @@
-from pathlib import Path
+import csv
 import gc
 import json
 import sys
 import traceback
+from pathlib import Path
 
 try:
     import pythoncom
@@ -17,6 +18,7 @@ from solidworks.bend_table_pdf import BendTablePdfWriter, attach_flat_dxfs
 from solidworks.dwg_exporter import DwgExporter
 from solidworks.thickness_dwg import ThicknessDwgBuilder
 from solidworks.sheet_metal import SheetMetalDetector
+from solidworks.drawing_builder import SolidWorksDrawingBuilder
 
 GROUP_BY_THICKNESS = True
 REPEAT_BY_QUANTITY = False
@@ -24,26 +26,25 @@ ODA_CONVERTER_PATH = None
 PART_GAP = 20.0
 MAX_ROW_WIDTH = 6000.0
 
-
-# PDF_ONLY = True  -> ONLY the bend table PDFs. No flat pattern DXF export, no merging, no DWG.
-# PDF_ONLY = False -> the normal full run (DXF/DWG as before).
+# Existing workflow settings
 PDF_ONLY = True
-# USE_SCAN_CACHE = True -> the sheet metal scan of the last run (output/scan_cache.json) is reused
-# instead of scanning every part again. Delete that file (or set False) to scan again.
 USE_SCAN_CACHE = True
-
-# ---- bend tables (Tag / Direction / Angle / Inner Radius) written to PDF ----
-# The DXF/DWG output is NOT changed by this. PDFs go to output/bend_tables_pdf/
 EXPORT_BEND_TABLE_PDF = True
-COMBINE_BEND_TABLE_PDF = True    # also write ONE PDF with all parts (one page per part)
-FOLDED_VIEWS_IN_PDF = True        # also show the part AFTER bending (best of Front / Top / Right) with its sizes
-FLAT_VIEW_IN_PDF = True          # draw the flat pattern, its A/B/C... bend tags, the length/width and the bend
-                                 # positions on every PDF page. The view is taken from SolidWorks' own temporary
-                                 # drawing (saved in output/flat_view/). Only if that is missing, the flat pattern
-                                 # DXFs of an earlier run (output/*/_parts_dxf/) are used, without tags.
-BEND_TABLE_LIMIT = None          # e.g. 3 = test on the first 3 parts only, None = all parts
-DRAWING_TEMPLATE_PATH = None     # full path of a .drwdot file, only if it is not found automatically
-BEND_TABLE_TEMPLATE_PATH = None  # full path of a .sldbndtbt file, only if you want a specific one
+COMBINE_BEND_TABLE_PDF = True
+FOLDED_VIEWS_IN_PDF = True
+FLAT_VIEW_IN_PDF = True
+BEND_TABLE_LIMIT = None
+DRAWING_TEMPLATE_PATH = None
+BEND_TABLE_TEMPLATE_PATH = None
+
+# ---- NEW: native, editable SolidWorks drawings ----
+CREATE_EDITABLE_SOLIDWORKS_DRAWINGS = True
+EXPORT_EDITABLE_DRAWINGS_PDF = True
+EDITABLE_DRAWINGS_FOLDER = "editable_drawings"
+# Optional: use a full path to a .drwdot file. If None, the builder tries
+# NewDocument with the default/blank template; if that fails, set this path.
+EDITABLE_DRAWING_TEMPLATE_PATH = DRAWING_TEMPLATE_PATH
+EDITABLE_DRAWINGS_LIMIT = None  # e.g. 1 for a quick test; None = all scanned parts
 
 
 def connect_to_solidworks():
@@ -70,7 +71,6 @@ def select_assembly(input_folder):
     print(f"Selected: {selected}")
     return selected
 
-#print
 
 def print_summary(components, unique_parts):
     parts = sum(1 for c in components if c.is_part)
@@ -109,11 +109,12 @@ def save_run_summary(output_folder, assembly_path, scan_result, drawing_result):
                 }
                 for item in (drawing_result.get("files", []) if drawing_result else [])
             ],
+            "editable_solidworks": scan_result.get("editable_drawings", {}),
         },
     }
     path = Path(output_folder) / "run_summary.json"
     try:
-        path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        path.write_text(json.dumps(data, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
         print(f"Run summary saved: {path}")
     except Exception as exc:
         print(f"Could not save run summary: {exc}")
@@ -167,6 +168,73 @@ def load_scan_cache(output_folder, assembly_path):
         return None
 
 
+def create_editable_solidworks_drawings(sw_app, sheet_metal_parts, output_folder):
+    """Create native .SLDDRW files for scanned sheet-metal part records."""
+    result = {"created": [], "failed_parts": []}
+    records = list(sheet_metal_parts or [])
+    if EDITABLE_DRAWINGS_LIMIT is not None:
+        records = records[:max(0, int(EDITABLE_DRAWINGS_LIMIT))]
+
+    target_folder = Path(output_folder) / EDITABLE_DRAWINGS_FOLDER
+    target_folder.mkdir(parents=True, exist_ok=True)
+
+    print("\n" + "=" * 60)
+    print("NATIVE EDITABLE SOLIDWORKS DRAWINGS")
+    print("=" * 60)
+    print(f"Parts queued: {len(records)}")
+    print(f"Output folder: {target_folder}")
+
+    builder = SolidWorksDrawingBuilder(
+        sw_app=sw_app,
+        output_dir=target_folder,
+        drawing_template=EDITABLE_DRAWING_TEMPLATE_PATH,
+    )
+
+    for index, record in enumerate(records, 1):
+        part_path = Path(record.get("path", ""))
+        label = record.get("name") or part_path.stem or f"part_{index}"
+        print(f"\n[{index}/{len(records)}] {label}")
+        try:
+            output = builder.build(
+                part_path=part_path,
+                configuration=record.get("configuration"),
+                part_number=part_path.stem,
+                quantity=record.get("quantity", 1),
+                thickness_mm=record.get("thickness"),
+                export_pdf=EXPORT_EDITABLE_DRAWINGS_PDF,
+            )
+            item = {
+                "part": label,
+                "source": str(part_path),
+                "configuration": record.get("configuration"),
+                "quantity": record.get("quantity", 1),
+                "thickness": record.get("thickness"),
+                **output,
+            }
+            result["created"].append(item)
+            print(f"  SLDDRW: {output.get('slddrw', 'not reported')}")
+            if output.get("pdf"):
+                print(f"  PDF:    {output['pdf']}")
+            if output.get("pdf_error"):
+                print(f"  PDF warning: {output['pdf_error']}")
+        except Exception as exc:
+            failure = {"part": label, "path": str(part_path), "error": f"{type(exc).__name__}: {exc}"}
+            result["failed_parts"].append(failure)
+            print(f"  FAILED: {failure['error']}")
+            traceback.print_exc()
+
+    manifest = target_folder / "editable_drawings_manifest.json"
+    try:
+        manifest.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+        result["manifest"] = str(manifest)
+    except Exception as exc:
+        print(f"Could not save drawing manifest: {exc}")
+
+    print("\nEditable drawings created: {}".format(len(result["created"])))
+    print("Editable drawings failed:  {}".format(len(result["failed_parts"])))
+    return result
+
+
 def main():
     project_folder = Path(__file__).resolve().parent
     input_folder = project_folder / "input"
@@ -214,13 +282,29 @@ def main():
         if USE_SCAN_CACHE:
             save_scan_cache(output_folder, assembly_path, scan_result)
 
+    # ---- NEW: create editable native SolidWorks drawings from the scan ----
+    editable_drawing_result = {"created": [], "failed_parts": []}
+    if CREATE_EDITABLE_SOLIDWORKS_DRAWINGS:
+        try:
+            editable_drawing_result = create_editable_solidworks_drawings(
+                sw_app, scan_result["sheet_metal_parts"], output_folder
+            )
+        except Exception as exc:
+            print(f"\nEDITABLE SOLIDWORKS DRAWINGS FAILED: {type(exc).__name__}: {exc}")
+            traceback.print_exc()
+            editable_drawing_result = {
+                "created": [],
+                "failed_parts": [],
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+    scan_result["editable_drawings"] = editable_drawing_result
+
     exporter = DwgExporter(
         sw_app,
         assembly_path=assembly_path,
         reconnect=connect_to_solidworks,
     )
 
-    # ---- bend tables: read from SolidWorks, then written to PDF (DXF/DWG untouched) ----
     if EXPORT_BEND_TABLE_PDF:
         try:
             reader = BendTableReader(
@@ -297,6 +381,8 @@ def main():
     print(f"Sheet metal (quantity): {scan_result['total_quantity']}")
     print(f"Not sheet metal: {scan_result['not_sheet_metal']}")
     print(f"Scan failures: {scan_result['failed']}")
+    print(f"Editable SolidWorks drawings created: {len(editable_drawing_result.get('created', []))}")
+    print(f"Editable SolidWorks drawings failed: {len(editable_drawing_result.get('failed_parts', []))}")
     if drawing_result:
         print(f"Drawings created: {len(drawing_result['files'])}")
         print(f"Export failures: {len(drawing_result['failed_parts'])}")
