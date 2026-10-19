@@ -452,19 +452,27 @@ class FlatPatternView:
     # FOLDED VIEWS (the part after bending)
     # =====================================================
 
+    # def folded_selection(self, thickness=None):
+    #     """
+    #     The folded views worth showing, biggest first (at most 3).
+    #     A view that is only a thin strip (the part seen edge-on) is dropped: it tells nothing the others do not.
+    #     """
+    #     minimum = max(4.0, 3.0 * float(thickness)) if thickness else 4.0
+    #     chosen = []
+    #     for view in self.folded:
+    #         x0, y0, x1, y1 = view["bbox"]
+    #         if min(x1 - x0, y1 - y0) >= minimum:
+    #             chosen.append(view)
+    #     chosen.sort(key=lambda v: -((v["bbox"][2] - v["bbox"][0]) * (v["bbox"][3] - v["bbox"][1])))
+    #     return chosen[:3]
+
+
     def folded_selection(self, thickness=None):
         """
-        The folded views worth showing, biggest first (at most 3).
-        A view that is only a thin strip (the part seen edge-on) is dropped: it tells nothing the others do not.
+        Return every folded view available in the drawing.
+        Do not drop thin views and do not limit the number of views.
         """
-        minimum = max(4.0, 3.0 * float(thickness)) if thickness else 4.0
-        chosen = []
-        for view in self.folded:
-            x0, y0, x1, y1 = view["bbox"]
-            if min(x1 - x0, y1 - y0) >= minimum:
-                chosen.append(view)
-        chosen.sort(key=lambda v: -((v["bbox"][2] - v["bbox"][0]) * (v["bbox"][3] - v["bbox"][1])))
-        return chosen[:3]
+        return list(self.folded)
 
     @staticmethod
     def _legs(view, thickness=None):
@@ -777,10 +785,17 @@ class FlatPatternView:
                          f"{view['name'].upper()} VIEW   SCALE {scale_text(k)}")
         c.restoreState()
 
+        # return ", ".join(
+        #     f"{v['name']} {w:.1f} x {h:.1f} ({scale_text(kk)}, {len(lg)} leg(s))"
+        #     for v, w, h, kk, lg in zip(views, widths, heights, ks, legs_per_view)
+        # )
+
         return ", ".join(
-            f"{v['name']} {w:.1f} x {h:.1f} ({scale_text(kk)}, {len(lg)} leg(s))"
-            for v, w, h, kk, lg in zip(views, widths, heights, ks, legs_per_view)
+            f"{v['name']} VIEW: overall {w:.1f} x {h:.1f} mm "
+            f"(scale {scale_text(kk)})"
+            for v, w, h, kk in zip(views, widths, heights, ks)
         )
+
 
     @staticmethod
     def _chain_marks(low, high, positions):
