@@ -1042,11 +1042,15 @@ class FlatPatternView:
 
         # Helper: assign outer rows by descending dimension value.
         # Largest dimension gets the outermost row.
+        
         def draw_dimension_group(items, draw_one, base_offset=16.0, row_gap=13.0):
-            items.sort(key=lambda item: item["value"], reverse=True)
+            # Smallest dimension closest to the part;
+            # largest dimension farthest from the part.
+            items.sort(key=lambda item: item["value"])
 
             for rank, item in enumerate(items):
                 draw_one(item, base_offset + rank * row_gap)
+
 
         # ---- Vertical bend lines ----
         # Measure each bend from its nearest left/right edge.
