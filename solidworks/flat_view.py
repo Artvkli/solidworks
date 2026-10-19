@@ -1000,9 +1000,9 @@ class FlatPatternView:
         c.setFillColorRGB(0, 0, 0)
 
         # ---- Bend tags and labels ----
-        
-        # ---- Bend tags: stagger nearby labels diagonally ----
+        # ---- Bend tags: stagger nearby labels without rotation ----
         c.setFillColorRGB(0, 0, 0)
+        c.setFont(font + "-Bold", 10)
 
         tag_positions = sorted(
             view.tags,
@@ -1011,40 +1011,44 @@ class FlatPatternView:
 
         placed_tags = []
 
-        # Approximate horizontal spacing needed between tag labels.
         min_gap = 22.0
+        shift_x = 12.0
+        shift_y = 10.0
 
         for tag in tag_positions:
             tx = px(tag["pos"][0])
             ty = py(tag["pos"][1])
 
             label = str(tag["tag"])
-            c.setFont(font + "-Bold", 10)
-            label_width = c.stringWidth(label, font + "-Bold", 10)
+            label_width = c.stringWidth(
+                label, font + "-Bold", 10
+            )
 
-            # Check whether another tag is too close horizontally
-            # and vertically.
-            overlap = any(
-                abs(tx - prev_x) < max(
+            # Find previously drawn tags that are too close.
+            nearby = [
+                (prev_x, prev_y, prev_width, prev_level)
+                for prev_x, prev_y, prev_width, prev_level
+                in placed_tags
+                if abs(tx - prev_x) < max(
                     min_gap,
                     (label_width + prev_width) / 2.0
                 )
-                and abs(ty - prev_y) < 18.0
-                for prev_x, prev_y, prev_width in placed_tags
+                and abs(ty - prev_y) < 22.0
+            ]
+
+            # Move nearby tags progressively to the left and down.
+            level = 0
+            if nearby:
+                level = max(item[3] for item in nearby) + 1
+
+            draw_x = tx - shift_x * level
+            draw_y = ty - 8.0 - shift_y * level
+
+            c.drawCentredString(draw_x, draw_y, label)
+
+            placed_tags.append(
+                (draw_x, draw_y, label_width, level)
             )
-
-            if overlap:
-                # Alternate the diagonal direction to reduce collisions.
-                direction = -1 if len(placed_tags) % 2 else 1
-                c.saveState()
-                c.translate(tx, ty - 8.0)
-                c.rotate(35 * direction)
-                c.drawCentredString(0, 0, label)
-                c.restoreState()
-            else:
-                c.drawCentredString(tx, ty - 8.0, label)
-
-            placed_tags.append((tx, ty, label_width))
 
         # Regular labels remain unchanged.
         for text, pos in view.labels:
