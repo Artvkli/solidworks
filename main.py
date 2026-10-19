@@ -17,9 +17,7 @@ from solidworks.bend_table_pdf import BendTablePdfWriter, attach_flat_dxfs
 from solidworks.dwg_exporter import DwgExporter
 from solidworks.thickness_dwg import ThicknessDwgBuilder
 from solidworks.sheet_metal import SheetMetalDetector
-from solidworks.bend_table_slddrw import SlddrwWriter
 
-EXPORT_BEND_TABLE_SLDDRW = True
 GROUP_BY_THICKNESS = True
 REPEAT_BY_QUANTITY = False
 ODA_CONVERTER_PATH = None
