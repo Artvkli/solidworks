@@ -24,7 +24,7 @@ ODA_CONVERTER_PATH = None
 PART_GAP = 20.0
 MAX_ROW_WIDTH = 6000.0
 
-# ---- test mode ----
+
 # PDF_ONLY = True  -> ONLY the bend table PDFs. No flat pattern DXF export, no merging, no DWG.
 # PDF_ONLY = False -> the normal full run (DXF/DWG as before).
 PDF_ONLY = True
