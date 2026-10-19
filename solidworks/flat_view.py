@@ -1000,63 +1000,20 @@ class FlatPatternView:
         c.setFillColorRGB(0, 0, 0)
 
         # ---- Bend tags and labels ----
-        # ---- Bend tags: stagger nearby labels without rotation ----
-        c.setFillColorRGB(0, 0, 0)
-        c.setFont(font + "-Bold", 10)
-
-        tag_positions = sorted(
-            view.tags,
-            key=lambda tag: (tag["pos"][1], tag["pos"][0])
-        )
-
-        placed_tags = []
-
-        min_gap = 22.0
-        shift_x = 12.0
-        shift_y = 10.0
-
-        for tag in tag_positions:
-            tx = px(tag["pos"][0])
-            ty = py(tag["pos"][1])
-
-            label = str(tag["tag"])
-            label_width = c.stringWidth(
-                label, font + "-Bold", 10
+        for tag in view.tags:
+            c.setFont(font + "-Bold", 10)
+            c.drawCentredString(
+                px(tag["pos"][0]),
+                py(tag["pos"][1]) - 8.0,
+                tag["tag"],
             )
 
-            # Find previously drawn tags that are too close.
-            nearby = [
-                (prev_x, prev_y, prev_width, prev_level)
-                for prev_x, prev_y, prev_width, prev_level
-                in placed_tags
-                if abs(tx - prev_x) < max(
-                    min_gap,
-                    (label_width + prev_width) / 2.0
-                )
-                and abs(ty - prev_y) < 22.0
-            ]
-
-            # Move nearby tags progressively to the left and down.
-            level = 0
-            if nearby:
-                level = max(item[3] for item in nearby) + 1
-
-            draw_x = tx - shift_x * level
-            draw_y = ty - 8.0 - shift_y * level
-
-            c.drawCentredString(draw_x, draw_y, label)
-
-            placed_tags.append(
-                (draw_x, draw_y, label_width, level)
-            )
-
-        # Regular labels remain unchanged.
         for text, pos in view.labels:
             c.setFont(font, 9)
             c.drawCentredString(
                 px(pos[0]),
                 py(pos[1]) - 3.0,
-                text
+                text,
             )
 
         # ---- Dimensions ----
