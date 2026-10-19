@@ -62,10 +62,52 @@ class SolidWorksDrawingBuilder:
                 f"SolidWorks could not open part: {part_path}; "
                 f"errors={getattr(errors, 'value', errors)}"
             )
+        # Some scan-cache records use the placeholder "Default", although
+        # the part file has a differently named configuration.
         if configuration:
-            ok = self._safe_call(model, "ShowConfiguration2", configuration, default=False)
-            if ok is False:
-                raise RuntimeError(f"Could not activate configuration: {configuration}")
+            requested = str(configuration).strip()
+            ok = self._safe_call(model, "ShowConfiguration2", requested, default=None)
+            active = self._safe_call(model, "GetActiveConfiguration", default=None)
+            active_name = self._safe_call(active, "GetName", default=None)
+
+            if not (ok is True or (active_name and str(active_name) == requested)):
+                raw_names = self._safe_call(model, "GetConfigurationNames", default=[]) or []
+                config_names = [str(n) for n in raw_names if n]
+                if requested in config_names:
+                    ok = self._safe_call(model, "ShowConfiguration2", requested, default=False)
+                    active = self._safe_call(model, "GetActiveConfiguration", default=None)
+                    active_name = self._safe_call(active, "GetName", default=None)
+                    if not (ok is True or (active_name and str(active_name) == requested)):
+                        raise RuntimeError(
+                            f"Could not activate configuration '{requested}'. "
+                            f"Available configurations: {config_names or 'unknown'}"
+                        )
+                else:
+                    # Prefer the configuration already active in the document;
+                    # otherwise use the first configuration actually defined.
+                    fallback = str(active_name) if active_name else (
+                        config_names[0] if config_names else None
+                    )
+                    if not fallback or fallback == requested:
+                        raise RuntimeError(
+                            f"Could not activate requested configuration '{requested}'. "
+                            f"Available configurations: {config_names or 'unknown'}"
+                        )
+                    fallback_ok = self._safe_call(
+                        model, "ShowConfiguration2", fallback, default=False
+                    )
+                    active = self._safe_call(model, "GetActiveConfiguration", default=None)
+                    active_name = self._safe_call(active, "GetName", default=None)
+                    if fallback_ok is True or (active_name and str(active_name) == fallback):
+                        print(
+                            f"  [config] '{requested}' is not available; "
+                            f"using existing configuration '{fallback}'"
+                        )
+                    else:
+                        raise RuntimeError(
+                            f"Could not activate requested configuration '{requested}'. "
+                            f"Available configurations: {config_names or 'unknown'}"
+                        )
         self._safe_call(model, "ForceRebuild3", True)
         return model, opened_here
 
