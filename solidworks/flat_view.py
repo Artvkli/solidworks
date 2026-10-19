@@ -1022,9 +1022,9 @@ class FlatPatternView:
         c.setFont(font + "-Bold", 10)
 
         placed_tags = []
-        min_gap = 24.0
-        shift_x = 12.0
-        shift_y = 10.0
+        min_gap = 22.0
+        shift_x = 9.0
+        shift_y = 7.0
 
         for tag in view.tags:
             tx = px(tag["pos"][0])
