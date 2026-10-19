@@ -1000,20 +1000,59 @@ class FlatPatternView:
         c.setFillColorRGB(0, 0, 0)
 
         # ---- Bend tags and labels ----
-        for tag in view.tags:
+        
+        # ---- Bend tags: stagger nearby labels diagonally ----
+        c.setFillColorRGB(0, 0, 0)
+
+        tag_positions = sorted(
+            view.tags,
+            key=lambda tag: (tag["pos"][1], tag["pos"][0])
+        )
+
+        placed_tags = []
+
+        # Approximate horizontal spacing needed between tag labels.
+        min_gap = 22.0
+
+        for tag in tag_positions:
+            tx = px(tag["pos"][0])
+            ty = py(tag["pos"][1])
+
+            label = str(tag["tag"])
             c.setFont(font + "-Bold", 10)
-            c.drawCentredString(
-                px(tag["pos"][0]),
-                py(tag["pos"][1]) - 8.0,
-                tag["tag"],
+            label_width = c.stringWidth(label, font + "-Bold", 10)
+
+            # Check whether another tag is too close horizontally
+            # and vertically.
+            overlap = any(
+                abs(tx - prev_x) < max(
+                    min_gap,
+                    (label_width + prev_width) / 2.0
+                )
+                and abs(ty - prev_y) < 18.0
+                for prev_x, prev_y, prev_width in placed_tags
             )
 
+            if overlap:
+                # Alternate the diagonal direction to reduce collisions.
+                direction = -1 if len(placed_tags) % 2 else 1
+                c.saveState()
+                c.translate(tx, ty - 8.0)
+                c.rotate(35 * direction)
+                c.drawCentredString(0, 0, label)
+                c.restoreState()
+            else:
+                c.drawCentredString(tx, ty - 8.0, label)
+
+            placed_tags.append((tx, ty, label_width))
+
+        # Regular labels remain unchanged.
         for text, pos in view.labels:
             c.setFont(font, 9)
             c.drawCentredString(
                 px(pos[0]),
                 py(pos[1]) - 3.0,
-                text,
+                text
             )
 
         # ---- Dimensions ----
