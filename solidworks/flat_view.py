@@ -1000,21 +1000,66 @@ class FlatPatternView:
         c.setFillColorRGB(0, 0, 0)
 
         # ---- Bend tags and labels ----
+        # for tag in view.tags:
+        #     c.setFont(font + "-Bold", 10)
+        #     c.drawCentredString(
+        #         px(tag["pos"][0]),
+        #         py(tag["pos"][1]) - 8.0,
+        #         tag["tag"],
+        #     )
+
+        # for text, pos in view.labels:
+        #     c.setFont(font, 9)
+        #     c.drawCentredString(
+        #         px(pos[0]),
+        #         py(pos[1]) - 3.0,
+        #         text,
+        #     )
+
+
+        # ---- Bend tags: separate nearby tags ----
+        c.setFillColorRGB(0, 0, 0)
+        c.setFont(font + "-Bold", 10)
+
+        placed_tags = []
+        min_gap = 24.0
+        shift_x = 14.0
+        shift_y = 12.0
+
         for tag in view.tags:
-            c.setFont(font + "-Bold", 10)
-            c.drawCentredString(
-                px(tag["pos"][0]),
-                py(tag["pos"][1]) - 8.0,
-                tag["tag"],
+            tx = px(tag["pos"][0])
+            ty = py(tag["pos"][1])
+            label = str(tag["tag"])
+
+            label_width = c.stringWidth(
+                label, font + "-Bold", 10
             )
 
+            # Detect nearby tags.
+            level = 0
+            while any(
+                abs((tx - level * shift_x) - prev_x)
+                    < max(min_gap, (label_width + prev_width) / 2.0)
+                and abs((ty - level * shift_y) - prev_y) < 18.0
+                for prev_x, prev_y, prev_width in placed_tags
+            ):
+                level += 1
+
+            draw_x = tx - level * shift_x
+            draw_y = ty - 8.0 - level * shift_y
+
+            c.drawCentredString(draw_x, draw_y, label)
+            placed_tags.append((draw_x, draw_y, label_width))
+
+        # Regular labels remain unchanged.
         for text, pos in view.labels:
             c.setFont(font, 9)
             c.drawCentredString(
                 px(pos[0]),
                 py(pos[1]) - 3.0,
-                text,
+                text
             )
+
 
         # ---- Dimensions ----
         gray = 0.25
