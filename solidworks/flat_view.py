@@ -849,10 +849,104 @@ class FlatPatternView:
             bottom, left = new_bottom, new_left
         return k, (left, bottom, top, right)
 
+    # def draw(self, c, area, font="Helvetica", font_size=8.5):
+    #     """
+    #     Draws the view (with dimensions) centred in area = (x0, y0, x1, y1) in PDF points.
+    #     Returns a short description of what was drawn.
+    #     """
+    #     ax0, ay0, ax1, ay1 = area
+    #     aw, ah = ax1 - ax0, ay1 - ay0
+
+    #     view = self
+    #     k, margins = self._plan((aw, ah), font, font_size)
+    #     turned = self.rotated()
+    #     k_turned, margins_turned = turned._plan((aw, ah), font, font_size)
+    #     if k_turned > k * 1.2:
+    #         view, k, margins = turned, k_turned, margins_turned
+
+    #     left, bottom, top, right = margins
+    #     x0, y0, x1, y1 = view.bbox()
+    #     width, height = x1 - x0, y1 - y0
+    #     drawn_w, drawn_h = width * k, height * k
+
+    #     # centre the drawing (without its dimension margins) inside the free area
+    #     ox = ax0 + left + (aw - left - right - drawn_w) / 2.0
+    #     oy = ay0 + bottom + (ah - top - bottom - drawn_h) / 2.0
+
+    #     def px(x):
+    #         return ox + (x - x0) * k
+
+    #     def py(y):
+    #         return oy + (y - y0) * k
+
+    #     # ---- geometry ----
+    #     c.saveState()
+    #     c.setStrokeColorRGB(0, 0, 0)
+    #     for path in view.paths:
+    #         pts = path["points"]
+    #         c.setLineWidth(0.35 if path["bend"] else 0.7)
+    #         c.setDash(3, 2) if path["bend"] else c.setDash()
+    #         p = c.beginPath()
+    #         p.moveTo(px(pts[0][0]), py(pts[0][1]))
+    #         for x, y in pts[1:]:
+    #             p.lineTo(px(x), py(y))
+    #         c.drawPath(p, stroke=1, fill=0)
+    #     c.setDash()
+
+    #     # ---- bend tags and labels, where SolidWorks put them ----
+    #     c.setFillColorRGB(0, 0, 0)
+    #     for tag in view.tags:
+    #         c.setFont(font + "-Bold", 10)
+    #         c.drawCentredString(px(tag["pos"][0]), py(tag["pos"][1]) - 8.0, tag["tag"])
+    #     for text, pos in view.labels:
+    #         c.setFont(font, 9)
+    #         c.drawCentredString(px(pos[0]), py(pos[1]) - 3.0, text)
+
+    #     # ---- dimensions ----
+    #     gray = 0.25
+    #     c.setStrokeColorRGB(gray, gray, gray)
+    #     c.setFillColorRGB(gray, gray, gray)
+    #     c.setLineWidth(0.4)
+
+    #     left_x, right_x = px(x0), px(x1)
+    #     bottom_y, top_y = py(y0), py(y1)
+
+    #     self._hdim(c, left_x, right_x, top_y + 22.0, top_y, f"{width:.1f}", font, font_size)
+    #     self._vdim(c, bottom_y, top_y, right_x + 22.0, right_x, f"{height:.1f}", font, font_size)
+
+    #     xs, ys, slanted = view.bend_positions()
+    #     xmarks = self._chain_marks(x0, x1, xs)
+    #     ymarks = self._chain_marks(y0, y1, ys)
+
+    #     if xmarks:
+    #         levels = self._levels(xmarks, k, font, font_size)
+    #         for i in range(len(xmarks) - 1):
+    #             self._hdim(c, px(xmarks[i]), px(xmarks[i + 1]), bottom_y - (16.0 + 13.0 * levels[i]), bottom_y,
+    #                        f"{xmarks[i + 1] - xmarks[i]:.1f}", font, font_size)
+    #     if ymarks:
+    #         levels = self._levels(ymarks, k, font, font_size)
+    #         for i in range(len(ymarks) - 1):
+    #             self._vdim(c, py(ymarks[i]), py(ymarks[i + 1]), left_x - (16.0 + 13.0 * levels[i]), left_x,
+    #                        f"{ymarks[i + 1] - ymarks[i]:.1f}", font, font_size)
+    #     c.restoreState()
+
+    #     ratio = k / PT_PER_MM
+    #     self.scale_label = f"{ratio:.3g}:1" if ratio >= 1 else f"1:{1.0 / ratio:.3g}"
+    #     return (
+    #         f"{width:.1f} x {height:.1f} mm, scale {self.scale_label}, "
+    #         f"{len(xs)} vertical / {len(ys)} horizontal / {slanted} slanted bend line(s)"
+    #         + (f", {len(view.tags)} tag(s)" if view.tags else "")
+    #         + (", turned 90 degrees" if view is not self else "")
+    #     )
+
+
     def draw(self, c, area, font="Helvetica", font_size=8.5):
         """
-        Draws the view (with dimensions) centred in area = (x0, y0, x1, y1) in PDF points.
-        Returns a short description of what was drawn.
+        Draw the flat pattern with:
+        - Overall width and height.
+        - Each vertical bend dimensioned from its nearest left/right edge.
+        - Each horizontal bend dimensioned from its nearest bottom/top edge.
+        - No chain dimensions between bend lines.
         """
         ax0, ay0, ax1, ay1 = area
         aw, ah = ax1 - ax0, ay1 - ay0
@@ -861,6 +955,7 @@ class FlatPatternView:
         k, margins = self._plan((aw, ah), font, font_size)
         turned = self.rotated()
         k_turned, margins_turned = turned._plan((aw, ah), font, font_size)
+
         if k_turned > k * 1.2:
             view, k, margins = turned, k_turned, margins_turned
 
@@ -869,7 +964,7 @@ class FlatPatternView:
         width, height = x1 - x0, y1 - y0
         drawn_w, drawn_h = width * k, height * k
 
-        # centre the drawing (without its dimension margins) inside the free area
+        # Centre the drawing inside the available area.
         ox = ax0 + left + (aw - left - right - drawn_w) / 2.0
         oy = ay0 + bottom + (ah - top - bottom - drawn_h) / 2.0
 
@@ -879,30 +974,42 @@ class FlatPatternView:
         def py(y):
             return oy + (y - y0) * k
 
-        # ---- geometry ----
+        # ---- Geometry ----
         c.saveState()
         c.setStrokeColorRGB(0, 0, 0)
+
         for path in view.paths:
             pts = path["points"]
             c.setLineWidth(0.35 if path["bend"] else 0.7)
-            c.setDash(3, 2) if path["bend"] else c.setDash()
+            if path["bend"]:
+                c.setDash(3, 2)
+            else:
+                c.setDash()
+
             p = c.beginPath()
             p.moveTo(px(pts[0][0]), py(pts[0][1]))
             for x, y in pts[1:]:
                 p.lineTo(px(x), py(y))
             c.drawPath(p, stroke=1, fill=0)
+
         c.setDash()
 
-        # ---- bend tags and labels, where SolidWorks put them ----
+        # ---- Bend tags and labels ----
         c.setFillColorRGB(0, 0, 0)
+
         for tag in view.tags:
             c.setFont(font + "-Bold", 10)
-            c.drawCentredString(px(tag["pos"][0]), py(tag["pos"][1]) - 8.0, tag["tag"])
+            c.drawCentredString(
+                px(tag["pos"][0]),
+                py(tag["pos"][1]) - 8.0,
+                tag["tag"]
+            )
+
         for text, pos in view.labels:
             c.setFont(font, 9)
             c.drawCentredString(px(pos[0]), py(pos[1]) - 3.0, text)
 
-        # ---- dimensions ----
+        # ---- Dimensions ----
         gray = 0.25
         c.setStrokeColorRGB(gray, gray, gray)
         c.setFillColorRGB(gray, gray, gray)
@@ -911,30 +1018,152 @@ class FlatPatternView:
         left_x, right_x = px(x0), px(x1)
         bottom_y, top_y = py(y0), py(y1)
 
-        self._hdim(c, left_x, right_x, top_y + 22.0, top_y, f"{width:.1f}", font, font_size)
-        self._vdim(c, bottom_y, top_y, right_x + 22.0, right_x, f"{height:.1f}", font, font_size)
+        # Overall flat-pattern dimensions: unchanged.
+        self._hdim(
+            c, left_x, right_x,
+            top_y + 22.0, top_y,
+            f"{width:.1f}", font, font_size
+        )
+        self._vdim(
+            c, bottom_y, top_y,
+            right_x + 22.0, right_x,
+            f"{height:.1f}", font, font_size
+        )
 
         xs, ys, slanted = view.bend_positions()
-        xmarks = self._chain_marks(x0, x1, xs)
-        ymarks = self._chain_marks(y0, y1, ys)
 
-        if xmarks:
-            levels = self._levels(xmarks, k, font, font_size)
-            for i in range(len(xmarks) - 1):
-                self._hdim(c, px(xmarks[i]), px(xmarks[i + 1]), bottom_y - (16.0 + 13.0 * levels[i]), bottom_y,
-                           f"{xmarks[i + 1] - xmarks[i]:.1f}", font, font_size)
-        if ymarks:
-            levels = self._levels(ymarks, k, font, font_size)
-            for i in range(len(ymarks) - 1):
-                self._vdim(c, py(ymarks[i]), py(ymarks[i + 1]), left_x - (16.0 + 13.0 * levels[i]), left_x,
-                           f"{ymarks[i + 1] - ymarks[i]:.1f}", font, font_size)
+        # ---- Vertical bend lines ----
+        # Each bend is measured from its nearest outer edge.
+        # Use _pack() to separate nearby dimension labels.
+        vertical_dims = []
+
+        for x in xs:
+            if not (x0 + 1e-3 < x < x1 - 1e-3):
+                continue
+
+            left_dist = x - x0
+            right_dist = x1 - x
+
+            if left_dist <= right_dist:
+                a, b = px(x0), px(x)
+                value = left_dist
+                side_key = "left"
+            else:
+                a, b = px(x), px(x1)
+                value = right_dist
+                side_key = "right"
+
+            centre = (a + b) / 2.0
+            label_width = max(18.0, len(f"{value:.1f}") * font_size * 0.65)
+
+            vertical_dims.append({
+                "a": a,
+                "b": b,
+                "value": value,
+                "side": side_key,
+                "centre": centre,
+                "label_width": label_width,
+            })
+
+        for side_key in ("left", "right"):
+            indices = [
+                i for i, d in enumerate(vertical_dims)
+                if d["side"] == side_key
+            ]
+
+            spans = [
+                (vertical_dims[i]["centre"], vertical_dims[i]["label_width"])
+                for i in indices
+            ]
+            levels = self._pack(spans)
+
+            for i, level in zip(indices, levels):
+                d = vertical_dims[i]
+                self._hdim(
+                    c,
+                    d["a"], d["b"],
+                    bottom_y - (16.0 + 13.0 * level),
+                    bottom_y,
+                    f"{d['value']:.1f}",
+                    font, font_size
+                )
+
+        # ---- Horizontal bend lines ----
+        # Each bend is measured from its nearest outer edge.
+        horizontal_dims = []
+
+        for y in ys:
+            if not (y0 + 1e-3 < y < y1 - 1e-3):
+                continue
+
+            bottom_dist = y - y0
+            top_dist = y1 - y
+
+            if bottom_dist <= top_dist:
+                a, b = py(y0), py(y)
+                value = bottom_dist
+                side_key = "bottom"
+            else:
+                a, b = py(y), py(y1)
+                value = top_dist
+                side_key = "top"
+
+            centre = (a + b) / 2.0
+            label_width = max(18.0, len(f"{value:.1f}") * font_size * 0.65)
+
+            horizontal_dims.append({
+                "a": a,
+                "b": b,
+                "value": value,
+                "side": side_key,
+                "centre": centre,
+                "label_width": label_width,
+            })
+
+        for side_key in ("left", "right"):
+            # Vertical dimension labels are placed on the left or right
+            # of the drawing depending on which outer edge is nearest.
+            indices = [
+                i for i, d in enumerate(horizontal_dims)
+                if d["side"] in ("bottom", "top")
+            ]
+
+            # Keep labels from overlapping by assigning separate rows.
+            # The spans are based on their vertical positions.
+            spans = [
+                (horizontal_dims[i]["centre"], horizontal_dims[i]["label_width"])
+                for i in indices
+            ]
+            levels = self._pack(spans)
+
+            # Draw only once; the side loop is intentionally avoided below.
+            break
+
+        for i, level in zip(indices, levels):
+            d = horizontal_dims[i]
+            self._vdim(
+                c,
+                min(d["a"], d["b"]),
+                max(d["a"], d["b"]),
+                left_x - (16.0 + 13.0 * level),
+                left_x,
+                f"{d['value']:.1f}",
+                font, font_size
+            )
+
         c.restoreState()
 
         ratio = k / PT_PER_MM
-        self.scale_label = f"{ratio:.3g}:1" if ratio >= 1 else f"1:{1.0 / ratio:.3g}"
+        self.scale_label = (
+            f"{ratio:.3g}:1"
+            if ratio >= 1
+            else f"1:{1.0 / ratio:.3g}"
+        )
+
         return (
             f"{width:.1f} x {height:.1f} mm, scale {self.scale_label}, "
-            f"{len(xs)} vertical / {len(ys)} horizontal / {slanted} slanted bend line(s)"
+            f"{len(xs)} vertical / {len(ys)} horizontal / "
+            f"{slanted} slanted bend line(s)"
             + (f", {len(view.tags)} tag(s)" if view.tags else "")
             + (", turned 90 degrees" if view is not self else "")
         )
