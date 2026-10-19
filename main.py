@@ -17,7 +17,9 @@ from solidworks.bend_table_pdf import BendTablePdfWriter, attach_flat_dxfs
 from solidworks.dwg_exporter import DwgExporter
 from solidworks.thickness_dwg import ThicknessDwgBuilder
 from solidworks.sheet_metal import SheetMetalDetector
+from solidworks.bend_table_slddrw import SlddrwWriter
 
+EXPORT_BEND_TABLE_SLDDRW = True
 GROUP_BY_THICKNESS = True
 REPEAT_BY_QUANTITY = False
 ODA_CONVERTER_PATH = None
@@ -252,6 +254,16 @@ def main():
                 output_folder / "bend_tables_pdf",
                 combined_name=f"{assembly_path.stem}_bend_tables" if COMBINE_BEND_TABLE_PDF else None,
             )
+
+            if EXPORT_BEND_TABLE_SLDDRW:
+                SlddrwWriter(
+                    reader,
+                    group_by_thickness=GROUP_BY_THICKNESS,
+                ).write_all_slddrw(
+                    scan_result["sheet_metal_parts"],
+                    output_folder / "drawings_slddrw",
+                    base_name=assembly_path.stem,
+                )
         except Exception as exc:
             print(f"\nBEND TABLES FAILED (continuing without them): {type(exc).__name__}: {exc}")
             traceback.print_exc()
