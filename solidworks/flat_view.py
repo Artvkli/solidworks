@@ -1017,14 +1017,15 @@ class FlatPatternView:
         #     )
 
 
-        # ---- Bend tags: separate nearby tags ----
+       
+        # ---- Bend tags: separate nearby tags with small offsets ----
         c.setFillColorRGB(0, 0, 0)
         c.setFont(font + "-Bold", 10)
 
         placed_tags = []
         min_gap = 22.0
-        shift_x = 9.0
-        shift_y = 7.0
+        shift_x = 7.0
+        shift_y = 3.0
 
         for tag in view.tags:
             tx = px(tag["pos"][0])
@@ -1035,18 +1036,21 @@ class FlatPatternView:
                 label, font + "-Bold", 10
             )
 
-            # Detect nearby tags.
+            draw_x = tx
+            draw_y = ty - 8.0
+
+            # Move left first; use only a small vertical offset
+            # when horizontal movement alone is not enough.
             level = 0
             while any(
-                abs((tx - level * shift_x) - prev_x)
+                abs(draw_x - prev_x)
                     < max(min_gap, (label_width + prev_width) / 2.0)
-                and abs((ty - level * shift_y) - prev_y) < 18.0
+                and abs(draw_y - prev_y) < 12.0
                 for prev_x, prev_y, prev_width in placed_tags
             ):
                 level += 1
-
-            draw_x = tx - level * shift_x
-            draw_y = ty - 8.0 - level * shift_y
+                draw_x = tx - level * shift_x
+                draw_y = ty - 8.0 - (level % 2) * shift_y
 
             c.drawCentredString(draw_x, draw_y, label)
             placed_tags.append((draw_x, draw_y, label_width))
