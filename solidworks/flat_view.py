@@ -1030,63 +1030,110 @@ class FlatPatternView:
             f"{height:.1f}", font, font_size
         )
 
+        
+        # Bend dimensions: larger dimensions are placed farther outward.
         xs, ys, slanted = view.bend_positions()
 
-        # ---- Vertical bend lines ----
-        # Each bend is measured from its nearest outer edge.
-        # Use _pack() to separate nearby dimension labels.
-        vertical_dims = []
+        # ---------------------------------
+        # Vertical bend lines (x positions)
+        # ---------------------------------
+        # A bend is measured from its nearest left/right outer edge.
+        x_groups = {"left": [], "right": []}
 
         for x in xs:
-            if not (x0 + 1e-3 < x < x1 - 1e-3):
+            if x <= x0 or x >= x1:
                 continue
 
             left_dist = x - x0
             right_dist = x1 - x
 
             if left_dist <= right_dist:
-                a, b = px(x0), px(x)
+                side = "left"
+                xa, xb = px(x0), px(x)
                 value = left_dist
-                side_key = "left"
             else:
-                a, b = px(x), px(x1)
+                side = "right"
+                xa, xb = px(x), px(x1)
                 value = right_dist
-                side_key = "right"
 
-            centre = (a + b) / 2.0
-            label_width = max(18.0, len(f"{value:.1f}") * font_size * 0.65)
-
-            vertical_dims.append({
-                "a": a,
-                "b": b,
+            label = self._fmt(value)
+            x_groups[side].append({
+                "xa": xa,
+                "xb": xb,
                 "value": value,
-                "side": side_key,
-                "centre": centre,
-                "label_width": label_width,
+                "label": label,
+                "center": (xa + xb) / 2,
+                "width": max(18, len(label) * font_size * 0.65),
             })
 
-        for side_key in ("left", "right"):
-            indices = [
-                i for i, d in enumerate(vertical_dims)
-                if d["side"] == side_key
-            ]
+        for side, items in x_groups.items():
+            # Sort labels from largest dimension to smallest.
+            items.sort(key=lambda item: item["value"], reverse=True)
 
-            spans = [
-                (vertical_dims[i]["centre"], vertical_dims[i]["label_width"])
-                for i in indices
-            ]
-            levels = self._pack(spans)
+            # Larger dimensions go farther outward (lower on the page).
+            for rank, item in enumerate(items):
+                offset = 16 + rank * 13
+                y_dim = bottom_y - offset
 
-            for i, level in zip(indices, levels):
-                d = vertical_dims[i]
                 self._hdim(
                     c,
-                    d["a"], d["b"],
-                    bottom_y - (16.0 + 13.0 * level),
+                    item["xa"],
+                    item["xb"],
+                    y_dim,
                     bottom_y,
-                    f"{d['value']:.1f}",
-                    font, font_size
+                    item["label"],
+                    font_name,
+                    font_size,
                 )
+
+        # ----------------------------------
+        # Horizontal bend lines (y positions)
+        # ----------------------------------
+        y_items = []
+
+        for y in ys:
+            if y <= y0 or y >= y1:
+                continue
+
+            bottom_dist = y - y0
+            top_dist = y1 - y
+
+            if bottom_dist <= top_dist:
+                ya, yb = py(y0), py(y)
+                value = bottom_dist
+            else:
+                ya, yb = py(y), py(y1)
+                value = top_dist
+
+            label = self._fmt(value)
+            y_items.append({
+                "ya": ya,
+                "yb": yb,
+                "value": value,
+                "label": label,
+                "center": (ya + yb) / 2,
+                "width": max(18, len(label) * font_size * 0.65),
+            })
+
+        # Sort from largest to smallest.
+        y_items.sort(key=lambda item: item["value"], reverse=True)
+
+        # Larger dimensions go farther outward (left side of the pattern).
+        for rank, item in enumerate(y_items):
+            offset = 16 + rank * 13
+            x_dim = left_x - offset
+
+            self._vdim(
+                c,
+                item["ya"],
+                item["yb"],
+                x_dim,
+                left_x,
+                item["label"],
+                font_name,
+                font_size,
+            )
+
 
         # ---- Horizontal bend lines ----
         # Each bend is measured from its nearest outer edge.
