@@ -546,7 +546,7 @@ class SwDrawingPdfExporter(DwgExporter):
             self._select_error = f"delete dim: {str(exc)[:50]}"
         self._clear(drawing)
 
-    def _add_checked_dimension(self, drawing, label, expected):
+    def _add_checked_dimension(self, drawing, label, expected, tol=None):
         """AddDimension2 for the current selection. Kept only if its value matches `expected` (metres)."""
         try:
             dim = drawing.AddDimension2(float(label[0]), float(label[1]), 0.0)
@@ -560,7 +560,7 @@ class SwDrawingPdfExporter(DwgExporter):
         value = self._dim_value(dim)
         self._clear(drawing)
         if value is not None and expected is not None:
-            if abs(value - expected) > max(0.0015, 0.01 * expected):
+            if abs(value - expected) > (tol if tol is not None else max(0.0015, 0.01 * expected)):
                 self._select_error = (
                     f"wrong value {value * 1000:.1f} mm (expected {expected * 1000:.1f} mm) - removed"
                 )
@@ -586,97 +586,169 @@ class SwDrawingPdfExporter(DwgExporter):
     # FLAT PATTERN DIMENSIONS
     # =====================================================
 
-    def _read_view_transform(self, view, steps):
-        errors = []
-        for name, getter in (
-            ("ModelToViewTransform", lambda: view.ModelToViewTransform.ArrayData),
-            ("GetXform", lambda: view.GetXform()),
-        ):
-            try:
-                data = [float(v) for v in getter()]
-                if len(data) >= 13:
-                    return data
-                errors.append(f"{name}: only {len(data)} values")
-            except Exception as exc:
-                errors.append(f"{name}: {str(exc)[:40]}")
-        steps.append("flat dimensions: view transform unavailable (" + " | ".join(errors) + ")")
-        return None
-
-    def _build_bend_mapper(self, view, pairs, bbox, denominator, steps):
-        """
-        Map bend-line points to sheet coordinates using the view transform array
-        (3x3 rotation, translation, scale). The exact convention differs between versions, so several
-        are tried and the one that puts every bend line inside the flat pattern (and axis-aligned) wins.
-        """
-        data = self._read_view_transform(view, steps)
-        if data is None:
-            return None
-        R, t, s = data[0:9], data[9:12], data[12]
-        pos = self._position(view) or (0.0, 0.0)
-        inv = 1.0 / float(denominator)
-
-        def rot(mode, p):
-            x, y, z = p
-            if mode == "R":
-                return (R[0] * x + R[1] * y + R[2] * z, R[3] * x + R[4] * y + R[5] * z)
-            return (R[0] * x + R[3] * y + R[6] * z, R[1] * x + R[4] * y + R[7] * z)
-
-        finals = {
-            "v*s+t": lambda v: (v[0] * s + t[0], v[1] * s + t[1]),
-            "v*s+t+pos": lambda v: (v[0] * s + t[0] + pos[0], v[1] * s + t[1] + pos[1]),
-            "v*s+pos": lambda v: (v[0] * s + pos[0], v[1] * s + pos[1]),
-            "v*inv+pos": lambda v: (v[0] * inv + pos[0], v[1] * inv + pos[1]),
-            "v+pos": lambda v: (v[0] + pos[0], v[1] + pos[1]),
-            "v+t": lambda v: (v[0] + t[0], v[1] + t[1]),
-        }
+    # ---------- edge scan: find where the outer edges REALLY are ----------
+    def _scan_side(self, drawing, side, bbox, span=0.012, step=0.0005, wanted=3):
+        """Walk from outside to inside across a side of the bbox; the first successful pick is a real edge point."""
         x0, y0, x1, y1 = bbox
-        scored = []
-        for mode in ("R", "RT"):
-            for name, fin in finals.items():
-                fn = lambda p, m=mode, f=fin: f(rot(m, p))
-                total = 0.0
-                for a, b in pairs:
-                    pa, pb = fn(a), fn(b)
-                    for x, y in (pa, pb):
-                        total += max(x0 - x, 0) + max(x - x1, 0) + max(y0 - y, 0) + max(y - y1, 0)
-                    total += 0.5 * min(abs(pa[0] - pb[0]), abs(pa[1] - pb[1]))
-                scored.append((total, f"{mode}:{name}", fn))
-        scored.sort(key=lambda r: r[0])
-        best = scored[0]
-        if best[0] > 0.0015 * len(pairs):
+        hits = []
+        for f in (0.5, 0.35, 0.65, 0.2, 0.8):
+            if side in ("left", "right"):
+                y = y0 + (y1 - y0) * f
+                base, sign = (x0, 1.0) if side == "left" else (x1, -1.0)
+                points = [(base - sign * span + sign * step * i, y) for i in range(int(2 * span / step) + 1)]
+            else:
+                x = x0 + (x1 - x0) * f
+                base, sign = (y0, 1.0) if side == "bottom" else (y1, -1.0)
+                points = [(x, base - sign * span + sign * step * i) for i in range(int(2 * span / step) + 1)]
+            for px, py in points:
+                if self._select_at(drawing, px, py, False, kinds=("EDGE",)):
+                    hits.append((px, py))
+                    break
+            self._clear(drawing)
+            if len(hits) >= wanted:
+                break
+        return hits
+
+    def _scan_edges(self, drawing, view, bbox, steps, tag):
+        sides = {s: self._scan_side(drawing, s, bbox) for s in ("left", "right", "bottom", "top")}
+        if not any(sides.values()):
+            name = self._view_name(view)
+            try:
+                if name and drawing.ActivateView(name):
+                    sides = {s: self._scan_side(drawing, s, bbox) for s in ("left", "right", "bottom", "top")}
+                    steps.append(f"{tag}: edges only pickable with the view activated ({name})")
+            except Exception as exc:
+                steps.append(f"{tag}: ActivateView failed ({str(exc)[:40]})")
+        steps.append(f"{tag}: edge scan hits " + ", ".join(f"{k}={len(v)}" for k, v in sides.items()))
+        return sides
+
+    def _dimension_overall(self, drawing, view, bbox, den, steps, tag, sides=None):
+        """Overall length (above the view) and height (right of the view)."""
+        x0, y0, x1, y1 = bbox
+        w, h = x1 - x0, y1 - y0
+        if sides is None:
+            sides = self._scan_edges(drawing, view, bbox, steps, tag)
+        fallback_h = [(x0, y0 + h * f) for f in PICK_FRACTIONS], [(x1, y0 + h * f) for f in PICK_FRACTIONS]
+        fallback_v = [(x0 + w * f, y0) for f in PICK_FRACTIONS], [(x0 + w * f, y1) for f in PICK_FRACTIONS]
+        made = 0
+        if self._dimension_two_picks(
+            drawing, sides["left"] or fallback_h[0], sides["right"] or fallback_h[1],
+            ((x0 + x1) / 2, y1 + DIM_OFFSET), w * den,
+        ):
+            made += 1
+        else:
+            steps.append(f"{tag}: overall length not created ({self._select_error or 'no edge picked'})")
+        if self._dimension_two_picks(
+            drawing, sides["bottom"] or fallback_v[0], sides["top"] or fallback_v[1],
+            (x1 + DIM_OFFSET, (y0 + y1) / 2), h * den,
+        ):
+            made += 1
+        else:
+            steps.append(f"{tag}: overall height not created ({self._select_error or 'no edge picked'})")
+        return made
+
+    # ---------- bend lines: positions come from the A/B/C tag notes ----------
+    def _view_tags(self, view):
+        """[(letter, x, y)] of the single-letter notes (bend tags) that SolidWorks put on the flat pattern."""
+        found = []
+
+        def add(text, pos):
+            text = str(text or "").strip()
+            try:
+                if len(text) == 1 and text.isalpha() and pos is not None:
+                    found.append((text.upper(), float(pos[0]), float(pos[1])))
+            except Exception:
+                pass
+
+        try:
+            ann = view.GetFirstAnnotation3()
+            guard = 0
+            while ann is not None and guard < 500:
+                guard += 1
+                try:
+                    if int(ann.GetType()) == 6:  # swNote
+                        note = ann.GetSpecificAnnotation()
+                        try:
+                            text = note.GetText()
+                        except Exception:
+                            text = note.Text
+                        add(text, ann.GetPosition())
+                except Exception:
+                    pass
+                ann = ann.GetNext3()
+        except Exception:
+            pass
+        if not found:
+            try:
+                for note in list(view.GetNotes() or []):
+                    try:
+                        add(note.GetText(), note.GetAnnotation().GetPosition())
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+        unique = {}
+        for t in found:
+            unique.setdefault(t[0], t)
+        return sorted(unique.values(), key=lambda t: t[0])
+
+    def _fit_bend_mapping(self, pairs, tags, bbox, den, steps):
+        """
+        Sketch coordinates (real metres) -> sheet coordinates:  sheet = T + (1/den) * M * p.
+        M is one of the 8 rotations/flips; T comes from the tag positions (a tag sits on its bend line).
+        """
+        n = len(pairs)
+        if n == 0 or len(tags) < n:
+            steps.append(f"flat dimensions: {len(tags)} tags found for {n} bend lines - cannot locate the bend lines")
+            return None
+        tags = tags[:n]
+        s = 1.0 / float(den)
+        mids = [((a[0] + b[0]) / 2, (a[1] + b[1]) / 2) for a, b in pairs]
+        x0, y0, x1, y1 = bbox
+        mats = {
+            "rot0": ((1, 0), (0, 1)), "rot90": ((0, -1), (1, 0)), "rot180": ((-1, 0), (0, -1)),
+            "rot270": ((0, 1), (-1, 0)), "flipX": ((-1, 0), (0, 1)), "flipY": ((1, 0), (0, -1)),
+            "swap": ((0, 1), (1, 0)), "swap180": ((0, -1), (-1, 0)),
+        }
+
+        def apply(M, p):
+            return (M[0][0] * p[0] + M[0][1] * p[1], M[1][0] * p[0] + M[1][1] * p[1])
+
+        best = None
+        for name, M in mats.items():
+            rm = [apply(M, m) for m in mids]
+            tx = sum(t[1] for t in tags) / n - s * sum(r[0] for r in rm) / n
+            ty = sum(t[2] for t in tags) / n - s * sum(r[1] for r in rm) / n
+            residual = sum(math.hypot(t[1] - (tx + s * r[0]), t[2] - (ty + s * r[1])) for t, r in zip(tags, rm)) / n
+            outside, fill = 0.0, 0.0
+            for a, b in pairs:
+                pa, pb = apply(M, a), apply(M, b)
+                pts = [(tx + s * pa[0], ty + s * pa[1]), (tx + s * pb[0], ty + s * pb[1])]
+                for x, y in pts:
+                    outside += max(x0 - x, 0) + max(x - x1, 0) + max(y0 - y, 0) + max(y - y1, 0)
+                dx, dy = abs(pts[0][0] - pts[1][0]), abs(pts[0][1] - pts[1][1])
+                fill += (dy / max(y1 - y0, 1e-9)) if dy >= dx else (dx / max(x1 - x0, 1e-9))
+            fill /= n
+            score = residual + outside + 0.003 * (1.0 - min(fill, 1.0))
+            if best is None or score < best[0]:
+                best = (score, name, M, tx, ty, residual, outside, fill)
+        score, name, M, tx, ty, residual, outside, fill = best
+        if residual > 0.008 or outside > 0.004 * n:
             steps.append(
-                f"flat dimensions: no transform fits the bend lines (best {best[1]}, off by {best[0] * 1000:.1f} mm)"
+                f"flat dimensions: tags do not match the bend lines (best {name}, residual {residual * 1000:.1f} mm, "
+                f"outside {outside * 1000:.1f} mm)"
             )
             return None
-        close = [r for r in scored if r[0] <= best[0] + 0.0005]
         steps.append(
-            f"flat dimensions: bend line transform = {best[1]}"
-            + (f" ({len(close)} equally good - values are verified)" if len(close) > 1 else "")
+            f"flat dimensions: bend line mapping = {name}, tag residual {residual * 1000:.1f} mm, fill {fill:.2f}"
+            + (" (single bend: orientation guessed from its length)" if n == 1 else "")
         )
-        return best[2]
 
-    # ---------- entities used by the chain dimensions ----------
-    @staticmethod
-    def _edge_entity(coord, vertical, bbox):
-        x0, y0, x1, y1 = bbox
-        if vertical:  # a vertical edge at x = coord
-            picks = [(coord, y0 + (y1 - y0) * f) for f in PICK_FRACTIONS]
-        else:  # a horizontal edge at y = coord
-            picks = [(x0 + (x1 - x0) * f, coord) for f in PICK_FRACTIONS]
-        return {"kind": "edge", "coord": coord, "picks": picks}
+        def mapper(p):
+            q = apply(M, p)
+            return (tx + s * q[0], ty + s * q[1])
 
-    def _select_entity(self, drawing, view, ent, append):
-        if ent["kind"] == "bend":
-            if self._select_object(drawing, view, ent["seg"], append):
-                return True
-            for p in ent["along"]:
-                if self._select_at(drawing, p[0], p[1], append, kinds=("SKETCHSEGMENT", "EDGE")):
-                    return True
-            return False
-        for p in ent["picks"]:
-            if self._select_at(drawing, p[0], p[1], append, kinds=("EDGE",)):
-                return True
-        return False
+        return mapper
 
     def _dimension_chain(self, drawing, view, entities, bbox, den, bottom_row):
         """edge -> bend -> bend -> ... -> edge, one dimension between every neighbouring pair."""
@@ -695,53 +767,54 @@ class SwDrawingPdfExporter(DwgExporter):
                 continue
             mid = (e1["coord"] + e2["coord"]) / 2
             label = (mid, y0 - DIM_OFFSET) if bottom_row else (x0 - DIM_OFFSET, mid)
-            if self._add_checked_dimension(drawing, label, gap * den):
+            exact = e1["kind"] == "bend" and e2["kind"] == "bend"
+            tol = None if exact else 0.003 * den  # edge distances depend on the tag position (about 3 mm on the sheet)
+            if self._add_checked_dimension(drawing, label, gap * den, tol):
                 made += 1
         self._clear(drawing)
         return made
 
-    def _dimension_overall(self, drawing, bbox, den, steps, tag):
-        """Overall length (above the view) and height (right of the view)."""
-        x0, y0, x1, y1 = bbox
-        w, h = x1 - x0, y1 - y0
-        made = 0
-        left = [(x0, y0 + h * f) for f in PICK_FRACTIONS]
-        right = [(x1, y0 + h * f) for f in PICK_FRACTIONS]
-        if self._dimension_two_picks(drawing, left, right, ((x0 + x1) / 2, y1 + DIM_OFFSET), w * den):
-            made += 1
-        else:
-            steps.append(f"{tag}: overall length not created ({self._select_error or 'no edge picked'})")
-        bottom = [(x0 + w * f, y0) for f in PICK_FRACTIONS]
-        top = [(x0 + w * f, y1) for f in PICK_FRACTIONS]
-        if self._dimension_two_picks(drawing, bottom, top, (x1 + DIM_OFFSET, (y0 + y1) / 2), h * den):
-            made += 1
-        else:
-            steps.append(f"{tag}: overall height not created ({self._select_error or 'no edge picked'})")
-        return made
+    def _select_entity(self, drawing, view, ent, append):
+        if ent["kind"] == "bend":
+            if self._select_object(drawing, view, ent["seg"], append):
+                return True
+            for p in ent["along"]:
+                if self._select_at(drawing, p[0], p[1], append, kinds=("SKETCHSEGMENT", "EDGE")):
+                    return True
+            return False
+        for p in ent["picks"]:
+            if self._select_at(drawing, p[0], p[1], append, kinds=("EDGE",)):
+                return True
+        return False
 
     def _insert_flat_pattern_dimensions(self, drawing, view, bbox, den, steps):
         """
         Like the reference: overall length (top) and width (right) + chain dimensions
         edge | bend | bend | edge along the bottom (vertical bend lines) and the left (horizontal bend lines).
-        Every dimension is checked against its expected value and removed if it is wrong.
+        Needs the bend table to exist already (its A/B/C tags tell where the bend lines are).
         """
         self._select_error = ""
         x0, y0, x1, y1 = bbox
-        created = self._dimension_overall(drawing, bbox, den, steps, "flat dimensions")
+        sides = self._scan_edges(drawing, view, bbox, steps, "flat dimensions")
+        created = self._dimension_overall(drawing, view, bbox, den, steps, "flat dimensions", sides)
 
         segments = []
         for seg in self._get_bend_lines(view):
             pts = self._line_segment_points(seg)
             if pts:
                 segments.append((seg, pts))
-        steps.append(f"flat dimensions: bend lines readable {len(segments)}")
+        tags = self._view_tags(view)
+        steps.append(
+            f"flat dimensions: bend lines readable {len(segments)}, tags found {''.join(t[0] for t in tags) or 'none'}"
+        )
 
         if segments:
-            mapper = self._build_bend_mapper(view, [pts for _, pts in segments], bbox, den, steps)
+            pairs = [((p[0][0], p[0][1]), (p[1][0], p[1][1])) for _, p in segments]
+            mapper = self._fit_bend_mapping(pairs, tags, bbox, den, steps)
             if mapper is not None:
                 v_bends, h_bends = [], []
-                for seg, pts in segments:
-                    a, b = mapper(pts[0]), mapper(pts[1])
+                for (seg, _), (ra, rb) in zip(segments, pairs):
+                    a, b = mapper(ra), mapper(rb)
                     along = [(a[0] + (b[0] - a[0]) * f, a[1] + (b[1] - a[1]) * f) for f in PICK_FRACTIONS]
                     if abs(a[0] - b[0]) <= abs(a[1] - b[1]):
                         v_bends.append({"kind": "bend", "seg": seg, "coord": (a[0] + b[0]) / 2, "along": along})
@@ -751,10 +824,18 @@ class SwDrawingPdfExporter(DwgExporter):
                 h_bends = [e for e in h_bends if y0 < e["coord"] < y1]
                 n_v = n_h = 0
                 if v_bends:
-                    chain = [self._edge_entity(x0, True, bbox)] + v_bends + [self._edge_entity(x1, True, bbox)]
+                    chain = list(v_bends)
+                    if sides["left"]:
+                        chain.append({"kind": "edge", "coord": x0, "picks": sides["left"]})
+                    if sides["right"]:
+                        chain.append({"kind": "edge", "coord": x1, "picks": sides["right"]})
                     n_v = self._dimension_chain(drawing, view, chain, bbox, den, bottom_row=True)
                 if h_bends:
-                    chain = [self._edge_entity(y0, False, bbox)] + h_bends + [self._edge_entity(y1, False, bbox)]
+                    chain = list(h_bends)
+                    if sides["bottom"]:
+                        chain.append({"kind": "edge", "coord": y0, "picks": sides["bottom"]})
+                    if sides["top"]:
+                        chain.append({"kind": "edge", "coord": y1, "picks": sides["top"]})
                     n_h = self._dimension_chain(drawing, view, chain, bbox, den, bottom_row=False)
                 steps.append(
                     f"flat dimensions: chain along the bottom {n_v}/{len(v_bends) + 1 if v_bends else 0}, "
@@ -1007,15 +1088,7 @@ class SwDrawingPdfExporter(DwgExporter):
                 if bbox is not None:
                     folded_bbox[kind] = bbox
 
-            # ---- 4) native dimensions (BEFORE the table adds the bend tags) ----
-            if self.dimensions:
-                self._insert_flat_pattern_dimensions(drawing, views["flat"], flat_bbox, flat_den, steps)
-                for kind, bbox in folded_bbox.items():
-                    self._select_error = ""
-                    n = self._dimension_overall(drawing, bbox, view_den, steps, f"{kind} dimensions")
-                    steps.append(f"{kind} dimensions: {n}/2 created")
-
-            # ---- 5) bend table, bottom right above the title block ----
+            # ---- 4) bend table first: it creates the A/B/C tags that tell where the bend lines are ----
             if self.bend_table:
                 table = self._insert_bend_table(views["flat"], sheet_w, steps)
                 if table is not None:
@@ -1031,6 +1104,21 @@ class SwDrawingPdfExporter(DwgExporter):
                 else:
                     steps.append("BEND TABLE MISSING in this drawing")
 
+            # ---- 5) native dimensions (the window must show the whole sheet or picks miss their target) ----
+            self._call(drawing, "ViewZoomtofit2")
+            self._call(drawing, "GraphicsRedraw2")
+            if self.dimensions:
+                self._insert_flat_pattern_dimensions(drawing, views["flat"], flat_bbox, flat_den, steps)
+                for kind, bbox in folded_bbox.items():
+                    self._select_error = ""
+                    n = self._dimension_overall(drawing, views[kind], bbox, view_den, steps, f"{kind} dimensions")
+                    steps.append(f"{kind} dimensions: {n}/2 created")
+                try:  # leave any activated view
+                    drawing.ActivateSheet(str(self._call(sheet, "GetName") or ""))
+                except Exception:
+                    pass
+                self._clear(drawing)
+
             # ---- 6) notes: view labels, Fixed Face, QTY, frame + title block ----
             self._select_error = ""
             label_names = {"Front": "FRONT", "Top": "TOP", "Right": "RIGHT"}
@@ -1041,11 +1129,7 @@ class SwDrawingPdfExporter(DwgExporter):
                 text = f"{label_names.get(kind, kind.upper())} VIEW   SCALE {self._scale_text(view_den)}"
                 self._insert_note(drawing, text, bbox[0], VIEW_LABEL_TOP, height=0.0025)
 
-            self._insert_note(
-                drawing, "Fixed Face",
-                (flat_bbox[0] + flat_bbox[2]) / 2 - 0.008, (flat_bbox[1] + flat_bbox[3]) / 2 + 0.002,
-                height=0.0028,
-            )
+            # "Fixed Face" is written by SolidWorks itself on the flat pattern view.
 
             quantity = int(item.get("quantity", 1))
             mirror = int(item.get("mirror_quantity", 0) or 0)
