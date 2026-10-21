@@ -653,16 +653,27 @@ class SwDrawingPdfExporter(DwgExporter):
             if self.dimensions:
                 self._insert_dimensions(drawing, steps)
 
-            # ---- QTY note ----
+            # ---- part / thickness / QTY identification below the bend-table area ----
+            # Keep these as editable SolidWorks notes so they are saved in the SLDDRW
+            # and therefore also appear in the PDF exported from that same drawing.
+            quantity = int(item.get("quantity", 1))
+            mirror = int(item.get("mirror_quantity", 0) or 0)
+            qty_text = f"QTY={quantity}" + (
+                f" ({quantity - mirror} + {mirror} MIRROR)" if mirror else ""
+            )
+            part_text = f"DWG NO. / PART: {item.get('name') or path.stem}"
+            thickness = item.get("thickness")
+            thickness_text = (
+                f"THICKNESS: {float(thickness):g} mm"
+                if thickness is not None else "THICKNESS: N/A"
+            )
+            # The default SolidWorks sheet format's title block occupies the lower edge.
+            # Place identification notes in the open lower-left area, under the table zone.
+            note_x = MARGIN_LEFT + 0.004
+            self._insert_note(drawing, part_text, note_x, 0.043, steps)
+            self._insert_note(drawing, thickness_text, note_x, 0.031, steps)
             if self.qty_note:
-                quantity = int(item.get("quantity", 1))
-                mirror = int(item.get("mirror_quantity", 0) or 0)
-                text = f"QTY={quantity}" + (
-                    f" ({quantity - mirror} + {mirror} MIRROR)" if mirror else ""
-                )
-                self._insert_note(
-                    drawing, text, MARGIN_LEFT + 0.004, TITLE_BLOCK_TOP + 0.012, steps
-                )
+                self._insert_note(drawing, qty_text, note_x, 0.019, steps)
 
             # ---- save the drawing, then the PDF ----
             slddrw_path.parent.mkdir(parents=True, exist_ok=True)
