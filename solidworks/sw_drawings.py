@@ -546,7 +546,12 @@ class SwDrawingPdfExporter(DwgExporter):
         return start, end
 
     def _edge_points(self, edge):
-        """Get edge endpoints in model coordinates (straight outline edges only)."""
+        """Get finite edge endpoints in model coordinates."""
+        # Most IEdge objects expose start/end vertices.  Some SolidWorks drawing-view
+        # proxies only expose them after querying the underlying edge/curve.
+        for getter in ("GetStartVertex", "GetEndVertex"):
+            if not hasattr(edge, getter):
+                return None
         try:
             sv = edge.GetStartVertex()
             ev = edge.GetEndVertex()
@@ -556,7 +561,51 @@ class SwDrawingPdfExporter(DwgExporter):
                 return start, end
         except Exception:
             pass
+        try:
+            curve = edge.GetCurve()
+            params = curve.LineParams
+            vals = list(params) if params is not None else []
+            # LineParams are an infinite line (point + direction), not finite endpoints;
+            # don't fabricate finite edge lengths from them.
+            if len(vals) >= 6:
+                start_v = self._xyz(edge.GetStartVertex().GetPoint())
+                end_v = self._xyz(edge.GetEndVertex().GetPoint())
+                if start_v is not None and end_v is not None:
+                    return start_v, end_v
+        except Exception:
+            pass
         return None
+
+    def _visible_view_edges(self, view, steps):
+        """Query visible model edges using both part-view and component-view signatures."""
+        candidates = [None]
+        root_component = self._call(view, "RootDrawingComponent")
+        if root_component is not None:
+            candidates.append(root_component)
+        visible_components = self._call(view, "GetVisibleComponents")
+        if visible_components:
+            try:
+                candidates.extend(list(visible_components))
+            except Exception:
+                pass
+        # SolidWorks uses 1 for visible edges and 3 for silhouette edges.
+        for component in candidates:
+            for entity_type in (1, 3):
+                for method in ("GetVisibleEntities2", "GetVisibleEntities"):
+                    try:
+                        fn = getattr(view, method)
+                        result = fn(component, entity_type)
+                        if result:
+                            values = list(result)
+                            if values:
+                                steps.append(
+                                    f"flat edge query: {method}(type={entity_type}) returned {len(values)} entities"
+                                )
+                                return values
+                    except Exception:
+                        continue
+        steps.append("flat edge query: no visible edge entities returned by SolidWorks API")
+        return []
 
     def _model_to_sheet(self, view, point):
         """Map a model point into sheet coordinates, accounting for view orientation/scale."""
@@ -612,15 +661,14 @@ class SwDrawingPdfExporter(DwgExporter):
             bend_lines = list(self._call(view, "GetBendLines") or [])
         except Exception:
             bend_lines = []
-        try:
-            edges = list(self._call(view, "GetVisibleEntities2", None, 1) or [])
-        except Exception:
-            edges = []
+        edges = self._visible_view_edges(view, steps)
         edge_records = []
+        edges_with_endpoints = 0
         for edge in edges:
             pts = self._edge_points(edge)
             if not pts:
                 continue
+            edges_with_endpoints += 1
             (x1, y1, z1), (x2, y2, z2) = pts
             # The outside perimeter edges used for linear dimensions must be straight.
             if abs(x2 - x1) < 1e-7 and abs(y2 - y1) > 1e-7:
@@ -629,8 +677,9 @@ class SwDrawingPdfExporter(DwgExporter):
             elif abs(y2 - y1) < 1e-7 and abs(x2 - x1) > 1e-7:
                 edge_records.append({"obj": edge, "axis": "h", "coord": (y1+y2)/2,
                                      "lo": min(x1,x2), "hi": max(x1,x2), "p1": pts[0], "p2": pts[1]})
+        steps.append(f"flat edge analysis: entities={len(edges)}, entities with endpoints={edges_with_endpoints}, straight perimeter candidates={len(edge_records)}")
         if not bend_lines or not edge_records:
-            steps.append(f"flat dimensions: skipped (bend lines={len(bend_lines)}, straight visible edges={len(edge_records)})")
+            steps.append(f"flat dimensions: skipped (bend lines={len(bend_lines)}, straight visible edges={len(edge_records)}). See flat edge query/analysis above.")
             return 0
 
         # Only consider the outermost straight edges for the overall dimensions and bend references.
