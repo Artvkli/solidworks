@@ -1,4 +1,5 @@
 import csv
+import math
 import os
 import re
 import time
@@ -14,30 +15,34 @@ from .dwg_exporter import DwgExporter
 # ---------------------------------------------------------
 SW_DOC_PART = 1
 SW_DWG_PAPER_A4_VERTICAL = 7  # swDwgPaperA4sizeVertical
-SW_IMPORT_FROM_ENTIRE_MODEL = 1  # swImportModelItemsFromEntireModel
-ANNOTATION_TYPE_CANDIDATES = (1, 2, 4, 8)  # swInsertAnnotation_e values tried until dimensions appear
+SW_DWG_PAPERS_USER_DEFINED = 12  # swDwgPapersUserDefined = custom size, NO sheet format (blank sheet)
 ANCHOR_BOTTOM_RIGHT = 4  # bend table anchor corner (bottom right)
 FIRST_BEND_TAG = "A"  # first tag shown on the flat-pattern bend lines and in the table
 
 # ---------------------------------------------------------
-# Layout (metres on the sheet)
+# Layout, copied from the reference PDF (A4 portrait, metres on the sheet)
 # ---------------------------------------------------------
-SCALE_DENOMINATORS = (
-    1, 2, 3, 4, 5, 8, 10, 15, 20, 25, 30, 40, 50, 60, 75, 100, 150, 200, 300, 500,
-)
-MARGIN_LEFT = 0.030
-MARGIN_RIGHT = 0.032  # a little more room: dimension labels of the flat pattern go to the right
-MARGIN_TOP = 0.030
-TITLE_BLOCK_TOP = 0.056  # the default sheet format's title block ends about here (CHANGE if yours differs)
-BAND_GAP = 0.004  # gap between the title block and the table / note band
-VIEW_GAP = 0.020  # free space around each view (room for dimensions)
-ROW_HEIGHT_GUESS = 0.0065  # bend table row height (matches what SolidWorks gave: 6 rows = 39 mm)
-TABLE_MARGIN_RIGHT = 0.012  # gap between the bend table and the sheet border
-TABLE_WIDTH_GUESS = 0.113  # bend table width when it cannot be read
-NOTE_LINE_HEIGHT = 0.0058  # height of one line of the info note
-NOTE_MAX_NAME = 34  # part names longer than this are cut in the note
-DIM_OFFSET = 0.008  # first dimension line distance from the flat pattern
-DIM_STEP = 0.006  # distance between stacked dimension lines
+SHEET_W, SHEET_H = 0.210, 0.297
+FRAME = (0.008, 0.008, 0.202, 0.289)  # outer frame
+TITLE_TOP = 0.027  # top of the title block
+TITLE_COLS = (0.008, 0.105, 0.140, 0.171, 0.202)  # DWG NO. | THICKNESS | SCALE | SHEET
+TABLE_BOTTOM = 0.033  # bend table: bottom right, just above the title block
+ROW_HEIGHT_GUESS = 0.0065
+TABLE_WIDTH_GUESS = 0.093
+
+VIEW_ROW_X = (0.016, 0.194)  # the Front / Top / Right row
+VIEW_ROW_Y = (0.222, 0.270)  # vertical band of the views in that row
+VIEW_LABEL_TOP = 0.216  # "FRONT VIEW  SCALE 1:x" labels, all on one line
+VIEW_CELL_GAP = 0.010
+VIEW_DIM_ROOM = 0.016  # room right of a folded view for its height dimension
+
+FLAT_X = (0.034, 0.178)  # flat pattern area (side room is for the dimensions)
+FLAT_TOP = 0.190
+FLAT_BOTTOM_ROOM = 0.020  # between the bend table and the flat pattern
+
+QTY_X, QTY_TOP = 0.0196, 0.0465
+MARGIN_GUESS = 0.0084  # a view outline is wider than its geometry by about this much on the sheet
+DIM_OFFSET = 0.008  # first dimension line distance from a view
 PICK_FRACTIONS = (0.5, 0.35, 0.65, 0.2, 0.8, 0.1, 0.9)  # where along an edge a pick is tried
 
 
@@ -60,6 +65,8 @@ class SwDrawingPdfExporter(DwgExporter):
         dimensions=True,
         view_names=("Front", "Top", "Right"),
         qty_note=True,
+        blank_sheet=True,
+        frame=True,
     ):
         super().__init__(sw_app, assembly_path=assembly_path, reconnect=reconnect)
         self.template = template
@@ -71,6 +78,8 @@ class SwDrawingPdfExporter(DwgExporter):
         self.dimensions = dimensions
         self._template_path = None
         self._select_error = ""
+        self.blank_sheet = blank_sheet
+        self.frame = frame
 
     # =====================================================
     # TEMPLATE
@@ -236,62 +245,6 @@ class SwDrawingPdfExporter(DwgExporter):
             return None
 
     # =====================================================
-    # LAYOUT
-    # =====================================================
-
-    @staticmethod
-    def pack_views(sizes, region, denominator, gap=VIEW_GAP):
-        """
-        sizes: {key: (width, height)} at 1:1.  Returns {key: (cx, cy)} at 1:denominator or None.
-        Views keep the order of `sizes` (flat pattern first, then the others); rows are filled
-        left to right and every row and the whole block are centred in the region.
-        """
-        x0, y0, x1, y1 = region
-        avail_w, avail_h = x1 - x0, y1 - y0
-
-        items = [(key, w / denominator, h / denominator) for key, (w, h) in sizes.items()]
-        if any(w > avail_w or h > avail_h for _, w, h in items):
-            return None
-
-        rows, current, current_w = [], [], 0.0
-        for item in items:
-            needed = item[1] + (gap if current else 0.0)
-            if current and current_w + needed > avail_w:
-                rows.append(current)
-                current, current_w = [item], item[1]
-            else:
-                current.append(item)
-                current_w += needed
-        if current:
-            rows.append(current)
-
-        row_heights = [max(h for _, _, h in row) for row in rows]
-        total_h = sum(row_heights) + gap * (len(rows) - 1)
-        if total_h > avail_h:
-            return None
-
-        positions = {}
-        y_top = y1 - (avail_h - total_h) / 2
-        for row, row_h in zip(rows, row_heights):
-            row_w = sum(w for _, w, _ in row) + gap * (len(row) - 1)
-            x = x0 + (avail_w - row_w) / 2
-            for key, w, h in row:
-                positions[key] = (x + w / 2, y_top - row_h / 2)
-                x += w + gap
-            y_top -= row_h + gap
-        return positions
-
-    def choose_scale(self, sizes, region):
-        for denominator in SCALE_DENOMINATORS:
-            positions = self.pack_views(sizes, region, denominator)
-            if positions is not None:
-                return denominator, positions
-        denominator = SCALE_DENOMINATORS[-1]
-        return denominator, self.pack_views(
-            sizes, (region[0], region[1], region[2], region[3] + 10), denominator
-        )
-
-    # =====================================================
     # BEND TABLE
     # =====================================================
 
@@ -346,8 +299,8 @@ class SwDrawingPdfExporter(DwgExporter):
         return values
 
     def _insert_bend_table(self, flat_view, sheet_w, steps):
-        x = sheet_w - 0.012
-        y = TITLE_BLOCK_TOP + 0.004
+        x = FRAME[2]
+        y = TABLE_BOTTOM
         template = self._find_bend_table_template()
 
         attempts = []
@@ -382,7 +335,7 @@ class SwDrawingPdfExporter(DwgExporter):
         return None
 
     def _set_bend_table_headers(self, table, steps):
-        headers = ("Tags", "Direction", "Angle", "Inner Radius")
+        headers = ("Tag", "Direction", "Angle", "Inner Radius")
         try:
             columns = int(self._get(table, "ColumnCount") or 0)
         except Exception:
@@ -413,8 +366,30 @@ class SwDrawingPdfExporter(DwgExporter):
             self._call(table, "Update")
         except Exception:
             pass
-        steps.append(f"bend table headers: {changed}/4 updated (Tags / Direction / Angle / Inner Radius)")
+        steps.append(f"bend table headers: {changed}/4 updated (Tag / Direction / Angle / Inner Radius)")
         return changed == 4
+
+    def _drop_blank_row(self, table, steps):
+        """The default bend table has an empty row under the header; the reference has none."""
+        try:
+            rows = int(self._get(table, "RowCount"))
+            columns = int(self._get(table, "ColumnCount"))
+            if rows < 3:
+                return
+            def row_text(r):
+                return "".join(str(self._call(table, "Text", r, c) or "").strip() for c in range(columns))
+            if row_text(1) or not row_text(2):
+                return
+            for args in ((1, True), (1,)):
+                try:
+                    table.DeleteRow2(*args)
+                    break
+                except Exception:
+                    continue
+            after = int(self._get(table, "RowCount"))
+            steps.append("bend table: empty row removed" if after < rows else "bend table: empty row could not be removed")
+        except Exception as exc:
+            steps.append(f"bend table: empty row not removed ({str(exc)[:50]})")
 
     def _table_size(self, table):
         rows = self._get(table, "RowCount")
@@ -453,8 +428,8 @@ class SwDrawingPdfExporter(DwgExporter):
     def _place_bend_table(self, table, sheet_w, steps):
         """Moves the table to the bottom right corner, just above the title block. Returns its height."""
         width, height = self._table_size(table)
-        x_left = sheet_w - TABLE_MARGIN_RIGHT - width
-        y_top = TITLE_BLOCK_TOP + BAND_GAP + height
+        x_left = FRAME[2] - width
+        y_top = TABLE_BOTTOM + height
 
         try:
             annotation = self._call(table, "GetAnnotation")
@@ -680,221 +655,259 @@ class SwDrawingPdfExporter(DwgExporter):
         )
         return best[2]
 
-    def _insert_flat_pattern_dimensions(self, drawing, view, bbox, denominator, steps):
+    # ---------- entities used by the chain dimensions ----------
+    @staticmethod
+    def _edge_entity(coord, vertical, bbox):
+        x0, y0, x1, y1 = bbox
+        if vertical:  # a vertical edge at x = coord
+            picks = [(coord, y0 + (y1 - y0) * f) for f in PICK_FRACTIONS]
+        else:  # a horizontal edge at y = coord
+            picks = [(x0 + (x1 - x0) * f, coord) for f in PICK_FRACTIONS]
+        return {"kind": "edge", "coord": coord, "picks": picks}
+
+    def _select_entity(self, drawing, view, ent, append):
+        if ent["kind"] == "bend":
+            if self._select_object(drawing, view, ent["seg"], append):
+                return True
+            for p in ent["along"]:
+                if self._select_at(drawing, p[0], p[1], append, kinds=("SKETCHSEGMENT", "EDGE")):
+                    return True
+            return False
+        for p in ent["picks"]:
+            if self._select_at(drawing, p[0], p[1], append, kinds=("EDGE",)):
+                return True
+        return False
+
+    def _dimension_chain(self, drawing, view, entities, bbox, den, bottom_row):
+        """edge -> bend -> bend -> ... -> edge, one dimension between every neighbouring pair."""
+        x0, y0, x1, y1 = bbox
+        made = 0
+        entities = sorted(entities, key=lambda e: e["coord"])
+        for e1, e2 in zip(entities, entities[1:]):
+            gap = e2["coord"] - e1["coord"]
+            if gap < 0.0004:
+                continue
+            self._clear(drawing)
+            if not self._select_entity(drawing, view, e1, False):
+                continue
+            if not self._select_entity(drawing, view, e2, True):
+                self._clear(drawing)
+                continue
+            mid = (e1["coord"] + e2["coord"]) / 2
+            label = (mid, y0 - DIM_OFFSET) if bottom_row else (x0 - DIM_OFFSET, mid)
+            if self._add_checked_dimension(drawing, label, gap * den):
+                made += 1
+        self._clear(drawing)
+        return made
+
+    def _dimension_overall(self, drawing, bbox, den, steps, tag):
+        """Overall length (above the view) and height (right of the view)."""
+        x0, y0, x1, y1 = bbox
+        w, h = x1 - x0, y1 - y0
+        made = 0
+        left = [(x0, y0 + h * f) for f in PICK_FRACTIONS]
+        right = [(x1, y0 + h * f) for f in PICK_FRACTIONS]
+        if self._dimension_two_picks(drawing, left, right, ((x0 + x1) / 2, y1 + DIM_OFFSET), w * den):
+            made += 1
+        else:
+            steps.append(f"{tag}: overall length not created ({self._select_error or 'no edge picked'})")
+        bottom = [(x0 + w * f, y0) for f in PICK_FRACTIONS]
+        top = [(x0 + w * f, y1) for f in PICK_FRACTIONS]
+        if self._dimension_two_picks(drawing, bottom, top, (x1 + DIM_OFFSET, (y0 + y1) / 2), h * den):
+            made += 1
+        else:
+            steps.append(f"{tag}: overall height not created ({self._select_error or 'no edge picked'})")
+        return made
+
+    def _insert_flat_pattern_dimensions(self, drawing, view, bbox, den, steps):
         """
-        Native, editable dimensions on the flat pattern, each one checked against its expected value:
-          1) overall length and width   2) every bend line -> nearest outer edge
-        bbox = true geometry bounding box on the sheet (measured before any tag/table exists).
+        Like the reference: overall length (top) and width (right) + chain dimensions
+        edge | bend | bend | edge along the bottom (vertical bend lines) and the left (horizontal bend lines).
+        Every dimension is checked against its expected value and removed if it is wrong.
         """
         self._select_error = ""
         x0, y0, x1, y1 = bbox
-        width, height = x1 - x0, y1 - y0
-        den = float(denominator)
-        created = 0
+        created = self._dimension_overall(drawing, bbox, den, steps, "flat dimensions")
 
-        left = [(x0, y0 + height * f) for f in PICK_FRACTIONS]
-        right = [(x1, y0 + height * f) for f in PICK_FRACTIONS]
-        if self._dimension_two_picks(drawing, left, right, ((x0 + x1) / 2, y1 + DIM_OFFSET), width * den):
-            created += 1
-        else:
-            steps.append(f"flat dimensions: overall length not created ({self._select_error or 'no edge picked'})")
-
-        bottom = [(x0 + width * f, y0) for f in PICK_FRACTIONS]
-        top = [(x0 + width * f, y1) for f in PICK_FRACTIONS]
-        if self._dimension_two_picks(drawing, bottom, top, (x1 + DIM_OFFSET, (y0 + y1) / 2), height * den):
-            created += 1
-        else:
-            steps.append(f"flat dimensions: overall width not created ({self._select_error or 'no edge picked'})")
-
-        bend_lines = self._get_bend_lines(view)
         segments = []
-        for seg in bend_lines:
+        for seg in self._get_bend_lines(view):
             pts = self._line_segment_points(seg)
             if pts:
                 segments.append((seg, pts))
-        steps.append(f"flat dimensions: bend lines found {len(bend_lines)}, readable {len(segments)}")
+        steps.append(f"flat dimensions: bend lines readable {len(segments)}")
 
-        bend_created = 0
         if segments:
-            mapper = self._build_bend_mapper(view, [pts for _, pts in segments], bbox, denominator, steps)
+            mapper = self._build_bend_mapper(view, [pts for _, pts in segments], bbox, den, steps)
             if mapper is not None:
-                for index, (seg, pts) in enumerate(segments):
+                v_bends, h_bends = [], []
+                for seg, pts in segments:
                     a, b = mapper(pts[0]), mapper(pts[1])
                     along = [(a[0] + (b[0] - a[0]) * f, a[1] + (b[1] - a[1]) * f) for f in PICK_FRACTIONS]
-                    level = 1 + index % 3
-                    if abs(a[0] - b[0]) <= abs(a[1] - b[1]):  # vertical bend line
-                        mx = (a[0] + b[0]) / 2
-                        ex = x0 if (mx - x0) <= (x1 - mx) else x1
-                        edge_pts = [(ex, p[1]) for p in along] + [(ex, y0 + height * f) for f in PICK_FRACTIONS]
-                        label = ((mx + ex) / 2, y1 + DIM_OFFSET + level * DIM_STEP)
-                        expected = abs(mx - ex) * den
-                    else:  # horizontal bend line
-                        my = (a[1] + b[1]) / 2
-                        ey = y0 if (my - y0) <= (y1 - my) else y1
-                        edge_pts = [(p[0], ey) for p in along] + [(x0 + width * f, ey) for f in PICK_FRACTIONS]
-                        label = (x1 + DIM_OFFSET + (level % 3) * DIM_STEP, (my + ey) / 2)
-                        expected = abs(my - ey) * den
-
-                    done = False
-                    self._clear(drawing)
-                    picked = self._select_object(drawing, view, seg, False)
-                    if not picked:
-                        for p in along:
-                            if self._select_at(drawing, p[0], p[1], False, kinds=("SKETCHSEGMENT", "EDGE")):
-                                picked = True
-                                break
-                    if picked:
-                        for q in edge_pts:
-                            if self._select_at(drawing, q[0], q[1], True, kinds=("EDGE",)):
-                                done = self._add_checked_dimension(drawing, label, expected)
-                                break
-                    self._clear(drawing)
-                    if done:
-                        bend_created += 1
-                steps.append(f"flat dimensions: bend-to-edge {bend_created}/{len(segments)} created")
-        created += bend_created
+                    if abs(a[0] - b[0]) <= abs(a[1] - b[1]):
+                        v_bends.append({"kind": "bend", "seg": seg, "coord": (a[0] + b[0]) / 2, "along": along})
+                    else:
+                        h_bends.append({"kind": "bend", "seg": seg, "coord": (a[1] + b[1]) / 2, "along": along})
+                v_bends = [e for e in v_bends if x0 < e["coord"] < x1]
+                h_bends = [e for e in h_bends if y0 < e["coord"] < y1]
+                n_v = n_h = 0
+                if v_bends:
+                    chain = [self._edge_entity(x0, True, bbox)] + v_bends + [self._edge_entity(x1, True, bbox)]
+                    n_v = self._dimension_chain(drawing, view, chain, bbox, den, bottom_row=True)
+                if h_bends:
+                    chain = [self._edge_entity(y0, False, bbox)] + h_bends + [self._edge_entity(y1, False, bbox)]
+                    n_h = self._dimension_chain(drawing, view, chain, bbox, den, bottom_row=False)
+                steps.append(
+                    f"flat dimensions: chain along the bottom {n_v}/{len(v_bends) + 1 if v_bends else 0}, "
+                    f"along the left {n_h}/{len(h_bends) + 1 if h_bends else 0}"
+                )
+                created += n_v + n_h
         if self._select_error:
             steps.append(f"flat dimensions: last problem: {self._select_error}")
         steps.append(f"flat dimensions: {created} native dimensions in total")
         return created
 
-    def _insert_dimensions(self, drawing, folded_views, steps):
-        """Model dimensions on the folded views (all views first, then view by view)."""
-        errors = []
-        for types in ANNOTATION_TYPE_CANDIDATES:
-            try:
-                result = drawing.InsertModelAnnotations3(
-                    SW_IMPORT_FROM_ENTIRE_MODEL, types, True, False, False, False
-                )
-                count = len(result) if result else 0
-                if count:
-                    steps.append(f"dimensions: {count} model items (type {types})")
-                    return count
-                errors.append(f"type {types}: none")
-            except Exception as exc:
-                errors.append(f"type {types}: {str(exc)[:60]}")
-
-        total = 0
-        for kind, view in folded_views.items():
-            name = self._view_name(view)
-            if not name:
-                continue
-            for types in ANNOTATION_TYPE_CANDIDATES:
-                try:
-                    self._clear(drawing)
-                    if not self._select_at(drawing, 0, 0, False, kinds=()):
-                        drawing.Extension.SelectByID2(
-                            name, "DRAWINGVIEW", 0.0, 0.0, 0.0, False, 0,
-                            VARIANT(pythoncom.VT_DISPATCH, None), 0,
-                        )
-                    result = drawing.InsertModelAnnotations3(
-                        SW_IMPORT_FROM_ENTIRE_MODEL, types, False, False, False, False
-                    )
-                    count = len(result) if result else 0
-                    if count:
-                        total += count
-                        steps.append(f"dimensions: {count} items in view {kind} (type {types})")
-                        break
-                except Exception as exc:
-                    errors.append(f"{kind}/{types}: {str(exc)[:40]}")
-        self._clear(drawing)
-        if not total:
-            steps.append("dimensions on folded views: none inserted (" + " | ".join(errors[:6]) + ")")
-        return total
-
     # =====================================================
-    # NOTE
+    # VIEW SCALE / TRUE GEOMETRY
     # =====================================================
 
-    def _geometry_bbox(self, drawing, sheet, view, raw_size, denominator, steps):
+    def _set_view_scale(self, view, den):
+        """Own (custom) scale for a view, independent of the sheet scale."""
+        try:
+            view.UseSheetScale = False
+        except Exception:
+            pass
+        try:
+            view.ScaleDecimal = 1.0 / float(den)
+            return True
+        except Exception:
+            pass
+        try:
+            view.ScaleRatio = self._r8_array(1.0, float(den))
+            return True
+        except Exception:
+            return False
+
+    def _geometry_bbox(self, drawing, view, raw_size, den, apply_scale, steps, tag):
         """
-        The view outline = geometry + a fixed margin on the sheet (about 8 mm, independent of the scale).
-        Two measurements (1:1 and 1:n) separate the two, giving the true flat length/width and the true
-        bounding box on the sheet.  Returns (bbox, (length, width) in metres).
+        A view outline = geometry + a fixed margin on the sheet (about 8 mm, independent of the scale).
+        Measuring at 1:1 (raw_size) and at 1:den separates the two. Returns (bbox, (length, width) in metres).
         """
         outline = self._outline(view)
         if outline is None:
             return None, None
-        n = float(denominator)
+        n = float(den)
         temp = n < 1.5
         measured_n = 2.0 if temp else n
         if temp:
-            self._call(sheet, "SetScale", 1.0, 2.0, True, True)
+            apply_scale(2.0)
             self._call(drawing, "ForceRebuild3", False)
         measured = self._outline(view)
         if temp:
-            self._call(sheet, "SetScale", 1.0, 1.0, True, True)
+            apply_scale(n)
             self._call(drawing, "ForceRebuild3", False)
             outline = self._outline(view) or outline
         if measured is None:
             return outline, raw_size
-
         k = 1.0 - 1.0 / measured_n
         length = (raw_size[0] - (measured[2] - measured[0])) / k
         width = (raw_size[1] - (measured[3] - measured[1])) / k
         if not (0 < length <= raw_size[0] and 0 < width <= raw_size[1]):
-            steps.append("flat geometry: margin calibration failed, using the raw outline")
+            steps.append(f"{tag}: margin calibration failed, using the raw outline")
             return outline, raw_size
-        margin = raw_size[0] - length
         cx, cy = (outline[0] + outline[2]) / 2, (outline[1] + outline[3]) / 2
         hw, hh = length / n / 2, width / n / 2
-        steps.append(
-            f"flat geometry: {length * 1000:.1f} x {width * 1000:.1f} mm (outline margin {margin * 1000:.1f} mm)"
-        )
+        steps.append(f"{tag}: {length * 1000:.1f} x {width * 1000:.1f} mm at 1:{n:g}")
         return (cx - hw, cy - hh, cx + hw, cy + hh), (length, width)
 
-    def _info_lines(self, item, path, flat_size):
-        name = str(item.get("name") or path.stem)
-        if len(name) > NOTE_MAX_NAME:
-            name = name[: NOTE_MAX_NAME - 2] + ".."
-        lines = [f"PART: {name}"]
+    @staticmethod
+    def _fit_denominator(raw_w, raw_h, avail_w, avail_h):
+        aw, ah = max(avail_w - MARGIN_GUESS, 0.005), max(avail_h - MARGIN_GUESS, 0.005)
+        den = max((raw_w - MARGIN_GUESS) / aw, (raw_h - MARGIN_GUESS) / ah, 1.0)
+        return math.ceil(den * 10) / 10
 
-        thickness = item.get("thickness")
-        lines.append(f"THICKNESS: {float(thickness):g} mm" if thickness is not None else "THICKNESS: N/A")
+    @staticmethod
+    def _scale_text(den):
+        return "1:" + f"{den:.2f}".rstrip("0").rstrip(".")
 
-        if self.qty_note:
-            quantity = int(item.get("quantity", 1))
-            mirror = int(item.get("mirror_quantity", 0) or 0)
-            lines.append(
-                f"QTY={quantity}" + (f" ({quantity - mirror} + {mirror} MIRROR)" if mirror else "")
-            )
+    # =====================================================
+    # NOTES / FRAME / TITLE BLOCK
+    # =====================================================
 
-        if flat_size:
-            long_side, short_side = sorted(flat_size, reverse=True)
-            lines.append(f"FLAT SIZE: {long_side * 1000:.1f} x {short_side * 1000:.1f} mm")
-        return lines
-
-    def _insert_note(self, drawing, text, x, y, steps):
+    def _insert_note(self, drawing, text, x, y, height=None, bold=False):
+        """Note with its top-left corner at (x, y). Returns True when it was created."""
         try:
             note = drawing.InsertNote(text)
             if note is None:
-                steps.append("note: InsertNote returned nothing")
                 return False
-
-            placed = False
             try:
                 note.SetTextPoint(x, y, 0.0)
-                placed = True
             except Exception:
-                pass
-            if not placed:
                 try:
-                    annotation = note.GetAnnotation()
-                    annotation.SetPosition2(x, y, 0.0)
-                    placed = True
+                    note.GetAnnotation().SetPosition2(x, y, 0.0)
                 except Exception:
                     pass
-
-            first_line = text.splitlines()[0][:25] if text else ""
-            steps.append(f"note: '{first_line}...' inserted" + ("" if placed else " (position not set)"))
+            if height or bold:
+                try:
+                    ann = note.GetAnnotation()
+                    fmt = ann.GetTextFormat(0)
+                    if height:
+                        fmt.CharHeight = float(height)
+                    fmt.Bold = bool(bold)
+                    ann.SetTextFormat(0, False, fmt)
+                except Exception:
+                    pass
             return True
         except Exception as exc:
-            steps.append(f"note: FAILED ({str(exc)[:70]})")
+            self._select_error = f"note: {str(exc)[:60]}"
             return False
+
+    def _line(self, drawing, x1, y1, x2, y2):
+        try:
+            return drawing.CreateLine2(x1, y1, 0.0, x2, y2, 0.0) is not None
+        except Exception as exc:
+            self._select_error = f"line: {str(exc)[:60]}"
+            return False
+
+    def _draw_frame_and_title(self, drawing, part_name, thickness_text, scale_text, steps):
+        fx0, fy0, fx1, fy1 = FRAME
+        lines = [
+            (fx0, fy0, fx1, fy0), (fx1, fy0, fx1, fy1), (fx1, fy1, fx0, fy1), (fx0, fy1, fx0, fy0),
+            (fx0, TITLE_TOP, fx1, TITLE_TOP),
+        ] + [(x, fy0, x, TITLE_TOP) for x in TITLE_COLS[1:-1]]
+        done = sum(1 for ln in lines if self._line(drawing, *ln))
+        labels = ("DWG NO. / PART", "THICKNESS", "SCALE", "SHEET")
+        values = (part_name, thickness_text, scale_text, "1 OF 1")
+        notes = 0
+        for i, (label, value) in enumerate(zip(labels, values)):
+            x = TITLE_COLS[i] + 0.0025
+            notes += self._insert_note(drawing, label, x, TITLE_TOP - 0.0015, height=0.0022)
+            size = 0.0045 if (i == 0 and len(value) > 24) else 0.0055
+            notes += self._insert_note(drawing, value, x, TITLE_TOP - 0.0075, height=size, bold=True)
+        steps.append(f"frame + title block: {done}/{len(lines)} lines, {notes}/8 texts")
+
+    def _set_properties(self, drawing, props, steps):
+        try:
+            manager = drawing.Extension.CustomPropertyManager("")
+            for key, value in props.items():
+                manager.Add3(key, 30, str(value), 2)  # 30 = text, 2 = replace existing
+            steps.append("custom properties: " + ", ".join(props))
+        except Exception as exc:
+            steps.append(f"custom properties: not written ({str(exc)[:50]})")
 
     # =====================================================
     # ONE PART
     # =====================================================
+
+    def _new_drawing(self, template, steps):
+        if self.blank_sheet:
+            try:
+                drawing = self.sw_app.NewDocument(template, SW_DWG_PAPERS_USER_DEFINED, SHEET_W, SHEET_H)
+                if drawing is not None:
+                    steps.append("sheet: blank custom sheet (no sheet format)")
+                    return drawing
+            except Exception as exc:
+                steps.append(f"blank sheet failed ({str(exc)[:50]}), using A4")
+        return self.sw_app.NewDocument(template, self.paper_size, 0.0, 0.0)
 
     def _build_drawing(self, item, slddrw_path, pdf_path):
         steps = []
@@ -922,7 +935,7 @@ class SwDrawingPdfExporter(DwgExporter):
 
             _, previous_config = self._activate_configuration(model, configuration)
 
-            drawing = self.sw_app.NewDocument(template, self.paper_size, 0.0, 0.0)
+            drawing = self._new_drawing(template, steps)
             if drawing is None:
                 return False, "NewDocument returned nothing", steps
             drawing_title = self._get(drawing, "GetTitle")
@@ -931,9 +944,9 @@ class SwDrawingPdfExporter(DwgExporter):
             steps.append(f"sheet: {sheet_w * 1000:.0f} x {sheet_h * 1000:.0f} mm")
             self._call(sheet, "SetScale", 1.0, 1.0, True, True)
 
-            # ---- 1) create the views at 1:1 (provisional spot) to learn their real sizes ----
+            # ---- 1) views at 1:1 to learn their sizes ----
             kinds = ["flat"] + (list(self.view_names) if self.folded_views else [])
-            views, sizes = {}, {}
+            views, raw = {}, {}
             for kind in kinds:
                 view = self._create_view(drawing, kind, path, configuration, 0.1, 0.15)
                 outline = self._outline(view) if view is not None else None
@@ -941,68 +954,117 @@ class SwDrawingPdfExporter(DwgExporter):
                     steps.append(f"view {kind}: FAILED")
                     continue
                 views[kind] = view
-                sizes[kind] = (outline[2] - outline[0], outline[3] - outline[1])
+                raw[kind] = (outline[2] - outline[0], outline[3] - outline[1])
             steps.append("views: " + ", ".join(views) if views else "views: none")
-
             if "flat" not in views:
                 return False, "flat pattern view could not be created", steps
+            folded = [k for k in views if k != "flat"]
 
-            raw_flat = sizes["flat"]  # outline at 1:1 = geometry + fixed margin
-            steps.append(f"flat view outline at 1:1: {raw_flat[0] * 1000:.1f} x {raw_flat[1] * 1000:.1f} mm")
-
-            # ---- 2) reserve the bottom band (table + note) BEFORE the table exists ----
+            # ---- 2) scales ----
             bend_count = len(self._get_bend_lines(views["flat"]))
             table_estimate = (bend_count + 3) * ROW_HEIGHT_GUESS if self.bend_table else 0.0
-            note_height = (3 + (1 if self.qty_note else 0)) * NOTE_LINE_HEIGHT
-            band_height = max(table_estimate, note_height)
-            bottom = TITLE_BLOCK_TOP + BAND_GAP + band_height + 0.010
-            region = (MARGIN_LEFT, bottom, sheet_w - MARGIN_RIGHT, sheet_h - MARGIN_TOP)
+            flat_bottom = TABLE_BOTTOM + table_estimate + FLAT_BOTTOM_ROOM
+            flat_den = self._fit_denominator(
+                raw["flat"][0], raw["flat"][1], FLAT_X[1] - FLAT_X[0], FLAT_TOP - flat_bottom
+            )
 
-            # ---- 3) scale + positions ----
-            denominator, positions = self.choose_scale(sizes, region)
-            if positions is None:
-                return False, "views do not fit on the sheet", steps
-            steps.append(f"scale: 1:{denominator}")
-            self._call(sheet, "SetScale", 1.0, float(denominator), True, True)
+            cell_w = (VIEW_ROW_X[1] - VIEW_ROW_X[0] - VIEW_CELL_GAP * 2) / 3
+            view_den = 1.0
+            for kind in folded:
+                view_den = max(view_den, self._fit_denominator(
+                    raw[kind][0], raw[kind][1], cell_w - VIEW_DIM_ROOM, VIEW_ROW_Y[1] - VIEW_ROW_Y[0]
+                ))
+            steps.append(f"scales: flat {self._scale_text(flat_den)}, folded views {self._scale_text(view_den)}")
 
-            for kind, (cx, cy) in positions.items():
-                if not self._move_view_center(views[kind], cx, cy):
-                    return False, f"could not move view {kind}", steps
+            for kind in folded:  # own scale first, so they do not follow the sheet scale
+                if not self._set_view_scale(views[kind], view_den):
+                    steps.append(f"view {kind}: custom scale could not be set")
+            self._call(sheet, "SetScale", 1.0, float(flat_den), True, True)
+
+            # ---- 3) positions ----
+            fx = (FLAT_X[0] + FLAT_X[1]) / 2
+            fy = (FLAT_TOP + flat_bottom) / 2
+            if not self._move_view_center(views["flat"], fx, fy):
+                return False, "could not move the flat view", steps
+            for i, kind in enumerate(folded):
+                cx = VIEW_ROW_X[0] + cell_w * (i + 0.5) + VIEW_CELL_GAP * i - VIEW_DIM_ROOM / 4
+                if not self._move_view_center(views[kind], cx, sum(VIEW_ROW_Y) / 2):
+                    steps.append(f"view {kind}: could not be moved")
             self._call(drawing, "ForceRebuild3", False)
 
             flat_bbox, flat_size = self._geometry_bbox(
-                drawing, sheet, views["flat"], raw_flat, denominator, steps
+                drawing, views["flat"], raw["flat"], flat_den,
+                lambda d: self._call(sheet, "SetScale", 1.0, float(d), True, True), steps, "flat geometry",
             )
             if flat_bbox is None:
                 return False, "flat view outline unavailable", steps
+            folded_bbox = {}
+            for kind in folded:
+                bbox, _ = self._geometry_bbox(
+                    drawing, views[kind], raw[kind], view_den,
+                    lambda d, v=views[kind]: self._set_view_scale(v, d), steps, f"{kind} geometry",
+                )
+                if bbox is not None:
+                    folded_bbox[kind] = bbox
 
-            # ---- 4) native dimensions on the flat pattern (BEFORE the table adds bend tags) ----
+            # ---- 4) native dimensions (BEFORE the table adds the bend tags) ----
             if self.dimensions:
-                self._insert_flat_pattern_dimensions(drawing, views["flat"], flat_bbox, denominator, steps)
-                folded = {k: v for k, v in views.items() if k != "flat"}
-                if folded:
-                    self._insert_dimensions(drawing, folded, steps)
+                self._insert_flat_pattern_dimensions(drawing, views["flat"], flat_bbox, flat_den, steps)
+                for kind, bbox in folded_bbox.items():
+                    self._select_error = ""
+                    n = self._dimension_overall(drawing, bbox, view_den, steps, f"{kind} dimensions")
+                    steps.append(f"{kind} dimensions: {n}/2 created")
 
-            # ---- 5) bend table (also creates the A/B/C... tags on the bend lines) ----
+            # ---- 5) bend table, bottom right above the title block ----
             if self.bend_table:
                 table = self._insert_bend_table(views["flat"], sheet_w, steps)
                 if table is not None:
                     self._set_bend_table_headers(table, steps)
+                    self._drop_blank_row(table, steps)
                     table_height = self._place_bend_table(table, sheet_w, steps)
                     if table_height > table_estimate + 0.003:
                         steps.append(
                             f"WARNING: table is {table_height * 1000:.0f} mm tall, only "
-                            f"{table_estimate * 1000:.0f} mm were reserved - it may touch the views"
+                            f"{table_estimate * 1000:.0f} mm were reserved - it may touch the flat pattern"
                         )
                     self._describe_table(table, steps)
                 else:
                     steps.append("BEND TABLE MISSING in this drawing")
 
-            # ---- 6) ONE info note (part / thickness / QTY / true flat size), left of the table ----
-            note_lines = self._info_lines(item, path, flat_size)
-            note_x = MARGIN_LEFT + 0.004
-            note_top = TITLE_BLOCK_TOP + BAND_GAP + len(note_lines) * NOTE_LINE_HEIGHT
-            self._insert_note(drawing, "\r\n".join(note_lines), note_x, note_top, steps)
+            # ---- 6) notes: view labels, Fixed Face, QTY, frame + title block ----
+            self._select_error = ""
+            label_names = {"Front": "FRONT", "Top": "TOP", "Right": "RIGHT"}
+            for kind in folded:
+                bbox = folded_bbox.get(kind)
+                if bbox is None:
+                    continue
+                text = f"{label_names.get(kind, kind.upper())} VIEW   SCALE {self._scale_text(view_den)}"
+                self._insert_note(drawing, text, bbox[0], VIEW_LABEL_TOP, height=0.0025)
+
+            self._insert_note(
+                drawing, "Fixed Face",
+                (flat_bbox[0] + flat_bbox[2]) / 2 - 0.008, (flat_bbox[1] + flat_bbox[3]) / 2 + 0.002,
+                height=0.0028,
+            )
+
+            quantity = int(item.get("quantity", 1))
+            mirror = int(item.get("mirror_quantity", 0) or 0)
+            qty_text = f"QTY={quantity}" + (f" ({quantity - mirror} + {mirror} MIRROR)" if mirror else "")
+            if self.qty_note:
+                self._insert_note(drawing, qty_text, QTY_X, QTY_TOP, height=0.0065)
+
+            part_name = str(item.get("name") or path.stem)
+            thickness = item.get("thickness")
+            thickness_text = f"{float(thickness):g} mm" if thickness is not None else "N/A"
+            scale_text = self._scale_text(flat_den)
+            if self.frame:
+                self._draw_frame_and_title(drawing, part_name, thickness_text, scale_text, steps)
+            self._set_properties(drawing, {
+                "DWG NO": part_name, "THICKNESS": thickness_text, "SCALE": scale_text,
+                "QTY": quantity, "SHEET": "1 OF 1",
+            }, steps)
+            if self._select_error:
+                steps.append(f"notes/lines: last problem: {self._select_error}")
 
             # ---- 7) save the drawing, then the PDF ----
             self._call(drawing, "ViewZoomtofit2")
@@ -1026,13 +1088,9 @@ class SwDrawingPdfExporter(DwgExporter):
             for attempt in (
                 lambda: drawing.SaveAs3(str(pdf_path), 0, 1 | 2),
                 lambda: drawing.Extension.SaveAs3(
-                    str(pdf_path),
-                    0,
-                    1 | 2,
-                    VARIANT(pythoncom.VT_DISPATCH, None),
-                    VARIANT(pythoncom.VT_DISPATCH, None),
-                    self._byref_i4(),
-                    self._byref_i4(),
+                    str(pdf_path), 0, 1 | 2,
+                    VARIANT(pythoncom.VT_DISPATCH, None), VARIANT(pythoncom.VT_DISPATCH, None),
+                    self._byref_i4(), self._byref_i4(),
                 ),
             ):
                 try:
