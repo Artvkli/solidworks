@@ -14,16 +14,10 @@ except ImportError:
 from solidworks.assembly import SolidWorksAssembly, find_assemblies
 from solidworks.bend_table import BendTableReader
 from solidworks.bend_table_pdf import BendTablePdfWriter, attach_flat_dxfs
+from solidworks.sw_drawings import SwDrawingPdfExporter
 from solidworks.dwg_exporter import DwgExporter
 from solidworks.thickness_dwg import ThicknessDwgBuilder
 from solidworks.sheet_metal import SheetMetalDetector
-from solidworks.sw_drawing import SwDrawingBuilder
-
-# ---- real SolidWorks drawings (.slddrw) + PDF saved FROM SolidWorks ----
-SAVE_SW_DRAWINGS = True
-SW_DRAWINGS_LIMIT = 2                    # test on the first N parts, None = all parts
-SW_SHEET_MARGINS_MM = (10, 10, 10, 50)   # left, right, top, bottom (bottom must cover your title block)
-SW_DRAWING_PROPERTIES = {}               # e.g. {"DWG NO": "{name}", "THICKNESS": "{thickness} mm", "QTY": "{quantity}"}
 
 GROUP_BY_THICKNESS = True
 REPEAT_BY_QUANTITY = False
@@ -31,7 +25,7 @@ ODA_CONVERTER_PATH = None
 PART_GAP = 20.0
 MAX_ROW_WIDTH = 6000.0
 
-# ---- test mode ----
+
 # PDF_ONLY = True  -> ONLY the bend table PDFs. No flat pattern DXF export, no merging, no DWG.
 # PDF_ONLY = False -> the normal full run (DXF/DWG as before).
 PDF_ONLY = True
@@ -49,6 +43,7 @@ FLAT_VIEW_IN_PDF = True          # draw the flat pattern, its A/B/C... bend tags
                                  # drawing (saved in output/flat_view/). Only if that is missing, the flat pattern
                                  # DXFs of an earlier run (output/*/_parts_dxf/) are used, without tags.
 BEND_TABLE_LIMIT = None          # e.g. 3 = test on the first 3 parts only, None = all parts
+NATIVE_SLDDRW_PDF = True          # create SLDDRW and export the final PDF from that same drawing
 DRAWING_TEMPLATE_PATH = None     # full path of a .drwdot file, only if it is not found automatically
 BEND_TABLE_TEMPLATE_PATH = None  # full path of a .sldbndtbt file, only if you want a specific one
 
@@ -77,6 +72,7 @@ def select_assembly(input_folder):
     print(f"Selected: {selected}")
     return selected
 
+#print
 
 def print_summary(components, unique_parts):
     parts = sum(1 for c in components if c.is_part)
@@ -239,16 +235,6 @@ def main():
                 folded_views=FOLDED_VIEWS_IN_PDF and FLAT_VIEW_IN_PDF,
             )
             reader.read_all(scan_result["sheet_metal_parts"], output_folder, limit=BEND_TABLE_LIMIT)
-            if SAVE_SW_DRAWINGS:
-                SwDrawingBuilder(
-                    reader,
-                    margins_mm=SW_SHEET_MARGINS_MM,
-                    properties=SW_DRAWING_PROPERTIES,
-                ).build_all(
-                    scan_result["sheet_metal_parts"],
-                    output_folder / "drawings",
-                    limit=SW_DRAWINGS_LIMIT,
-                )
 
             if FLAT_VIEW_IN_PDF:
                 print("\n" + "=" * 60 + "\nFLAT PATTERNS FOR THE PDF\n" + "=" * 60)
@@ -263,11 +249,47 @@ def main():
                     exporter=exporter,
                 )
 
-            BendTablePdfWriter().write_all(
-                scan_result["sheet_metal_parts"],
-                output_folder / "bend_tables_pdf",
-                combined_name=f"{assembly_path.stem}_bend_tables" if COMBINE_BEND_TABLE_PDF else None,
-            )
+            if NATIVE_SLDDRW_PDF:
+                # The native SLDDRW is the source of truth; PDF is exported from it.
+                native_exporter = SwDrawingPdfExporter(
+                    sw_app,
+                    assembly_path=assembly_path,
+                    reconnect=connect_to_solidworks,
+                    # Use the drawing template configured as default in SolidWorks.
+                    template=None,
+                    folded_views=True,
+                    bend_table=True,
+                    dimensions=True,
+                    view_names=("Front", "Top", "Right"),
+                    qty_note=True,
+                )
+                native_folder = output_folder / "bend_drawings"
+                native_folder.mkdir(parents=True, exist_ok=True)
+                native_results = {"created": [], "failed": []}
+                native_items = scan_result["sheet_metal_parts"]
+                if BEND_TABLE_LIMIT:
+                    native_items = native_items[:int(BEND_TABLE_LIMIT)]
+                for index, item in enumerate(native_items, 1):
+                    safe_stem = native_exporter._safe_name(item.get("name") or Path(item["path"]).stem)
+                    slddrw_path = native_folder / f"{safe_stem}.SLDDRW"
+                    pdf_path = native_folder / f"{safe_stem}.PDF"
+                    ok, message, steps = native_exporter.export_part(item, slddrw_path, pdf_path)
+                    record = {"part": item.get("name"), "message": message, "steps": steps}
+                    if ok:
+                        record.update({"slddrw": str(slddrw_path), "pdf": str(pdf_path), "quantity": item.get("quantity", 1)})
+                        native_results["created"].append(record)
+                        print(f"[{index}/{len(native_items)}] Native SLDDRW + PDF: {item.get('name')}")
+                    else:
+                        native_results["failed"].append(record)
+                        print(f"[{index}/{len(native_items)}] Native drawing failed: {item.get('name')} -> {message}")
+                result_path = native_folder / "native_drawing_summary.json"
+                result_path.write_text(json.dumps(native_results, ensure_ascii=False, indent=2), encoding="utf-8")
+            else:
+                BendTablePdfWriter().write_all(
+                    scan_result["sheet_metal_parts"],
+                    output_folder / "bend_tables_pdf",
+                    combined_name=f"{assembly_path.stem}_bend_tables" if COMBINE_BEND_TABLE_PDF else None,
+                )
         except Exception as exc:
             print(f"\nBEND TABLES FAILED (continuing without them): {type(exc).__name__}: {exc}")
             traceback.print_exc()
