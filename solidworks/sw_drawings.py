@@ -523,6 +523,193 @@ class SwDrawingPdfExporter(DwgExporter):
                 cells.append("" if value is None else str(value).strip())
             steps.append("    " + " | ".join(cells))
 
+    @staticmethod
+    def _xyz(value):
+        """Read a SolidWorks point/array into an XYZ tuple."""
+        if value is None:
+            return None
+        try:
+            if hasattr(value, "X"):
+                return (float(value.X), float(value.Y), float(value.Z))
+            values = list(value)
+            if len(values) >= 3:
+                return (float(values[0]), float(values[1]), float(values[2]))
+        except Exception:
+            pass
+        return None
+
+    def _line_segment_points(self, segment):
+        start = self._xyz(self._call(segment, "GetStartPoint2"))
+        end = self._xyz(self._call(segment, "GetEndPoint2"))
+        if start is None or end is None:
+            return None
+        return start, end
+
+    def _edge_points(self, edge):
+        """Get edge endpoints in model coordinates (straight outline edges only)."""
+        try:
+            sv = edge.GetStartVertex()
+            ev = edge.GetEndVertex()
+            start = self._xyz(sv.GetPoint() if sv is not None else None)
+            end = self._xyz(ev.GetPoint() if ev is not None else None)
+            if start is not None and end is not None:
+                return start, end
+        except Exception:
+            pass
+        return None
+
+    def _model_to_sheet(self, view, point):
+        """Map a model point into sheet coordinates, accounting for view orientation/scale."""
+        x, y, z = point
+        try:
+            math_util = self.sw_app.GetMathUtility()
+            math_point = math_util.CreatePoint(self._r8_array(x, y, z))
+            transform = self._get(view, "ModelToViewTransform")
+            if transform is not None:
+                math_point = math_point.MultiplyTransform(transform)
+                arr = self._get(math_point, "ArrayData")
+                xyz = self._xyz(arr)
+                if xyz is not None:
+                    # ModelToViewTransform is view-relative; Position locates the view on the sheet.
+                    pos = self._position(view) or (0.0, 0.0)
+                    return xyz[0] + pos[0], xyz[1] + pos[1], xyz[2]
+        except Exception:
+            pass
+        return None
+
+    def _select_for_dimension(self, drawing, view, first, second, x, y):
+        """Create a native, editable SolidWorks display dimension between selected entities."""
+        try:
+            drawing.ClearSelection2(True)
+            sel_mgr = self._call(drawing, "SelectionManager")
+            sel_data = self._call(sel_mgr, "CreateSelectData") if sel_mgr is not None else None
+            if sel_data is None:
+                return False
+            sel_data.View = view
+            if not self._call(first, "Select4", False, sel_data, default=False):
+                return False
+            if not self._call(second, "Select4", True, sel_data, default=False):
+                drawing.ClearSelection2(True)
+                return False
+            dim = drawing.AddDimension2(float(x), float(y), 0.0)
+            drawing.ClearSelection2(True)
+            return dim is not None
+        except Exception:
+            try:
+                drawing.ClearSelection2(True)
+            except Exception:
+                pass
+            return False
+
+    def _insert_flat_pattern_dimensions(self, drawing, view, steps):
+        """Dimension overall extents and every bend line to its nearest outside edge.
+
+        Bend lines are selected as SolidWorks sketch segments from IView.GetBendLines;
+        the outside references are visible model edges. Dimensions are native display
+        dimensions saved in the SLDDRW, so the PDF exported from this drawing includes them.
+        """
+        try:
+            bend_lines = list(self._call(view, "GetBendLines") or [])
+        except Exception:
+            bend_lines = []
+        try:
+            edges = list(self._call(view, "GetVisibleEntities2", None, 1) or [])
+        except Exception:
+            edges = []
+        edge_records = []
+        for edge in edges:
+            pts = self._edge_points(edge)
+            if not pts:
+                continue
+            (x1, y1, z1), (x2, y2, z2) = pts
+            # The outside perimeter edges used for linear dimensions must be straight.
+            if abs(x2 - x1) < 1e-7 and abs(y2 - y1) > 1e-7:
+                edge_records.append({"obj": edge, "axis": "v", "coord": (x1+x2)/2,
+                                     "lo": min(y1,y2), "hi": max(y1,y2), "p1": pts[0], "p2": pts[1]})
+            elif abs(y2 - y1) < 1e-7 and abs(x2 - x1) > 1e-7:
+                edge_records.append({"obj": edge, "axis": "h", "coord": (y1+y2)/2,
+                                     "lo": min(x1,x2), "hi": max(x1,x2), "p1": pts[0], "p2": pts[1]})
+        if not bend_lines or not edge_records:
+            steps.append(f"flat dimensions: skipped (bend lines={len(bend_lines)}, straight visible edges={len(edge_records)})")
+            return 0
+
+        # Only consider the outermost straight edges for the overall dimensions and bend references.
+        min_x = min(min(r["p1"][0], r["p2"][0]) for r in edge_records)
+        max_x = max(max(r["p1"][0], r["p2"][0]) for r in edge_records)
+        min_y = min(min(r["p1"][1], r["p2"][1]) for r in edge_records)
+        max_y = max(max(r["p1"][1], r["p2"][1]) for r in edge_records)
+        span_x = max_x - min_x
+        span_y = max_y - min_y
+        tol = max(span_x, span_y, 1.0) * 1e-5
+        outer_v = [r for r in edge_records if r["axis"] == "v" and
+                   (abs(r["coord"]-min_x) <= tol or abs(r["coord"]-max_x) <= tol)]
+        outer_h = [r for r in edge_records if r["axis"] == "h" and
+                   (abs(r["coord"]-min_y) <= tol or abs(r["coord"]-max_y) <= tol)]
+        created = 0
+
+        # Overall length and width, using the longest edge at each outer extreme.
+        def longest(records, coord):
+            matches = [r for r in records if abs(r["coord"]-coord) <= tol]
+            return max(matches, key=lambda r: r["hi"]-r["lo"]) if matches else None
+        left, right = longest(outer_v, min_x), longest(outer_v, max_x)
+        bottom, top = longest(outer_h, min_y), longest(outer_h, max_y)
+        # Use transformed points to position dimensions outside the flat-pattern view.
+        view_outline = self._outline(view) or (0.0, 0.0, 0.1, 0.1)
+        overall_specs = []
+        if left and right:
+            p_left = self._model_to_sheet(view, ((min_x), (min_y+max_y)/2, 0.0))
+            p_right = self._model_to_sheet(view, ((max_x), (min_y+max_y)/2, 0.0))
+            if p_left and p_right:
+                overall_specs.append((left["obj"], right["obj"], (view_outline[0]+view_outline[2])/2,
+                                      view_outline[3]+0.010))
+        if bottom and top:
+            overall_specs.append((bottom["obj"], top["obj"], view_outline[2]+0.010,
+                                  (view_outline[1]+view_outline[3])/2))
+        for first, second, x, y in overall_specs:
+            if self._select_for_dimension(drawing, view, first, second, x, y):
+                created += 1
+
+        # Each bend line is dimensioned to the nearest outside edge parallel to it.
+        # Distribute dimension text along the orthogonal direction to reduce overlap.
+        for index, segment in enumerate(bend_lines):
+            points = self._line_segment_points(segment)
+            if not points:
+                continue
+            (x1, y1, z1), (x2, y2, z2) = points
+            vertical = abs(x2-x1) <= abs(y2-y1)
+            if vertical:
+                coord = (x1+x2)/2
+                candidates = [r for r in outer_v if r["lo"] <= max(y1,y2)+tol and r["hi"] >= min(y1,y2)-tol]
+                if not candidates:
+                    candidates = outer_v
+                if not candidates:
+                    continue
+                edge_rec = min(candidates, key=lambda r: abs(r["coord"]-coord))
+                # Position dimension label near this bend's midpoint; the API creates a true horizontal dimension.
+                mid = self._model_to_sheet(view, ((x1+x2)/2, (y1+y2)/2, (z1+z2)/2))
+                if mid is None:
+                    continue
+                x_dim = (mid[0] + (self._model_to_sheet(view, (edge_rec["coord"], (y1+y2)/2, (z1+z2)/2)) or mid)[0]) / 2
+                y_dim = mid[1] + ((index % 3) - 1) * 0.006
+            else:
+                coord = (y1+y2)/2
+                candidates = [r for r in outer_h if r["lo"] <= max(x1,x2)+tol and r["hi"] >= min(x1,x2)-tol]
+                if not candidates:
+                    candidates = outer_h
+                if not candidates:
+                    continue
+                edge_rec = min(candidates, key=lambda r: abs(r["coord"]-coord))
+                mid = self._model_to_sheet(view, ((x1+x2)/2, (y1+y2)/2, (z1+z2)/2))
+                if mid is None:
+                    continue
+                edge_mid = self._model_to_sheet(view, ((x1+x2)/2, edge_rec["coord"], (z1+z2)/2))
+                x_dim = mid[0] + ((index % 3) - 1) * 0.006
+                y_dim = (mid[1] + (edge_mid or mid)[1]) / 2
+            if self._select_for_dimension(drawing, view, segment, edge_rec["obj"], x_dim, y_dim):
+                created += 1
+        steps.append(f"flat dimensions: {created} native dimensions created (overall + bend-to-nearest-edge attempted for {len(bend_lines)} bend lines)")
+        return created
+
     def _insert_dimensions(self, drawing, steps):
         errors = []
         for types in ANNOTATION_TYPE_CANDIDATES:
@@ -649,8 +836,11 @@ class SwDrawingPdfExporter(DwgExporter):
                 if not self._move_view_center(views[kind], cx, cy):
                     return False, f"could not move view {kind}", steps
 
-            # ---- dimensions from the model ----
+            # ---- native dimensions on the flat pattern ----
             if self.dimensions:
+                flat_count = self._insert_flat_pattern_dimensions(drawing, views["flat"], steps)
+                # Keep the legacy model-dimension import as a fallback/additional source,
+                # but do not let it replace the requested bend-to-edge dimensions.
                 self._insert_dimensions(drawing, steps)
 
             # ---- part / thickness / QTY identification below the bend-table area ----
