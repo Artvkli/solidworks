@@ -14,7 +14,7 @@ except ImportError:
 from solidworks.assembly import SolidWorksAssembly, find_assemblies
 from solidworks.bend_table import BendTableReader
 from solidworks.bend_table_pdf import BendTablePdfWriter, attach_flat_dxfs
-from solidworks.sw_drawings import SwDrawingPdfExporter
+from solidworks.sw_drawings import SwDrawingBuilder
 from solidworks.dwg_exporter import DwgExporter
 from solidworks.thickness_dwg import ThicknessDwgBuilder
 from solidworks.sheet_metal import SheetMetalDetector
@@ -24,7 +24,11 @@ REPEAT_BY_QUANTITY = False
 ODA_CONVERTER_PATH = None
 PART_GAP = 20.0
 MAX_ROW_WIDTH = 6000.0
-
+# ---- real SolidWorks drawings (.slddrw) + PDF saved FROM SolidWorks ----
+SAVE_SW_DRAWINGS = True
+SW_DRAWINGS_LIMIT = 2                    # test on the first N parts, None = all parts
+SW_SHEET_MARGINS_MM = (10, 10, 10, 50)   # left, right, top, bottom (bottom must cover your title block)
+SW_DRAWING_PROPERTIES = {}               # e.g. {"DWG NO": "{name}", "THICKNESS": "{thickness} mm", "QTY": "{quantity}"}    
 
 # PDF_ONLY = True  -> ONLY the bend table PDFs. No flat pattern DXF export, no merging, no DWG.
 # PDF_ONLY = False -> the normal full run (DXF/DWG as before).
@@ -235,6 +239,16 @@ def main():
                 folded_views=FOLDED_VIEWS_IN_PDF and FLAT_VIEW_IN_PDF,
             )
             reader.read_all(scan_result["sheet_metal_parts"], output_folder, limit=BEND_TABLE_LIMIT)
+            if SAVE_SW_DRAWINGS:
+                SwDrawingBuilder(
+                    reader,
+                    margins_mm=SW_SHEET_MARGINS_MM,
+                    properties=SW_DRAWING_PROPERTIES,
+                ).build_all(
+                    scan_result["sheet_metal_parts"],
+                    output_folder / "drawings",
+                    limit=SW_DRAWINGS_LIMIT,
+                )
 
             if FLAT_VIEW_IN_PDF:
                 print("\n" + "=" * 60 + "\nFLAT PATTERNS FOR THE PDF\n" + "=" * 60)
