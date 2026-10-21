@@ -546,32 +546,41 @@ class SwDrawingPdfExporter(DwgExporter):
         return start, end
 
     def _edge_points(self, edge):
-        """Get finite edge endpoints in model coordinates."""
-        # Most IEdge objects expose start/end vertices.  Some SolidWorks drawing-view
-        # proxies only expose them after querying the underlying edge/curve.
-        for getter in ("GetStartVertex", "GetEndVertex"):
-            if not hasattr(edge, getter):
-                return None
+        """Get finite edge endpoints in model coordinates.
+
+        Do not use ``hasattr`` on late-bound SolidWorks COM dispatch objects: pywin32
+        can report false for valid IEdge methods until they are invoked.  The previous
+        guard therefore discarded every visible edge before trying GetStartVertex.
+        """
         try:
-            sv = edge.GetStartVertex()
-            ev = edge.GetEndVertex()
-            start = self._xyz(sv.GetPoint() if sv is not None else None)
-            end = self._xyz(ev.GetPoint() if ev is not None else None)
+            sv = self._call(edge, "GetStartVertex")
+            ev = self._call(edge, "GetEndVertex")
+            start = self._xyz(self._call(sv, "GetPoint")) if sv is not None else None
+            end = self._xyz(self._call(ev, "GetPoint")) if ev is not None else None
             if start is not None and end is not None:
                 return start, end
         except Exception:
             pass
+
+        # Some SolidWorks versions expose the edge endpoints through the curve's
+        # parameter data instead of a usable IVertex proxy.  Only accept finite
+        # endpoints when the API actually returns them; a line's direction vector
+        # alone is not enough to infer the visible segment length.
         try:
-            curve = edge.GetCurve()
-            params = curve.LineParams
+            curve = self._call(edge, "GetCurve")
+            params = self._call(edge, "GetCurveParams3")
+            if params is None:
+                params = self._call(edge, "GetCurveParams2")
             vals = list(params) if params is not None else []
-            # LineParams are an infinite line (point + direction), not finite endpoints;
-            # don't fabricate finite edge lengths from them.
-            if len(vals) >= 6:
-                start_v = self._xyz(edge.GetStartVertex().GetPoint())
-                end_v = self._xyz(edge.GetEndVertex().GetPoint())
-                if start_v is not None and end_v is not None:
-                    return start_v, end_v
+            # Curve parameter arrays vary by SolidWorks version. The first six values
+            # are not consistently endpoints, so only use explicit vertex fallbacks.
+            if curve is not None and len(vals) >= 6:
+                sv = self._call(edge, "GetStartVertex")
+                ev = self._call(edge, "GetEndVertex")
+                start = self._xyz(self._call(sv, "GetPoint")) if sv is not None else None
+                end = self._xyz(self._call(ev, "GetPoint")) if ev is not None else None
+                if start is not None and end is not None:
+                    return start, end
         except Exception:
             pass
         return None
