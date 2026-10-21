@@ -22,6 +22,7 @@ ANNOTATION_TYPE_CANDIDATES = (
     8,
 )  # swInsertAnnotation_e values tried until dimensions appear
 ANCHOR_BOTTOM_RIGHT = 4  # bend table anchor corner (bottom right)
+FIRST_BEND_TAG = "A"  # first tag shown on the flat-pattern bend lines and in the table
 
 # ---------------------------------------------------------
 # Layout (metres on the sheet)
@@ -350,6 +351,8 @@ class SwDrawingPdfExporter(DwgExporter):
                 values.append(ANCHOR_BOTTOM_RIGHT)
             elif "template" in key:
                 values.append(template)
+            elif "startvalue" in key or "starttag" in key or "firsttag" in key:
+                values.append(FIRST_BEND_TAG)
             elif vt == 11:  # VT_BOOL
                 values.append(False)
             elif vt == 5:  # VT_R8
@@ -377,10 +380,19 @@ class SwDrawingPdfExporter(DwgExporter):
         else:
             steps.append("bend table signature: could not be read from SolidWorks")
 
+        # SolidWorks' common API signature is:
+        # InsertBendTable(UseAnchorPoint, X, Y, AnchorType, StartValue, TableTemplate)
+        # StartValue controls the A/B/C... tags attached to the bend lines. Keep the
+        # six-argument forms first so the table and bend-line tags share the same sequence.
         attempts += [
             lambda: flat_view.InsertBendTable(
-                False, x, y, ANCHOR_BOTTOM_RIGHT, template
+                False, x, y, ANCHOR_BOTTOM_RIGHT, FIRST_BEND_TAG, template
             ),
+            lambda: flat_view.InsertBendTable(
+                False, x, y, ANCHOR_BOTTOM_RIGHT, FIRST_BEND_TAG, ""
+            ),
+            # Compatibility fallbacks for SolidWorks versions exposing a shorter signature.
+            lambda: flat_view.InsertBendTable(False, x, y, ANCHOR_BOTTOM_RIGHT, template),
             lambda: flat_view.InsertBendTable(False, x, y, ANCHOR_BOTTOM_RIGHT, ""),
             lambda: flat_view.InsertBendTable(False, ANCHOR_BOTTOM_RIGHT, template),
             lambda: flat_view.InsertBendTable(False, ANCHOR_BOTTOM_RIGHT, ""),
@@ -390,7 +402,10 @@ class SwDrawingPdfExporter(DwgExporter):
             try:
                 table = attempt()
                 if table is not None:
-                    steps.append(f"bend table: inserted (variant {number})")
+                    steps.append(f"bend table: inserted (variant {number}; first bend tag={FIRST_BEND_TAG})")
+                    # SolidWorks creates the bend-tag annotations on the associated flat
+                    # pattern when a native bend table is inserted. They remain editable
+                    # in the SLDDRW and are included when that same drawing is exported to PDF.
                     return table
                 errors.append(f"v{number}: returned nothing")
             except Exception as exc:
