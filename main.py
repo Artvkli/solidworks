@@ -264,6 +264,8 @@ def main():
                     # Use the default SolidWorks drawing template
                     template=str(drawing_template_path),
 
+                    bottom_margin=0.075,
+
                     folded_views=True,
                     bend_table=True,
                     dimensions=True,

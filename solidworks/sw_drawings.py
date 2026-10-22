@@ -73,6 +73,7 @@ class SwDrawingPdfExporter(DwgExporter):
         sheet_format=None,  # Custom .slddrt sheet format
         sheet_width=None,
         sheet_height=None, 
+        table_corner="top_right",
         **legacy_options,
     ):
         super().__init__(
@@ -92,6 +93,7 @@ class SwDrawingPdfExporter(DwgExporter):
         self.bottom_margin = bottom_margin
         self.sheet_width = sheet_width
         self.sheet_height = sheet_height
+        self.table_corner = table_corner
 
         # Custom SolidWorks sheet format (.slddrt)
         # Custom SolidWorks sheet format (.slddrt)
@@ -534,10 +536,14 @@ class SwDrawingPdfExporter(DwgExporter):
         return width, height
 
     def _place_bend_table(self, table, x_right, y_bottom, steps):
-        """Moves the table to the bottom right corner, above the title block. Returns its height."""
         width, height = self._table_size(table)
+        if self.table_corner == "top_right":
+            sheet_h = self._sheet_size_cache[1]
+            y_top = sheet_h - TOP_MARGIN
+        else:
+            y_top = y_bottom + height
         x_left = x_right - width
-        y_top = y_bottom + height
+
 
         try:
             annotation = self._call(table, "GetAnnotation")
@@ -1306,6 +1312,7 @@ class SwDrawingPdfExporter(DwgExporter):
                 steps.append("WARNING: custom sheet format NOT applied, continuing with the default template")
 
             sheet, sheet_w, sheet_h = self._sheet_size(drawing)
+            self._sheet_size_cache = (sheet_w, sheet_h)
 
             steps.append(f"sheet: {sheet_w * 1000:.0f} x {sheet_h * 1000:.0f} mm (from the default template)")
             self._call(sheet, "SetScale", 1.0, 1.0, True, True)
@@ -1322,17 +1329,19 @@ class SwDrawingPdfExporter(DwgExporter):
             # ---- 2) layout and scale ----
             bend_count = len(self._get_bend_lines(flat))
             table_estimate = (bend_count + 3) * ROW_HEIGHT_GUESS if self.bend_table else 0.0
-            table_bottom = self.bottom_margin
-            table_right = sheet_w - SIDE_MARGIN
+            table_right = sheet_w - SIDE_MARGIN - 0.005
 
             area_x0 = SIDE_MARGIN + FLAT_DIM_ROOM
             area_x1 = sheet_w - SIDE_MARGIN - FLAT_DIM_ROOM
-            area_top = sheet_h - TOP_MARGIN - FLAT_DIM_ROOM
-            area_bottom = table_bottom + table_estimate + FLAT_BOTTOM_ROOM
 
-            flat_den = self._fit_denominator(raw_w, raw_h, area_x1 - area_x0, area_top - area_bottom)
-            steps.append(f"scale: flat pattern {self._scale_text(flat_den)}")
-            self._call(sheet, "SetScale", 1.0, float(flat_den), True, True)
+            if self.table_corner == "top_right":
+                table_bottom = sheet_h - TOP_MARGIN - table_estimate      # جدول بالا
+                area_top = table_bottom - FLAT_BOTTOM_ROOM
+                area_bottom = self.bottom_margin + FLAT_DIM_ROOM          # فلت پترن بالای تایتل‌بلاک
+            else:
+                table_bottom = self.bottom_margin
+                area_top = sheet_h - TOP_MARGIN - FLAT_DIM_ROOM
+                area_bottom = table_bottom + table_estimate + FLAT_BOTTOM_ROOM
 
             # ---- 3) position ----
             fx = (area_x0 + area_x1) / 2
