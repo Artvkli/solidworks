@@ -16,36 +16,23 @@ from .dwg_exporter import DwgExporter
 SW_DOC_DRAWING = 3
 SW_OPEN_SILENT = 1
 SW_OPEN_READONLY = 2
-SW_DWG_PAPER_A4_VERTICAL = 7  # swDwgPaperA4sizeVertical
-SW_DWG_PAPERS_USER_DEFINED = 12  # swDwgPapersUserDefined = custom size, NO sheet format (blank sheet)
 SW_NOTE_TYPE = 6  # swNote
 ANCHOR_BOTTOM_RIGHT = 4  # bend table anchor corner (bottom right)
 FIRST_BEND_TAG = "A"  # first tag shown on the flat-pattern bend lines and in the table
 NO_OPTION_SPECIFIED = 0
-TITLE_NOTE_COUNT = 8  # 4 labels + 4 values in the title block
 
 # ---------------------------------------------------------
-# Layout, copied from the reference PDF (A4 portrait, metres on the sheet)
+# Layout (sheet metres). The sheet itself (size, frame, title block)
+# comes from the DEFAULT SolidWorks drawing template, so everything below
+# is relative to the real sheet size read from the template.
 # ---------------------------------------------------------
-SHEET_W, SHEET_H = 0.210, 0.297
-FRAME = (0.008, 0.008, 0.202, 0.289)  # outer frame
-TITLE_TOP = 0.027  # top of the title block
-TITLE_COLS = (0.008, 0.105, 0.140, 0.171, 0.202)  # DWG NO. | THICKNESS | SCALE | SHEET
-TABLE_BOTTOM = 0.033  # bend table: bottom right, just above the title block
+SIDE_MARGIN = 0.025  # free space left/right of the frame
+TOP_MARGIN = 0.025  # free space at the top
+BOTTOM_MARGIN = 0.040  # room reserved for the template's title block (bend table sits above it)
+FLAT_DIM_ROOM = 0.025  # room left/right/top of the flat pattern for its dimensions
+FLAT_BOTTOM_ROOM = 0.020  # between the bend table and the flat pattern (chain dimensions)
 ROW_HEIGHT_GUESS = 0.0065
 TABLE_WIDTH_GUESS = 0.093
-
-VIEW_ROW_X = (0.016, 0.194)  # the Front / Top / Right row
-VIEW_ROW_Y = (0.222, 0.270)  # vertical band of the views in that row
-VIEW_LABEL_TOP = 0.216  # "FRONT VIEW  SCALE 1:x" labels, all on one line
-VIEW_CELL_GAP = 0.010
-VIEW_DIM_ROOM = 0.016  # room right of a folded view for its height dimension
-
-FLAT_X = (0.034, 0.178)  # flat pattern area (side room is for the dimensions)
-FLAT_TOP = 0.190
-FLAT_BOTTOM_ROOM = 0.020  # between the bend table and the flat pattern
-
-QTY_X, QTY_TOP = 0.0196, 0.0465
 MARGIN_GUESS = 0.0084  # a view outline is wider than its geometry by about this much on the sheet
 PICK_FRACTIONS = (0.5, 0.35, 0.65, 0.2, 0.8, 0.1, 0.9)  # where along a line a pick is tried
 
@@ -53,21 +40,18 @@ PICK_FRACTIONS = (0.5, 0.35, 0.65, 0.2, 0.8, 0.1, 0.9)  # where along a line a p
 # Dimension layout (sheet metres)
 # ---------------------------------------------------------
 DIM_OFFSET = 0.008  # first dimension line distance from the geometry
-DIM_TIER_STEP = 0.005  # second row for neighbouring small chain dimensions (text would overlap otherwise)
-EDGE_TOL = 1.5e-4  # two coordinates closer than this (0.15 mm on the sheet) are "the same line"
+DIM_TIER_STEP = 0.005  # second row for neighbouring small chain dimensions
+EDGE_TOL = 1.5e-4  # two coordinates closer than this are "the same line"
 MIN_EDGE_LEN = 5e-4  # shorter edges are not used for dimensions
 
 
 class SwDrawingPdfExporter(DwgExporter):
     """
     Creates a real SolidWorks drawing for every sheet metal part:
-    flat pattern + folded views + bend table + native (editable) dimensions + notes,
-    saves the .slddrw and exports the PDF from the saved drawing.
+    flat pattern + bend table + native (editable) flat pattern dimensions,
+    from the DEFAULT drawing template of SolidWorks.
+    Saves the .slddrw and exports the PDF from the saved drawing.
     Every optional step is best effort and logged in `steps`.
-
-    Dimensions are made from the real edges of each view (IView.GetVisibleEntities2 + Select4),
-    not from clicks at sheet coordinates, and every dimension is checked against the geometry
-    (a wrong one is deleted again).
     """
 
     def __init__(
@@ -76,48 +60,33 @@ class SwDrawingPdfExporter(DwgExporter):
         assembly_path=None,
         reconnect=None,
         template=None,
-        paper_size=SW_DWG_PAPER_A4_VERTICAL,
-        folded_views=True,
+        paper_size=None,  # None = use the sheet of the template as it is
         bend_table=True,
         dimensions=True,
-        view_names=("Front", "Top", "Right"),
-        qty_note=True,
-        blank_sheet=True,
-        frame=True,
         bend_template=None,
-        template_has_frame=False,
-        title_template_path=None,
-        auto_title_template=True,
         pdf_from_saved_file=True,
         edit_bend_table_text=True,
         dim_text_height=0.0025,
+        bottom_margin=BOTTOM_MARGIN,
+        **legacy_options,  # old arguments (folded_views, frame, ...) are accepted and ignored
     ):
         super().__init__(sw_app, assembly_path=assembly_path, reconnect=reconnect)
         self.template = template
         self.paper_size = paper_size
-        self.folded_views = folded_views
-        self.view_names = tuple(view_names)
-        self.qty_note = qty_note
         self.bend_table = bend_table
         self.dimensions = dimensions
-        self.blank_sheet = blank_sheet
-        self.frame = frame
         self.bend_template = bend_template
-        self.template_has_frame = template_has_frame  # your own .drwdot already contains frame + title block
-        self.title_template_path = title_template_path  # where the generated title block template is kept
-        self.auto_title_template = auto_title_template
         self.pdf_from_saved_file = pdf_from_saved_file
         self.edit_bend_table_text = edit_bend_table_text
         self.dim_text_height = dim_text_height
+        self.bottom_margin = bottom_margin
 
         self._template_path = None
-        self._title_template = None  # path of the usable generated template, or None
-        self._prepared = False
         self._constants_cache = None
         self._select_error = ""
 
     # =====================================================
-    # TEMPLATE
+    # TEMPLATE (default SolidWorks drawing template)
     # =====================================================
 
     def find_template(self):
@@ -139,7 +108,7 @@ class SwDrawingPdfExporter(DwgExporter):
 
         # 2) documented helper
         try:
-            value = self.sw_app.GetDocumentTemplate(3, "", self.paper_size, 0.0, 0.0)
+            value = self.sw_app.GetDocumentTemplate(3, "", 0, 0.0, 0.0)
             if value:
                 candidates.append(str(value))
         except Exception:
@@ -186,6 +155,17 @@ class SwDrawingPdfExporter(DwgExporter):
             except Exception:
                 continue
         return ""
+
+    def _new_drawing(self, template, steps):
+        """New drawing from the default template, with the sheet of the template."""
+        size = self.paper_size if self.paper_size is not None else 0
+        try:
+            drawing = self.sw_app.NewDocument(template, size, 0.0, 0.0)
+            if drawing is not None:
+                return drawing
+        except Exception as exc:
+            steps.append(f"NewDocument failed ({str(exc)[:60]})")
+        return None
 
     # =====================================================
     # SOLIDWORKS CONSTANTS / UNITS
@@ -273,7 +253,7 @@ class SwDrawingPdfExporter(DwgExporter):
                 return sheet, width, height
         except Exception:
             pass
-        return sheet, 0.210, 0.297
+        return sheet, 0.297, 0.210
 
     def _outline(self, view):
         values = self._call(view, "GetOutline")
@@ -289,16 +269,6 @@ class SwDrawingPdfExporter(DwgExporter):
             return float(values[0]), float(values[1])
         except Exception:
             return None
-
-    def _view_name(self, view):
-        for getter in (lambda: view.GetName2(), lambda: view.Name):
-            try:
-                value = getter()
-                if value:
-                    return str(value)
-            except Exception:
-                continue
-        return None
 
     def _move_view_center(self, view, cx, cy):
         outline = self._outline(view)
@@ -327,28 +297,20 @@ class SwDrawingPdfExporter(DwgExporter):
             and abs((after[1] + after[3]) / 2 - cy) < 0.002
         )
 
-    def _create_view(self, drawing, kind, model_path, configuration, x, y):
+    def _create_flat_view(self, drawing, model_path, configuration, x, y):
         try:
-            if kind == "flat":
-                view = drawing.CreateFlatPatternViewFromModelView3(
-                    str(model_path), str(configuration or ""), x, y, 0.0, False, False
-                )
-                if view is not None:
-                    return view
-                return drawing.CreateDrawViewFromModelView3(
-                    str(model_path), "*Flat pattern", x, y, 0.0
-                )
+            view = drawing.CreateFlatPatternViewFromModelView3(
+                str(model_path), str(configuration or ""), x, y, 0.0, False, False
+            )
+            if view is not None:
+                return view
+        except Exception:
+            pass
+        try:
             return drawing.CreateDrawViewFromModelView3(
-                str(model_path), f"*{kind}", x, y, 0.0
+                str(model_path), "*Flat pattern", x, y, 0.0
             )
         except Exception:
-            if kind == "flat":
-                try:
-                    return drawing.CreateDrawViewFromModelView3(
-                        str(model_path), "*Flat pattern", x, y, 0.0
-                    )
-                except Exception:
-                    return None
             return None
 
     def _close_doc(self, doc):
@@ -420,9 +382,7 @@ class SwDrawingPdfExporter(DwgExporter):
                 values.append(0)
         return values
 
-    def _insert_bend_table(self, flat_view, sheet_w, steps):
-        x = FRAME[2]
-        y = TABLE_BOTTOM
+    def _insert_bend_table(self, flat_view, x, y, steps):
         template = self._find_bend_table_template()
 
         attempts = []
@@ -496,7 +456,7 @@ class SwDrawingPdfExporter(DwgExporter):
         return changed == 4
 
     def _drop_blank_row(self, table, steps):
-        """The default bend table has an empty row under the header; the reference has none."""
+        """The default bend table has an empty row under the header; remove it."""
         try:
             rows = int(self._get(table, "RowCount"))
             columns = int(self._get(table, "ColumnCount"))
@@ -553,11 +513,11 @@ class SwDrawingPdfExporter(DwgExporter):
             width = TABLE_WIDTH_GUESS
         return width, height
 
-    def _place_bend_table(self, table, sheet_w, steps):
-        """Moves the table to the bottom right corner, just above the title block. Returns its height."""
+    def _place_bend_table(self, table, x_right, y_bottom, steps):
+        """Moves the table to the bottom right corner, above the title block. Returns its height."""
         width, height = self._table_size(table)
-        x_left = FRAME[2] - width
-        y_top = TABLE_BOTTOM + height
+        x_left = x_right - width
+        y_top = y_bottom + height
 
         try:
             annotation = self._call(table, "GetAnnotation")
@@ -671,7 +631,7 @@ class SwDrawingPdfExporter(DwgExporter):
         self._clear(drawing)
 
     def _style_dimension(self, dim):
-        """No parentheses (reference dimension look) and a text height that fits small views."""
+        """No parentheses and a text height that fits small views."""
         try:
             dim.ShowParenthesis = False
         except Exception:
@@ -940,15 +900,6 @@ class SwDrawingPdfExporter(DwgExporter):
             steps.append(f"{tag}: overall height skipped (the top/bottom outline is not a straight horizontal edge)")
         return made
 
-    def _dimension_view_overall(self, drawing, view, den, steps, tag):
-        self._select_error = ""
-        geo = self._view_geometry(view, 1.0 / den, steps, tag)
-        if geo is None:
-            return 0
-        made = self._dimension_overall(drawing, view, geo, steps, tag)
-        steps.append(f"{tag}: {made}/2 created")
-        return made
-
     # =====================================================
     # BEND LINES: positions from the geometry, checked with the A/B/C tag notes
     # =====================================================
@@ -1129,7 +1080,7 @@ class SwDrawingPdfExporter(DwgExporter):
 
     def _insert_flat_pattern_dimensions(self, drawing, view, den, steps):
         """
-        Like the reference: overall length (top) and height (right) + chain dimensions
+        Overall length (top) and height (right) + chain dimensions
         edge | bend | bend | edge along the bottom (vertical bend lines) and the left (horizontal bend lines).
         Needs the bend table to exist already (its A/B/C tags are used to check where the bend lines are).
         """
@@ -1195,23 +1146,6 @@ class SwDrawingPdfExporter(DwgExporter):
     # VIEW SCALE
     # =====================================================
 
-    def _set_view_scale(self, view, den):
-        """Own (custom) scale for a view, independent of the sheet scale."""
-        try:
-            view.UseSheetScale = False
-        except Exception:
-            pass
-        try:
-            view.ScaleDecimal = 1.0 / float(den)
-            return True
-        except Exception:
-            pass
-        try:
-            view.ScaleRatio = self._r8_array(1.0, float(den))
-            return True
-        except Exception:
-            return False
-
     @staticmethod
     def _fit_denominator(raw_w, raw_h, avail_w, avail_h):
         aw, ah = max(avail_w - MARGIN_GUESS, 0.005), max(avail_h - MARGIN_GUESS, 0.005)
@@ -1221,229 +1155,6 @@ class SwDrawingPdfExporter(DwgExporter):
     @staticmethod
     def _scale_text(den):
         return "1:" + f"{den:.2f}".rstrip("0").rstrip(".")
-
-    # =====================================================
-    # NOTES / FRAME / TITLE BLOCK
-    # =====================================================
-
-    def _insert_note(self, drawing, text, x, y, height=None, bold=False):
-        """Note with its top-left corner at (x, y). Returns True when it was created."""
-        try:
-            note = drawing.InsertNote(text)
-            if note is None:
-                return False
-            try:
-                note.SetTextPoint(x, y, 0.0)
-            except Exception:
-                try:
-                    note.GetAnnotation().SetPosition2(x, y, 0.0)
-                except Exception:
-                    pass
-            if height or bold:
-                try:
-                    ann = note.GetAnnotation()
-                    fmt = ann.GetTextFormat(0)
-                    if height:
-                        fmt.CharHeight = float(height)
-                    fmt.Bold = bool(bold)
-                    ann.SetTextFormat(0, False, fmt)
-                except Exception:
-                    pass
-            return True
-        except Exception as exc:
-            self._select_error = f"note: {str(exc)[:60]}"
-            return False
-
-    def _line(self, drawing, x1, y1, x2, y2):
-        try:
-            return drawing.CreateLine2(x1, y1, 0.0, x2, y2, 0.0) is not None
-        except Exception as exc:
-            self._select_error = f"line: {str(exc)[:60]}"
-            return False
-
-    def _draw_frame_lines(self, drawing, steps):
-        """Frame + title block lines. Drawn FIRST (before any view), when the sheet is still empty."""
-        fx0, fy0, fx1, fy1 = FRAME
-        lines = [
-            (fx0, fy0, fx1, fy0), (fx1, fy0, fx1, fy1), (fx1, fy1, fx0, fy1), (fx0, fy1, fx0, fy0),
-            (fx0, TITLE_TOP, fx1, TITLE_TOP),
-        ] + [(x, fy0, x, TITLE_TOP) for x in TITLE_COLS[1:-1]]
-        done, missing = 0, []
-        for number, ln in enumerate(lines, 1):
-            ok = self._line(drawing, *ln)
-            if not ok:  # one more try (a line is sometimes refused right after another one)
-                time.sleep(0.2)
-                ok = self._line(drawing, *ln)
-            if ok:
-                done += 1
-            else:
-                missing.append(number)
-        steps.append(
-            f"frame lines: {done}/{len(lines)}" + (f" (missing line {missing}: {self._select_error})" if missing else "")
-        )
-        return not missing
-
-    def _draw_title_notes(self, drawing, values, steps):
-        """Labels and values of the title block. values = (DWG NO, THICKNESS, SCALE, SHEET) as text or $PRP links."""
-        labels = ("DWG NO. / PART", "THICKNESS", "SCALE", "SHEET")
-        notes = 0
-        for i, (label, value) in enumerate(zip(labels, values)):
-            x = TITLE_COLS[i] + 0.0025
-            notes += self._insert_note(drawing, label, x, TITLE_TOP - 0.0015, height=0.0022)
-            size = 0.0045 if (i == 0 and len(value) > 24) else 0.0055
-            notes += self._insert_note(drawing, value, x, TITLE_TOP - 0.0075, height=size, bold=True)
-        steps.append(f"title block texts: {notes}/{TITLE_NOTE_COUNT}")
-        return notes == TITLE_NOTE_COUNT
-
-    def _draw_frame_and_title(self, drawing, values, steps):
-        lines_ok = self._draw_frame_lines(drawing, steps)
-        notes_ok = self._draw_title_notes(drawing, values, steps)
-        return lines_ok and notes_ok
-
-    def _set_properties(self, drawing, props, steps):
-        try:
-            manager = drawing.Extension.CustomPropertyManager("")
-            for key, value in props.items():
-                manager.Add3(key, 30, str(value), 2)  # 30 = text, 2 = replace existing
-            steps.append("custom properties: " + ", ".join(props))
-        except Exception as exc:
-            steps.append(f"custom properties: not written ({str(exc)[:50]})")
-
-    # =====================================================
-    # TITLE BLOCK TEMPLATE (built once, linked to custom properties)
-    # =====================================================
-
-    def _sheet_note_count(self, drawing):
-        """Number of notes on the sheet itself (-1 = could not be counted)."""
-        view = self._call(drawing, "GetFirstView")  # the first "view" of a drawing is the sheet
-        if view is None:
-            return -1
-        count, guard = 0, 0
-        ann = self._call(view, "GetFirstAnnotation3")
-        while ann is not None and guard < 500:
-            guard += 1
-            try:
-                if int(ann.GetType()) == SW_NOTE_TYPE:
-                    count += 1
-            except Exception:
-                pass
-            ann = self._call(ann, "GetNext3")
-        return count
-
-    def _label_note_present(self, drawing):
-        """True if the title block label note can be picked at its place on the sheet."""
-        try:
-            self._call(drawing, "ViewZoomtofit2")
-            x = TITLE_COLS[0] + 0.0025 + 0.004
-            y = TITLE_TOP - 0.0015 - 0.0011
-            found = bool(drawing.Extension.SelectByID2(
-                "", "NOTE", float(x), float(y), 0.0, False, 0, VARIANT(pythoncom.VT_DISPATCH, None), 0
-            ))
-            self._clear(drawing)
-            return found
-        except Exception:
-            return False
-
-    def _build_title_template(self, path, steps):
-        """Blank A4 portrait, millimetres, frame + title block whose texts are $PRP links. Saved as .drwdot."""
-        base = self.find_template()
-        if not base:
-            steps.append("no base template found")
-            return False
-        drawing = None
-        try:
-            drawing = self.sw_app.NewDocument(base, SW_DWG_PAPERS_USER_DEFINED, SHEET_W, SHEET_H)
-            if drawing is None:
-                steps.append("NewDocument returned nothing")
-                return False
-            self._ensure_millimeters(drawing, steps)
-            self._select_error = ""
-            values = ('$PRP:"DWG NO"', '$PRP:"THICKNESS"', '$PRP:"SCALE"', '$PRP:"SHEET"')
-            if not self._draw_frame_and_title(drawing, values, steps):
-                steps.append(f"frame incomplete ({self._select_error}) - template not saved")
-                return False
-            path.parent.mkdir(parents=True, exist_ok=True)
-            if path.exists():
-                path.unlink()
-            drawing.SaveAs3(str(path), 0, 1)
-            ok = self._written(path)
-            steps.append(f"saved {path.name}" if ok else "template file was not written")
-            return ok
-        except Exception as exc:
-            steps.append(f"failed: {type(exc).__name__}: {str(exc)[:80]}")
-            return False
-        finally:
-            self._close_doc(drawing)
-
-    def _prepare_once(self, steps):
-        if self._prepared:
-            return
-        self._prepared = True
-
-        if self.template_has_frame:
-            steps.append("title block: your template already contains it")
-            return
-        if not (self.auto_title_template and self.title_template_path):
-            return
-
-        path = Path(self.title_template_path)
-        if path.exists():
-            self._title_template = str(path)
-            steps.append(f"title block template: {path.name}")
-            return
-
-        build_steps = []
-        ok = self._build_title_template(path, build_steps)
-        steps.extend("title block template: " + s for s in build_steps)
-        if ok:
-            self._title_template = str(path)
-        else:
-            steps.append("title block template could not be built - the frame is drawn by code")
-
-    def _try_new(self, template, steps):
-        if self.blank_sheet:
-            try:
-                drawing = self.sw_app.NewDocument(template, SW_DWG_PAPERS_USER_DEFINED, SHEET_W, SHEET_H)
-                if drawing is not None:
-                    return drawing
-            except Exception as exc:
-                steps.append(f"blank sheet failed ({str(exc)[:50]}), using A4")
-        try:
-            return self.sw_app.NewDocument(template, self.paper_size, 0.0, 0.0)
-        except Exception:
-            return None
-
-    def _new_drawing(self, base_template, steps):
-        """Returns (drawing, frame_ready). frame_ready = frame + title block already come from a template."""
-        ready = None
-        if self.template_has_frame and self.template and Path(str(self.template)).exists():
-            ready = str(self.template)
-        elif self._title_template:
-            ready = self._title_template
-
-        if ready:
-            drawing = self._try_new(ready, steps)
-            if drawing is not None:
-                count = self._sheet_note_count(drawing)
-                found = self._label_note_present(drawing)
-                if self.template_has_frame or count >= TITLE_NOTE_COUNT or found:
-                    steps.append(
-                        f"sheet: from template {Path(ready).name} (notes counted: {count}, label note found: {found})"
-                    )
-                    return drawing, True
-                steps.append(
-                    f"title block template check failed (notes counted: {count}, label note found: {found}) "
-                    f"- drawing the frame by code"
-                )
-                self._close_doc(drawing)
-                self._title_template = None
-            else:
-                steps.append("template could not be used - drawing the frame by code")
-
-        drawing = self._try_new(base_template, steps)
-        if drawing is not None:
-            steps.append("sheet: blank custom sheet" if self.blank_sheet else "sheet: standard A4")
-        return drawing, False
 
     # =====================================================
     # SAVE / PDF
@@ -1496,7 +1207,6 @@ class SwDrawingPdfExporter(DwgExporter):
             if not template:
                 return False, "no drawing template found (set DRAWING_TEMPLATE_PATH in main.py)", steps
             steps.append(f"template: {Path(template).name}")
-            self._prepare_once(steps)
 
             steps.append(f"part file: {path} (exists={path.exists()})")
             model, opened_by_us, open_status = self._open_part(path)
@@ -1508,74 +1218,54 @@ class SwDrawingPdfExporter(DwgExporter):
 
             _, previous_config = self._activate_configuration(model, configuration)
 
-            drawing, frame_ready = self._new_drawing(template, steps)
+            drawing = self._new_drawing(template, steps)
             if drawing is None:
                 return False, "NewDocument returned nothing", steps
             self._ensure_millimeters(drawing, steps)
 
             sheet, sheet_w, sheet_h = self._sheet_size(drawing)
-            steps.append(f"sheet: {sheet_w * 1000:.0f} x {sheet_h * 1000:.0f} mm")
+            steps.append(f"sheet: {sheet_w * 1000:.0f} x {sheet_h * 1000:.0f} mm (from the default template)")
             self._call(sheet, "SetScale", 1.0, 1.0, True, True)
             self._select_error = ""
-            if self.frame and not frame_ready:
-                self._draw_frame_lines(drawing, steps)  # before the views: the sheet is still empty
 
-            # ---- 1) views at 1:1 to learn their sizes ----
-            kinds = ["flat"] + (list(self.view_names) if self.folded_views else [])
-            views, raw = {}, {}
-            for kind in kinds:
-                view = self._create_view(drawing, kind, path, configuration, 0.1, 0.15)
-                outline = self._outline(view) if view is not None else None
-                if outline is None:
-                    steps.append(f"view {kind}: FAILED")
-                    continue
-                views[kind] = view
-                raw[kind] = (outline[2] - outline[0], outline[3] - outline[1])
-            steps.append("views: " + ", ".join(views) if views else "views: none")
-            if "flat" not in views:
+            # ---- 1) flat pattern at 1:1 to learn its size ----
+            flat = self._create_flat_view(drawing, path, configuration, sheet_w / 2, sheet_h / 2)
+            outline = self._outline(flat) if flat is not None else None
+            if outline is None:
                 return False, "flat pattern view could not be created", steps
-            folded = [k for k in views if k != "flat"]
+            raw_w, raw_h = outline[2] - outline[0], outline[3] - outline[1]
+            steps.append(f"flat pattern view: {raw_w * 1000:.0f} x {raw_h * 1000:.0f} mm at 1:1")
 
-            # ---- 2) scales ----
-            bend_count = len(self._get_bend_lines(views["flat"]))
+            # ---- 2) layout and scale ----
+            bend_count = len(self._get_bend_lines(flat))
             table_estimate = (bend_count + 3) * ROW_HEIGHT_GUESS if self.bend_table else 0.0
-            flat_bottom = TABLE_BOTTOM + table_estimate + FLAT_BOTTOM_ROOM
-            flat_den = self._fit_denominator(
-                raw["flat"][0], raw["flat"][1], FLAT_X[1] - FLAT_X[0], FLAT_TOP - flat_bottom
-            )
+            table_bottom = self.bottom_margin
+            table_right = sheet_w - SIDE_MARGIN
 
-            cell_w = (VIEW_ROW_X[1] - VIEW_ROW_X[0] - VIEW_CELL_GAP * 2) / 3
-            view_den = 1.0
-            for kind in folded:
-                view_den = max(view_den, self._fit_denominator(
-                    raw[kind][0], raw[kind][1], cell_w - VIEW_DIM_ROOM, VIEW_ROW_Y[1] - VIEW_ROW_Y[0]
-                ))
-            steps.append(f"scales: flat {self._scale_text(flat_den)}, folded views {self._scale_text(view_den)}")
+            area_x0 = SIDE_MARGIN + FLAT_DIM_ROOM
+            area_x1 = sheet_w - SIDE_MARGIN - FLAT_DIM_ROOM
+            area_top = sheet_h - TOP_MARGIN - FLAT_DIM_ROOM
+            area_bottom = table_bottom + table_estimate + FLAT_BOTTOM_ROOM
 
-            for kind in folded:  # own scale first, so they do not follow the sheet scale
-                if not self._set_view_scale(views[kind], view_den):
-                    steps.append(f"view {kind}: custom scale could not be set")
+            flat_den = self._fit_denominator(raw_w, raw_h, area_x1 - area_x0, area_top - area_bottom)
+            steps.append(f"scale: flat pattern {self._scale_text(flat_den)}")
             self._call(sheet, "SetScale", 1.0, float(flat_den), True, True)
 
-            # ---- 3) positions ----
-            fx = (FLAT_X[0] + FLAT_X[1]) / 2
-            fy = (FLAT_TOP + flat_bottom) / 2
-            if not self._move_view_center(views["flat"], fx, fy):
+            # ---- 3) position ----
+            fx = (area_x0 + area_x1) / 2
+            fy = (area_top + area_bottom) / 2
+            if not self._move_view_center(flat, fx, fy):
                 return False, "could not move the flat view", steps
-            for i, kind in enumerate(folded):
-                cx = VIEW_ROW_X[0] + cell_w * (i + 0.5) + VIEW_CELL_GAP * i - VIEW_DIM_ROOM / 4
-                if not self._move_view_center(views[kind], cx, sum(VIEW_ROW_Y) / 2):
-                    steps.append(f"view {kind}: could not be moved")
             self._call(drawing, "ForceRebuild3", False)
 
             # ---- 4) bend table first: it creates the A/B/C tags used to check the bend line positions ----
             if self.bend_table:
-                table = self._insert_bend_table(views["flat"], sheet_w, steps)
+                table = self._insert_bend_table(flat, table_right, table_bottom, steps)
                 if table is not None:
                     if self.edit_bend_table_text:
                         self._set_bend_table_headers(table, steps)
                         self._drop_blank_row(table, steps)
-                    table_height = self._place_bend_table(table, sheet_w, steps)
+                    table_height = self._place_bend_table(table, table_right, table_bottom, steps)
                     if table_height > table_estimate + 0.003:
                         steps.append(
                             f"WARNING: table is {table_height * 1000:.0f} mm tall, only "
@@ -1585,46 +1275,15 @@ class SwDrawingPdfExporter(DwgExporter):
                 else:
                     steps.append("BEND TABLE MISSING in this drawing")
 
-            # ---- 5) native dimensions, made from the real edges of every view ----
+            # ---- 5) native dimensions of the flat pattern ----
             self._call(drawing, "ForceRebuild3", False)
             self._call(drawing, "ViewZoomtofit2")
             if self.dimensions:
-                self._insert_flat_pattern_dimensions(drawing, views["flat"], flat_den, steps)
-                for kind in folded:
-                    self._dimension_view_overall(drawing, views[kind], view_den, steps, f"{kind} dimensions")
+                self._insert_flat_pattern_dimensions(drawing, flat, flat_den, steps)
                 self._clear(drawing)
+            self._call(drawing, "ForceRebuild3", False)
 
-            # ---- 6) notes: view labels, QTY, frame + title block, properties ----
-            self._select_error = ""
-            label_names = {"Front": "FRONT", "Top": "TOP", "Right": "RIGHT"}
-            for kind in folded:
-                outline = self._outline(views[kind])
-                if outline is None:
-                    continue
-                text = f"{label_names.get(kind, kind.upper())} VIEW   SCALE {self._scale_text(view_den)}"
-                self._insert_note(drawing, text, outline[0], VIEW_LABEL_TOP, height=0.0025)
-
-            quantity = int(item.get("quantity", 1))
-            mirror = int(item.get("mirror_quantity", 0) or 0)
-            qty_text = f"QTY={quantity}" + (f" ({quantity - mirror} + {mirror} MIRROR)" if mirror else "")
-            if self.qty_note:
-                self._insert_note(drawing, qty_text, QTY_X, QTY_TOP, height=0.0065)
-
-            part_name = str(item.get("name") or path.stem)
-            thickness = item.get("thickness")
-            thickness_text = f"{float(thickness):g} mm" if thickness is not None else "N/A"
-            scale_text = self._scale_text(flat_den)
-            if self.frame and not frame_ready:
-                self._draw_title_notes(drawing, (part_name, thickness_text, scale_text, "1 OF 1"), steps)
-            self._set_properties(drawing, {
-                "DWG NO": part_name, "THICKNESS": thickness_text, "SCALE": scale_text,
-                "QTY": quantity, "SHEET": "1 OF 1",
-            }, steps)
-            self._call(drawing, "ForceRebuild3", False)  # refreshes the $PRP links of the title block
-            if self._select_error:
-                steps.append(f"notes/lines: last problem: {self._select_error}")
-
-            # ---- 7) save the drawing, then the PDF ----
+            # ---- 6) save the drawing, then the PDF ----
             self._call(drawing, "ViewZoomtofit2")
             slddrw_path.parent.mkdir(parents=True, exist_ok=True)
             pdf_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1722,7 +1381,7 @@ class SwDrawingPdfExporter(DwgExporter):
 
         print()
         print("=" * 60)
-        print("PDF DRAWINGS (SolidWorks drawings, one folder per thickness)")
+        print("PDF DRAWINGS (flat pattern + bend table, one folder per thickness)")
         print("=" * 60)
         template = self.find_template()
         print(f"Drawing template: {template or 'NOT FOUND'}")
