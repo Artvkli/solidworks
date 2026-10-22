@@ -44,8 +44,7 @@ DIM_TIER_STEP = 0.005  # second row for neighbouring small chain dimensions
 EDGE_TOL = 1.5e-4  # two coordinates closer than this are "the same line"
 MIN_EDGE_LEN = 5e-4  # shorter edges are not used for dimensions
 
-sheet_width=0.420
-sheet_height=0.297,
+
 class SwDrawingPdfExporter(DwgExporter):
     """
     Creates a real SolidWorks drawing for every sheet metal part:
@@ -96,7 +95,7 @@ class SwDrawingPdfExporter(DwgExporter):
         self.sheet_height = sheet_height
         self.table_corner = table_corner
         self.frame_right = frame_right
-
+        self._current_drawing = None
         # Custom SolidWorks sheet format (.slddrt)
         self.sheet_format = (
             Path(sheet_format).resolve()
@@ -536,53 +535,16 @@ class SwDrawingPdfExporter(DwgExporter):
         return width, height
 
     def _place_bend_table(self, table, x_right, y_bottom, steps):
+        """
+        InsertBendTable already places the table with its bottom-right corner at
+        (x_right, y_bottom) because it is called with anchor type BOTTOM_RIGHT,
+        so no move is needed. This only reports the size.
+        """
         width, height = self._table_size(table)
-        x_left = x_right - width
-        y_top = y_bottom + height
-
-        attempts = []
-
-        # 1) ITableAnnotation.SetAnchorPosition? (some builds)
-        attempts.append(("table.AnchorPosition",
-                        lambda: setattr(table, "AnchorPosition", self._r8_array(x_right, y_bottom, 0.0))))
-
-        # 2) Annotation through the generic IAnnotation of the selection
-        def via_selection():
-            drawing = self._current_drawing
-            self._clear(drawing)
-            sel = drawing.SelectionManager
-            data = sel.CreateSelectData()
-            if not table.Select2(False, 0) if hasattr(table, "Select2") else False:
-                raise RuntimeError("table.Select2 not available")
-            ann = sel.GetSelectedObject6(1, -1)
-            ann.SetPosition2(x_left, y_top, 0.0)
-        attempts.append(("selection -> annotation", via_selection))
-
-        # 3) Extension.SelectByID2 on the table name, then the annotation
-        def via_name():
-            drawing = self._current_drawing
-            name = table.GetTitle() if hasattr(table, "GetTitle") else ""
-            ok = drawing.Extension.SelectByID2(
-                name, "GENERALTABLEFEAT", 0.0, 0.0, 0.0, False, 0,
-                VARIANT(pythoncom.VT_DISPATCH, None), 0)
-            if not ok:
-                raise RuntimeError(f"SelectByID2 did not select '{name}'")
-            feat = drawing.SelectionManager.GetSelectedObject6(1, -1)
-            tbl = feat.GetSpecificFeature2()
-            tbl.GetAnnotation().SetPosition2(x_left, y_top, 0.0)
-        attempts.append(("select by name", via_name))
-
-        moved = False
-        for label, attempt in attempts:
-            try:
-                attempt()
-                steps.append(f"bend table: moved with {label} to ({x_left*1000:.0f}, {y_top*1000:.0f}) mm")
-                moved = True
-                break
-            except Exception as exc:
-                steps.append(f"bend table: {label} failed ({type(exc).__name__}: {str(exc)[:60]})")
-        if not moved:
-            steps.append("bend table: NOT moved - left where SolidWorks put it")
+        steps.append(
+            f"bend table: bottom-right corner at ({x_right * 1000:.0f}, {y_bottom * 1000:.0f}) mm, "
+            f"size {width * 1000:.0f} x {height * 1000:.0f} mm"
+        )
         return height
     def _describe_table(self, table, steps):
         try:
@@ -1332,6 +1294,7 @@ class SwDrawingPdfExporter(DwgExporter):
             _, previous_config = self._activate_configuration(model, configuration)
 
             drawing = self._new_drawing(template, steps)
+            self._current_drawing = drawing
             if drawing is None:
                 return False, "NewDocument returned nothing", steps
 
