@@ -44,7 +44,8 @@ DIM_TIER_STEP = 0.005  # second row for neighbouring small chain dimensions
 EDGE_TOL = 1.5e-4  # two coordinates closer than this are "the same line"
 MIN_EDGE_LEN = 5e-4  # shorter edges are not used for dimensions
 
-
+sheet_width=0.420
+sheet_height=0.297,
 class SwDrawingPdfExporter(DwgExporter):
     """
     Creates a real SolidWorks drawing for every sheet metal part:
@@ -70,6 +71,8 @@ class SwDrawingPdfExporter(DwgExporter):
         dim_text_height=0.0025,
         bottom_margin=BOTTOM_MARGIN,
         sheet_format=None,  # Custom .slddrt sheet format
+        sheet_width=None,
+        sheet_height=None, 
         **legacy_options,
     ):
         super().__init__(
@@ -87,6 +90,8 @@ class SwDrawingPdfExporter(DwgExporter):
         self.edit_bend_table_text = edit_bend_table_text
         self.dim_text_height = dim_text_height
         self.bottom_margin = bottom_margin
+        self.sheet_width = sheet_width
+        self.sheet_height = sheet_height
 
         # Custom SolidWorks sheet format (.slddrt)
         # Custom SolidWorks sheet format (.slddrt)
@@ -1211,84 +1216,53 @@ class SwDrawingPdfExporter(DwgExporter):
             return None
 
     
-    def _apply_sheet_format(self, doc, steps):
-        try:
-            from pathlib import Path
-
-            format_path = Path(self.sheet_format)
-
-            if not format_path.is_file():
-                steps.append(
-                    f"Sheet format not found: {format_path}"
-                )
-                return False
-
-            sheet = doc.GetCurrentSheet()
-            if sheet is None:
-                steps.append("No active drawing sheet")
-                return False
-
-            sheet.SetTemplateName(str(format_path))
-            result = sheet.ReloadTemplate(False)
-
-            if result is False:
-                steps.append("ReloadTemplate returned False")
-                return False
-
-            doc.ForceRebuild3(False)
-            steps.append(
-                f"Applied sheet format: {format_path.name}"
-            )
-            return True
-
-        except Exception as exc:
-            steps.append(
-                f"Sheet format error: {str(exc)[:120]}"
-            )
-            return False
-
-
-
     def _apply_sheet_format(self, drawing, steps):
         if not self.sheet_format:
-            steps.append("No custom sheet format configured")
+            steps.append("sheet format: none configured, using the template sheet")
             return True
 
-        try:
-            format_path = Path(self.sheet_format).resolve()
-
-            if not format_path.is_file():
-                steps.append(
-                    f"Sheet format file not found: {format_path}"
-                )
-                return False
-
-            sheet = drawing.GetCurrentSheet()
-            if sheet is None:
-                steps.append("Could not get current drawing sheet")
-                return False
-
-            # Assign and reload the custom sheet format.
-            sheet.SetTemplateName(str(format_path))
-            result = sheet.ReloadTemplate(False)
-
-            if result is False:
-                steps.append("ReloadTemplate returned False")
-                return False
-
-            drawing.ForceRebuild3(False)
-            steps.append(
-                f"Applied sheet format: {format_path.name}"
-            )
-            return True
-
-        except Exception as exc:
-            steps.append(
-                f"Applying sheet format failed: {type(exc).__name__}: {exc}"
-            )
+        format_path = Path(self.sheet_format).resolve()
+        if not format_path.is_file():
+            steps.append(f"sheet format: file not found: {format_path}")
             return False
 
+        constants = self._constants()
+        custom = getattr(constants, "swDwgTemplateCustom", 12) if constants else 12
+        user_defined = getattr(constants, "swDwgPapersUserDefined", 12) if constants else 12
 
+        try:
+            sheet = drawing.GetCurrentSheet()
+            name = sheet.GetName()
+            _, w, h = self._sheet_size(drawing)
+            # size of YOUR format (A3 = 0.420 x 0.297)
+            w = self.sheet_width or w
+            h = self.sheet_height or h
+
+            ok = drawing.SetupSheet5(
+                name, user_defined, custom, 1.0, 1.0, True,
+                str(format_path), float(w), float(h), "", True,
+            )
+            if ok:
+                drawing.ForceRebuild3(False)
+                steps.append(f"sheet format applied (SetupSheet5): {format_path.name}")
+                return True
+            steps.append("SetupSheet5 returned False")
+        except Exception as exc:
+            steps.append(f"SetupSheet5 failed: {type(exc).__name__}: {str(exc)[:100]}")
+
+        # second attempt
+        try:
+            sheet = drawing.GetCurrentSheet()
+            sheet.SetTemplateName(str(format_path))
+            code = sheet.ReloadTemplate(True)      # 0 = success
+            if code in (0, None, True):
+                drawing.ForceRebuild3(False)
+                steps.append(f"sheet format applied (ReloadTemplate): {format_path.name}")
+                return True
+            steps.append(f"ReloadTemplate error code: {code}")
+        except Exception as exc:
+            steps.append(f"ReloadTemplate failed: {type(exc).__name__}: {str(exc)[:100]}")
+        return False
 
     # =====================================================
     # ONE PART
@@ -1329,7 +1303,7 @@ class SwDrawingPdfExporter(DwgExporter):
 
             # Apply custom .slddrt before calculating the layout.
             if not self._apply_sheet_format(drawing, steps):
-                return False, "Could not apply custom sheet format", steps
+                steps.append("WARNING: custom sheet format NOT applied, continuing with the default template")
 
             sheet, sheet_w, sheet_h = self._sheet_size(drawing)
 

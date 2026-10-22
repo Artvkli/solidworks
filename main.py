@@ -176,7 +176,7 @@ def main():
     input_folder.mkdir(exist_ok=True)
     output_folder.mkdir(exist_ok=True)
     
-    sheet_format_path = input_folder / "test.slddrt"
+    drawing_template_path = input_folder / "test1.DRWDOT"
 
     print("\n" + "=" * 60)
     print("SOLIDWORKS SHEET METAL -> DXF/DWG EXPORTER")
@@ -259,10 +259,10 @@ def main():
                     reconnect=connect_to_solidworks,
 
                     # Custom sheet format from project/input
-                    sheet_format=sheet_format_path,
+                    sheet_format=None,
 
                     # Use the default SolidWorks drawing template
-                    template=None,
+                    template=str(drawing_template_path),
 
                     folded_views=True,
                     bend_table=True,
@@ -289,6 +289,8 @@ def main():
                     else:
                         native_results["failed"].append(record)
                         print(f"[{index}/{len(native_items)}] Native drawing failed: {item.get('name')} -> {message}")
+                        for line in steps:
+                            print(f"      {line}")
                 result_path = native_folder / "native_drawing_summary.json"
                 result_path.write_text(json.dumps(native_results, ensure_ascii=False, indent=2), encoding="utf-8")
             else:
