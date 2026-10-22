@@ -70,10 +70,11 @@ class SwDrawingPdfExporter(DwgExporter):
         edit_bend_table_text=True,
         dim_text_height=0.0025,
         bottom_margin=BOTTOM_MARGIN,
-        sheet_format=None,  # Custom .slddrt sheet format
+        sheet_format=None,        # Custom .slddrt sheet format (optional)
         sheet_width=None,
-        sheet_height=None, 
-        table_corner="top_right",
+        sheet_height=None,
+        table_corner="bottom_right",   # bend table sits at the bottom right, against the frame
+        frame_right=0.010,             # distance of the template frame from the right sheet edge (m)
         **legacy_options,
     ):
         super().__init__(
@@ -94,8 +95,8 @@ class SwDrawingPdfExporter(DwgExporter):
         self.sheet_width = sheet_width
         self.sheet_height = sheet_height
         self.table_corner = table_corner
+        self.frame_right = frame_right
 
-        # Custom SolidWorks sheet format (.slddrt)
         # Custom SolidWorks sheet format (.slddrt)
         self.sheet_format = (
             Path(sheet_format).resolve()
@@ -106,7 +107,6 @@ class SwDrawingPdfExporter(DwgExporter):
         self._template_path = None
         self._constants_cache = None
         self._select_error = ""
-
     # =====================================================
     # TEMPLATE (default SolidWorks drawing template)
     # =====================================================
@@ -537,20 +537,28 @@ class SwDrawingPdfExporter(DwgExporter):
 
     def _place_bend_table(self, table, x_right, y_bottom, steps):
         width, height = self._table_size(table)
-        if self.table_corner == "top_right":
-            sheet_h = self._sheet_size_cache[1]
-            y_top = sheet_h - TOP_MARGIN
-        else:
-            y_top = y_bottom + height
         x_left = x_right - width
-
+        y_top = y_bottom + height
 
         try:
-            annotation = self._call(table, "GetAnnotation")
-            annotation.SetPosition2(x_left, y_top, 0.0)
-            steps.append(f"bend table: placed bottom right ({width * 1000:.0f} x {height * 1000:.0f} mm)")
+            ann = self._call(table, "GetAnnotation")
+            ann.SetPosition2(x_left, y_top, 0.0)
+
+            # بررسی: گوشه‌ی پایین-راست واقعی جدول
+            pos = ann.GetPosition()
+            real_right = float(pos[0]) + width
+            real_bottom = float(pos[1]) - height
+            dx = x_right - real_right
+            dy = y_bottom - real_bottom
+            if abs(dx) > 0.0005 or abs(dy) > 0.0005:
+                ann.SetPosition2(float(pos[0]) + dx, float(pos[1]) + dy, 0.0)
+
+            steps.append(
+                f"bend table: bottom-right corner at "
+                f"({x_right*1000:.0f}, {y_bottom*1000:.0f}) mm, size {width*1000:.0f} x {height*1000:.0f} mm"
+            )
         except Exception as exc:
-            steps.append(f"bend table: could not be moved, left where SolidWorks put it ({str(exc)[:60]})")
+            steps.append(f"bend table: could not be moved ({str(exc)[:60]})")
         return height
 
     def _describe_table(self, table, steps):
@@ -1329,7 +1337,7 @@ class SwDrawingPdfExporter(DwgExporter):
             # ---- 2) layout and scale ----
             bend_count = len(self._get_bend_lines(flat))
             table_estimate = (bend_count + 3) * ROW_HEIGHT_GUESS if self.bend_table else 0.0
-            table_right = sheet_w - SIDE_MARGIN - 0.005
+            table_right = sheet_w - self.frame_right - 0.001
 
             area_x0 = SIDE_MARGIN + FLAT_DIM_ROOM
             area_x1 = sheet_w - SIDE_MARGIN - FLAT_DIM_ROOM
@@ -1339,7 +1347,7 @@ class SwDrawingPdfExporter(DwgExporter):
                 area_top = table_bottom - FLAT_BOTTOM_ROOM
                 area_bottom = self.bottom_margin + FLAT_DIM_ROOM          # فلت پترن بالای تایتل‌بلاک
             else:
-                table_bottom = self.bottom_margin
+                table_bottom = self.bottom_margin + 0.001
                 area_top = sheet_h - TOP_MARGIN - FLAT_DIM_ROOM
                 area_bottom = table_bottom + table_estimate + FLAT_BOTTOM_ROOM
 
