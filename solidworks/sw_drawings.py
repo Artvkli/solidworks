@@ -540,22 +540,37 @@ class SwDrawingPdfExporter(DwgExporter):
         x_left = x_right - width
         y_top = y_bottom + height
 
-        def resolve(obj, name):
-            attr = getattr(obj, name)
-            return attr() if callable(attr) else attr
-
-        ann = None
-        try:
-            ann = resolve(table, "GetAnnotation")
-        except Exception as exc:
-            steps.append(f"bend table: GetAnnotation failed ({str(exc)[:50]})")
-
         attempts = []
-        if ann is not None:
-            attempts.append(("Annotation.SetPosition2", lambda: ann.SetPosition2(x_left, y_top, 0.0)))
-            attempts.append(("Annotation.SetPosition", lambda: ann.SetPosition(x_left, y_top, 0.0)))
-        attempts.append(("table.SetPosition2", lambda: table.SetPosition2(x_left, y_top, 0.0)))
-        attempts.append(("table.SetPosition", lambda: table.SetPosition(x_left, y_top, 0.0)))
+
+        # 1) ITableAnnotation.SetAnchorPosition? (some builds)
+        attempts.append(("table.AnchorPosition",
+                        lambda: setattr(table, "AnchorPosition", self._r8_array(x_right, y_bottom, 0.0))))
+
+        # 2) Annotation through the generic IAnnotation of the selection
+        def via_selection():
+            drawing = self._current_drawing
+            self._clear(drawing)
+            sel = drawing.SelectionManager
+            data = sel.CreateSelectData()
+            if not table.Select2(False, 0) if hasattr(table, "Select2") else False:
+                raise RuntimeError("table.Select2 not available")
+            ann = sel.GetSelectedObject6(1, -1)
+            ann.SetPosition2(x_left, y_top, 0.0)
+        attempts.append(("selection -> annotation", via_selection))
+
+        # 3) Extension.SelectByID2 on the table name, then the annotation
+        def via_name():
+            drawing = self._current_drawing
+            name = table.GetTitle() if hasattr(table, "GetTitle") else ""
+            ok = drawing.Extension.SelectByID2(
+                name, "GENERALTABLEFEAT", 0.0, 0.0, 0.0, False, 0,
+                VARIANT(pythoncom.VT_DISPATCH, None), 0)
+            if not ok:
+                raise RuntimeError(f"SelectByID2 did not select '{name}'")
+            feat = drawing.SelectionManager.GetSelectedObject6(1, -1)
+            tbl = feat.GetSpecificFeature2()
+            tbl.GetAnnotation().SetPosition2(x_left, y_top, 0.0)
+        attempts.append(("select by name", via_name))
 
         moved = False
         for label, attempt in attempts:
@@ -565,14 +580,9 @@ class SwDrawingPdfExporter(DwgExporter):
                 moved = True
                 break
             except Exception as exc:
-                steps.append(f"bend table: {label} failed ({type(exc).__name__}: {str(exc)[:50]})")
-
-        if moved and ann is not None:
-            try:
-                pos = resolve(ann, "GetPosition")
-                steps.append(f"bend table: position now ({float(pos[0])*1000:.0f}, {float(pos[1])*1000:.0f}) mm, size {width*1000:.0f} x {height*1000:.0f} mm")
-            except Exception:
-                pass
+                steps.append(f"bend table: {label} failed ({type(exc).__name__}: {str(exc)[:60]})")
+        if not moved:
+            steps.append("bend table: NOT moved - left where SolidWorks put it")
         return height
     def _describe_table(self, table, steps):
         try:
