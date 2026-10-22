@@ -750,14 +750,58 @@ class SwDrawingPdfExporter(DwgExporter):
             edges.append({"edge": edge, "points": points, "line": is_line})
         return edges
 
-    def _to_view_space(self, math_util, transform, point):
-        try:
-            math_point = math_util.CreatePoint(self._r8_array(*point))
-            result = math_point.MultiplyTransform(transform)
-            data = result.ArrayData
-            return float(data[0]), float(data[1])
-        except Exception:
-            return None
+    def _projector(self, view):
+        """
+        Returns (project, how, errors): project(model_xyz) -> (x, y) in view space.
+        1) SolidWorks' own math objects (several ways to pass the point),
+        2) the 4x4 transform data (ArrayData of ModelToViewTransform, or IView.GetXform) applied in Python.
+        """
+        errors = []
+        transform = self._call(view, "ModelToViewTransform")
+        math_util = self._call(self.sw_app, "GetMathUtility")
+
+        if transform is not None and math_util is not None:
+            makers = (
+                ("variant array", lambda p: self._r8_array(*p)),
+                ("tuple", lambda p: tuple(float(v) for v in p)),
+                ("list", lambda p: [float(v) for v in p]),
+            )
+            for label, make in makers:
+                def com(p, make=make):
+                    math_point = math_util.CreatePoint(make(p))
+                    result = math_point.MultiplyTransform(transform)
+                    data = result.ArrayData
+                    return float(data[0]), float(data[1])
+                try:
+                    com((0.0, 0.0, 0.0))
+                    return com, f"SolidWorks math ({label})", errors
+                except Exception as exc:
+                    errors.append(f"{label}: {str(exc)[:70]}")
+        else:
+            errors.append(f"transform={'ok' if transform is not None else 'None'}, math utility={'ok' if math_util is not None else 'None'}")
+
+        sources = (
+            ("ModelToViewTransform.ArrayData", lambda: transform.ArrayData),
+            ("IView.GetXform", lambda: view.GetXform()),
+        )
+        for label, getter in sources:
+            try:
+                raw = getter()
+                data = [float(v) for v in raw]
+                if len(data) < 13:
+                    errors.append(f"{label}: only {len(data)} values")
+                    continue
+                r, t, k = data[:9], data[9:12], data[12] or 1.0
+
+                def matrix(p, r=r, t=t, k=k):
+                    return (
+                        (r[0] * p[0] + r[1] * p[1] + r[2] * p[2]) * k + t[0],
+                        (r[3] * p[0] + r[4] * p[1] + r[5] * p[2]) * k + t[1],
+                    )
+                return matrix, f"matrix from {label}", errors
+            except Exception as exc:
+                errors.append(f"{label}: {str(exc)[:70]}")
+        return None, "", errors
 
     def _scale_of(self, view, fallback):
         try:
@@ -780,20 +824,22 @@ class SwDrawingPdfExporter(DwgExporter):
             steps.append(f"{tag}: no edges returned by SolidWorks ({self._select_error or 'empty list'})")
             return None
 
-        transform = self._call(view, "ModelToViewTransform")
-        math_util = self._call(self.sw_app, "GetMathUtility")
+        project, how, errors = self._projector(view)
         outline = self._outline(view)
-        if transform is None or math_util is None or outline is None:
-            steps.append(f"{tag}: view transform or outline not available - dimensions skipped")
+        if project is None or outline is None:
+            steps.append(
+                f"{tag}: no way to project the edges onto the sheet - dimensions skipped "
+                f"({'; '.join(errors) or 'outline missing'})"
+            )
             return None
 
         base = []
         for entry in edges:
-            mapped = [self._to_view_space(math_util, transform, p) for p in entry["points"]]
-            if any(p is None for p in mapped):
-                steps.append(f"{tag}: transforming the edge points failed - dimensions skipped")
+            try:
+                base.append([project(p) for p in entry["points"]])
+            except Exception as exc:
+                steps.append(f"{tag}: projecting an edge failed ({str(exc)[:60]}) - dimensions skipped")
                 return None
-            base.append(mapped)
 
         scale = self._scale_of(view, scale_hint)
         all_points = [p for pts in base for p in pts]
@@ -825,9 +871,7 @@ class SwDrawingPdfExporter(DwgExporter):
         k, dx, dy, mode = chosen
 
         def mapper(p3):
-            q = self._to_view_space(math_util, transform, p3)
-            if q is None:
-                raise ValueError("transform failed")
+            q = project(p3)
             return (q[0] * k + dx, q[1] * k + dy)
 
         lines, xs, ys = [], [], []
@@ -845,7 +889,7 @@ class SwDrawingPdfExporter(DwgExporter):
         steps.append(
             f"{tag}: {len(edges)} edges ({len(lines)} straight), geometry "
             f"{(bbox[2] - bbox[0]) / scale * 1000:.1f} x {(bbox[3] - bbox[1]) / scale * 1000:.1f} mm "
-            f"at 1:{1 / scale:g} (mapping: {mode})"
+            f"at 1:{1 / scale:g} (projection: {how}; {mode})"
         )
         return {"bbox": bbox, "lines": lines, "scale": scale, "mapper": mapper}
 
@@ -1217,14 +1261,30 @@ class SwDrawingPdfExporter(DwgExporter):
             self._select_error = f"line: {str(exc)[:60]}"
             return False
 
-    def _draw_frame_and_title(self, drawing, values, steps):
-        """Frame + title block. values = (DWG NO, THICKNESS, SCALE, SHEET) as text or $PRP links."""
+    def _draw_frame_lines(self, drawing, steps):
+        """Frame + title block lines. Drawn FIRST (before any view), when the sheet is still empty."""
         fx0, fy0, fx1, fy1 = FRAME
         lines = [
             (fx0, fy0, fx1, fy0), (fx1, fy0, fx1, fy1), (fx1, fy1, fx0, fy1), (fx0, fy1, fx0, fy0),
             (fx0, TITLE_TOP, fx1, TITLE_TOP),
         ] + [(x, fy0, x, TITLE_TOP) for x in TITLE_COLS[1:-1]]
-        done = sum(1 for ln in lines if self._line(drawing, *ln))
+        done, missing = 0, []
+        for number, ln in enumerate(lines, 1):
+            ok = self._line(drawing, *ln)
+            if not ok:  # one more try (a line is sometimes refused right after another one)
+                time.sleep(0.2)
+                ok = self._line(drawing, *ln)
+            if ok:
+                done += 1
+            else:
+                missing.append(number)
+        steps.append(
+            f"frame lines: {done}/{len(lines)}" + (f" (missing line {missing}: {self._select_error})" if missing else "")
+        )
+        return not missing
+
+    def _draw_title_notes(self, drawing, values, steps):
+        """Labels and values of the title block. values = (DWG NO, THICKNESS, SCALE, SHEET) as text or $PRP links."""
         labels = ("DWG NO. / PART", "THICKNESS", "SCALE", "SHEET")
         notes = 0
         for i, (label, value) in enumerate(zip(labels, values)):
@@ -1232,8 +1292,13 @@ class SwDrawingPdfExporter(DwgExporter):
             notes += self._insert_note(drawing, label, x, TITLE_TOP - 0.0015, height=0.0022)
             size = 0.0045 if (i == 0 and len(value) > 24) else 0.0055
             notes += self._insert_note(drawing, value, x, TITLE_TOP - 0.0075, height=size, bold=True)
-        steps.append(f"frame + title block: {done}/{len(lines)} lines, {notes}/{TITLE_NOTE_COUNT} texts")
-        return done == len(lines) and notes == TITLE_NOTE_COUNT
+        steps.append(f"title block texts: {notes}/{TITLE_NOTE_COUNT}")
+        return notes == TITLE_NOTE_COUNT
+
+    def _draw_frame_and_title(self, drawing, values, steps):
+        lines_ok = self._draw_frame_lines(drawing, steps)
+        notes_ok = self._draw_title_notes(drawing, values, steps)
+        return lines_ok and notes_ok
 
     def _set_properties(self, drawing, props, steps):
         try:
@@ -1264,6 +1329,20 @@ class SwDrawingPdfExporter(DwgExporter):
                 pass
             ann = self._call(ann, "GetNext3")
         return count
+
+    def _label_note_present(self, drawing):
+        """True if the title block label note can be picked at its place on the sheet."""
+        try:
+            self._call(drawing, "ViewZoomtofit2")
+            x = TITLE_COLS[0] + 0.0025 + 0.004
+            y = TITLE_TOP - 0.0015 - 0.0011
+            found = bool(drawing.Extension.SelectByID2(
+                "", "NOTE", float(x), float(y), 0.0, False, 0, VARIANT(pythoncom.VT_DISPATCH, None), 0
+            ))
+            self._clear(drawing)
+            return found
+        except Exception:
+            return False
 
     def _build_title_template(self, path, steps):
         """Blank A4 portrait, millimetres, frame + title block whose texts are $PRP links. Saved as .drwdot."""
@@ -1346,10 +1425,16 @@ class SwDrawingPdfExporter(DwgExporter):
             drawing = self._try_new(ready, steps)
             if drawing is not None:
                 count = self._sheet_note_count(drawing)
-                if self.template_has_frame or count >= TITLE_NOTE_COUNT:
-                    steps.append(f"sheet: from template {Path(ready).name} ({count} notes on the sheet)")
+                found = self._label_note_present(drawing)
+                if self.template_has_frame or count >= TITLE_NOTE_COUNT or found:
+                    steps.append(
+                        f"sheet: from template {Path(ready).name} (notes counted: {count}, label note found: {found})"
+                    )
                     return drawing, True
-                steps.append(f"title block template gives {count} notes, expected {TITLE_NOTE_COUNT} - drawing the frame by code")
+                steps.append(
+                    f"title block template check failed (notes counted: {count}, label note found: {found}) "
+                    f"- drawing the frame by code"
+                )
                 self._close_doc(drawing)
                 self._title_template = None
             else:
@@ -1431,6 +1516,9 @@ class SwDrawingPdfExporter(DwgExporter):
             sheet, sheet_w, sheet_h = self._sheet_size(drawing)
             steps.append(f"sheet: {sheet_w * 1000:.0f} x {sheet_h * 1000:.0f} mm")
             self._call(sheet, "SetScale", 1.0, 1.0, True, True)
+            self._select_error = ""
+            if self.frame and not frame_ready:
+                self._draw_frame_lines(drawing, steps)  # before the views: the sheet is still empty
 
             # ---- 1) views at 1:1 to learn their sizes ----
             kinds = ["flat"] + (list(self.view_names) if self.folded_views else [])
@@ -1527,7 +1615,7 @@ class SwDrawingPdfExporter(DwgExporter):
             thickness_text = f"{float(thickness):g} mm" if thickness is not None else "N/A"
             scale_text = self._scale_text(flat_den)
             if self.frame and not frame_ready:
-                self._draw_frame_and_title(drawing, (part_name, thickness_text, scale_text, "1 OF 1"), steps)
+                self._draw_title_notes(drawing, (part_name, thickness_text, scale_text, "1 OF 1"), steps)
             self._set_properties(drawing, {
                 "DWG NO": part_name, "THICKNESS": thickness_text, "SCALE": scale_text,
                 "QTY": quantity, "SHEET": "1 OF 1",
