@@ -54,13 +54,14 @@ class SwDrawingPdfExporter(DwgExporter):
     Every optional step is best effort and logged in `steps`.
     """
 
+    
     def __init__(
         self,
         sw_app,
         assembly_path=None,
         reconnect=None,
         template=None,
-        paper_size=None,  # None = use the sheet of the template as it is
+        paper_size=None,
         bend_table=True,
         dimensions=True,
         bend_template=None,
@@ -68,9 +69,15 @@ class SwDrawingPdfExporter(DwgExporter):
         edit_bend_table_text=True,
         dim_text_height=0.0025,
         bottom_margin=BOTTOM_MARGIN,
-        **legacy_options,  # old arguments (folded_views, frame, ...) are accepted and ignored
+        sheet_format=None,  # Custom .slddrt sheet format
+        **legacy_options,
     ):
-        super().__init__(sw_app, assembly_path=assembly_path, reconnect=reconnect)
+        super().__init__(
+            sw_app,
+            assembly_path=assembly_path,
+            reconnect=reconnect,
+        )
+
         self.template = template
         self.paper_size = paper_size
         self.bend_table = bend_table
@@ -80,6 +87,14 @@ class SwDrawingPdfExporter(DwgExporter):
         self.edit_bend_table_text = edit_bend_table_text
         self.dim_text_height = dim_text_height
         self.bottom_margin = bottom_margin
+
+        # Custom SolidWorks sheet format (.slddrt)
+        # Custom SolidWorks sheet format (.slddrt)
+        self.sheet_format = (
+            Path(sheet_format).resolve()
+            if sheet_format is not None
+            else None
+        )
 
         self._template_path = None
         self._constants_cache = None
@@ -1178,15 +1193,102 @@ class SwDrawingPdfExporter(DwgExporter):
                 return True
         return False
 
+    
     def _open_drawing(self, path, steps):
         try:
             return self.sw_app.OpenDoc6(
-                str(path), SW_DOC_DRAWING, SW_OPEN_SILENT | SW_OPEN_READONLY, "",
-                self._byref_i4(), self._byref_i4(),
+                str(path),
+                SW_DOC_DRAWING,
+                SW_OPEN_SILENT,
+                "",
+                self._byref_i4(),
+                self._byref_i4(),
             )
         except Exception as exc:
-            steps.append(f"reopening the .slddrw failed: {str(exc)[:60]}")
+            steps.append(
+                f"reopening the .slddrw failed: {str(exc)[:100]}"
+            )
             return None
+
+    
+    def _apply_sheet_format(self, doc, steps):
+        try:
+            from pathlib import Path
+
+            format_path = Path(self.sheet_format)
+
+            if not format_path.is_file():
+                steps.append(
+                    f"Sheet format not found: {format_path}"
+                )
+                return False
+
+            sheet = doc.GetCurrentSheet()
+            if sheet is None:
+                steps.append("No active drawing sheet")
+                return False
+
+            sheet.SetTemplateName(str(format_path))
+            result = sheet.ReloadTemplate(False)
+
+            if result is False:
+                steps.append("ReloadTemplate returned False")
+                return False
+
+            doc.ForceRebuild3(False)
+            steps.append(
+                f"Applied sheet format: {format_path.name}"
+            )
+            return True
+
+        except Exception as exc:
+            steps.append(
+                f"Sheet format error: {str(exc)[:120]}"
+            )
+            return False
+
+
+
+    def _apply_sheet_format(self, drawing, steps):
+        if not self.sheet_format:
+            steps.append("No custom sheet format configured")
+            return True
+
+        try:
+            format_path = Path(self.sheet_format).resolve()
+
+            if not format_path.is_file():
+                steps.append(
+                    f"Sheet format file not found: {format_path}"
+                )
+                return False
+
+            sheet = drawing.GetCurrentSheet()
+            if sheet is None:
+                steps.append("Could not get current drawing sheet")
+                return False
+
+            # Assign and reload the custom sheet format.
+            sheet.SetTemplateName(str(format_path))
+            result = sheet.ReloadTemplate(False)
+
+            if result is False:
+                steps.append("ReloadTemplate returned False")
+                return False
+
+            drawing.ForceRebuild3(False)
+            steps.append(
+                f"Applied sheet format: {format_path.name}"
+            )
+            return True
+
+        except Exception as exc:
+            steps.append(
+                f"Applying sheet format failed: {type(exc).__name__}: {exc}"
+            )
+            return False
+
+
 
     # =====================================================
     # ONE PART
@@ -1218,12 +1320,19 @@ class SwDrawingPdfExporter(DwgExporter):
 
             _, previous_config = self._activate_configuration(model, configuration)
 
+            
             drawing = self._new_drawing(template, steps)
             if drawing is None:
                 return False, "NewDocument returned nothing", steps
+
             self._ensure_millimeters(drawing, steps)
 
+            # Apply custom .slddrt before calculating the layout.
+            if not self._apply_sheet_format(drawing, steps):
+                return False, "Could not apply custom sheet format", steps
+
             sheet, sheet_w, sheet_h = self._sheet_size(drawing)
+
             steps.append(f"sheet: {sheet_w * 1000:.0f} x {sheet_h * 1000:.0f} mm (from the default template)")
             self._call(sheet, "SetScale", 1.0, 1.0, True, True)
             self._select_error = ""
