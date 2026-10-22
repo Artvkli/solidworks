@@ -28,7 +28,7 @@ NO_OPTION_SPECIFIED = 0
 # ---------------------------------------------------------
 SIDE_MARGIN = 0.025  # free space left/right of the frame
 TOP_MARGIN = 0.025  # free space at the top
-BOTTOM_MARGIN = 0.040  # room reserved for the template's title block (bend table sits above it)
+BOTTOM_MARGIN = 0.068  # room reserved for the template's title block (bend table sits above it)
 FLAT_DIM_ROOM = 0.025  # room left/right/top of the flat pattern for its dimensions
 FLAT_BOTTOM_ROOM = 0.020  # between the bend table and the flat pattern (chain dimensions)
 ROW_HEIGHT_GUESS = 0.0065
@@ -74,7 +74,7 @@ class SwDrawingPdfExporter(DwgExporter):
         sheet_width=None,
         sheet_height=None,
         table_corner="bottom_right",   # bend table sits at the bottom right, against the frame
-        frame_right=0.010,             # distance of the template frame from the right sheet edge (m)
+        frame_right=0.011,             # distance of the template frame from the right sheet edge (m)
         **legacy_options,
     ):
         super().__init__(
@@ -536,36 +536,43 @@ class SwDrawingPdfExporter(DwgExporter):
         return width, height
 
     def _place_bend_table(self, table, x_right, y_bottom, steps):
-        """Bottom-right corner of the table at (x_right, y_bottom), sheet metres."""
         width, height = self._table_size(table)
         x_left = x_right - width
         y_top = y_bottom + height
 
+        def resolve(obj, name):
+            attr = getattr(obj, name)
+            return attr() if callable(attr) else attr
+
+        ann = None
         try:
-            ann = table.GetAnnotation   # may be a method or already a value
-            if callable(ann):
-                ann = ann()
-            ann.SetPosition2(x_left, y_top, 0.0)
-
-            # read back (property or method) and correct any anchor offset
-            pos = ann.GetPosition
-            if callable(pos):
-                pos = pos()
-            pos = tuple(float(v) for v in pos)
-            dx = x_left - pos[0]
-            dy = y_top - pos[1]
-            if abs(dx) > 0.0005 or abs(dy) > 0.0005:
-                ann.SetPosition2(x_left + dx, y_top + dy, 0.0)
-                pos = ann.GetPosition
-                pos = tuple(float(v) for v in (pos() if callable(pos) else pos))
-
-            steps.append(
-                f"bend table: top-left requested ({x_left*1000:.0f}, {y_top*1000:.0f}) mm, "
-                f"actual ({pos[0]*1000:.0f}, {pos[1]*1000:.0f}) mm, "
-                f"size {width*1000:.0f} x {height*1000:.0f} mm"
-            )
+            ann = resolve(table, "GetAnnotation")
         except Exception as exc:
-            steps.append(f"bend table: could not be moved ({type(exc).__name__}: {str(exc)[:80]})")
+            steps.append(f"bend table: GetAnnotation failed ({str(exc)[:50]})")
+
+        attempts = []
+        if ann is not None:
+            attempts.append(("Annotation.SetPosition2", lambda: ann.SetPosition2(x_left, y_top, 0.0)))
+            attempts.append(("Annotation.SetPosition", lambda: ann.SetPosition(x_left, y_top, 0.0)))
+        attempts.append(("table.SetPosition2", lambda: table.SetPosition2(x_left, y_top, 0.0)))
+        attempts.append(("table.SetPosition", lambda: table.SetPosition(x_left, y_top, 0.0)))
+
+        moved = False
+        for label, attempt in attempts:
+            try:
+                attempt()
+                steps.append(f"bend table: moved with {label} to ({x_left*1000:.0f}, {y_top*1000:.0f}) mm")
+                moved = True
+                break
+            except Exception as exc:
+                steps.append(f"bend table: {label} failed ({type(exc).__name__}: {str(exc)[:50]})")
+
+        if moved and ann is not None:
+            try:
+                pos = resolve(ann, "GetPosition")
+                steps.append(f"bend table: position now ({float(pos[0])*1000:.0f}, {float(pos[1])*1000:.0f}) mm, size {width*1000:.0f} x {height*1000:.0f} mm")
+            except Exception:
+                pass
         return height
     def _describe_table(self, table, steps):
         try:
