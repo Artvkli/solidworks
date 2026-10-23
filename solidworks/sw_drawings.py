@@ -1110,27 +1110,37 @@ class SwDrawingPdfExporter(DwgExporter):
         return None
 
     def _delete_model_views(self, drawing, steps):
-        """Delete all model views from the copied master before inserting a fresh flat-pattern view."""
+        """Delete every model view from the copied master using the typed IDrawingDoc interface."""
+        drawing_doc = self._cast(drawing, "IDrawingDoc")
         views = self._model_views(drawing)
         removed, failed = [], []
-        for view in reversed(views):
+        # Re-read the view list each time because DeleteView invalidates COM view wrappers.
+        for _ in range(len(views) + 2):
+            current_views = self._model_views(drawing)
+            if not current_views:
+                break
+            view = current_views[-1]
             name = str(self._call(view, "GetName2") or "")
             if not name:
-                continue
+                failed.append("unnamed view")
+                break
             try:
                 self._clear(drawing)
-                result = drawing.DeleteView(name)
+                result = drawing_doc.DeleteView(name)
                 if result is False:
                     failed.append(name)
-                else:
-                    removed.append(name)
+                    break
+                removed.append(name)
+                self._call(drawing, "ForceRebuild3", False)
             except Exception as exc:
-                failed.append(f"{name} ({str(exc)[:60]})")
+                failed.append(f"{name} ({type(exc).__name__}: {str(exc)[:80]})")
+                break
         self._clear(drawing)
         self._call(drawing, "ForceRebuild3", False)
-        steps.append(f"master view cleanup: removed {len(removed)} view(s)" +
+        remaining = [str(self._call(v, "GetName2") or "?" ) for v in self._model_views(drawing)]
+        steps.append(f"master view cleanup: removed {len(removed)} view(s); remaining={remaining}" +
                      (f"; failed: {', '.join(failed)}" if failed else ""))
-        return not failed
+        return not failed and not remaining
 
     def _create_flat_pattern_view(self, drawing, model_path, configuration, slots, steps):
         """Insert a new flat-pattern view from the target part, not by reusing the master's view."""
@@ -1141,15 +1151,38 @@ class SwDrawingPdfExporter(DwgExporter):
             # Safe fallback for a standard drawing sheet; user can adjust placement in the master.
             x, y = 0.15, 0.15
         config_name = str(configuration or "")
-        try:
-            view = drawing.CreateFlatPatternViewFromModelView3(
-                str(model_path), config_name, x, y, 0.0, False, False
-            )
-        except Exception as exc:
-            steps.append(f"flat-pattern insertion failed ({type(exc).__name__}: {str(exc)[:120]})")
-            return None
+        drawing_doc = self._cast(drawing, "IDrawingDoc")
+        model_name = str(Path(model_path).resolve())
+        view = None
+        errors = []
+        # The method belongs to IDrawingDoc. Try the requested configuration first,
+        # then the model's default configuration if the requested one cannot unfold.
+        for cfg in dict.fromkeys((config_name, "")):
+            try:
+                # HideBendLines=True: keep the drawing visually limited to the flat outline.
+                view = drawing_doc.CreateFlatPatternViewFromModelView3(
+                    model_name, cfg, float(x), float(y), 0.0, False, True
+                )
+                if view is not None:
+                    steps.append(f"flat-pattern API succeeded with configuration={cfg!r}, HideBendLines=True")
+                    break
+                errors.append(f"configuration={cfg!r}: returned None")
+            except Exception as exc:
+                errors.append(f"configuration={cfg!r}: {type(exc).__name__}: {str(exc)[:90]}")
         if view is None:
-            steps.append("flat-pattern insertion failed: SolidWorks returned no view")
+            # Fallback for older SolidWorks versions that expose the previous method.
+            try:
+                view = drawing_doc.CreateFlatPatternViewFromModelView2(
+                    model_name, config_name, float(x), float(y), 0.0, False
+                )
+                if view is not None:
+                    steps.append("flat-pattern API fallback succeeded with CreateFlatPatternViewFromModelView2")
+            except Exception as exc:
+                errors.append(f"ViewFromModelView2: {type(exc).__name__}: {str(exc)[:90]}")
+        if view is None:
+            steps.append("flat-pattern insertion failed: " + " | ".join(errors))
+            steps.append("Check that the part is sheet metal, its Flat-Pattern feature is unsuppressed, "
+                         "and the selected configuration can be unfolded.")
             return None
         self._call(drawing, "ForceRebuild3", False)
         # Reacquire from drawing's view chain to avoid stale COM wrappers after rebuild.
@@ -1230,6 +1263,7 @@ class SwDrawingPdfExporter(DwgExporter):
 
         flat_name = str(self._call(flat, "GetName2") or "")
         removed, failed = [], []
+        drawing_doc = self._cast(drawing, "IDrawingDoc")
         # Delete in reverse order so child/derived views are less likely to block cleanup.
         for view in reversed(views):
             name = str(self._call(view, "GetName2") or "")
@@ -1237,13 +1271,13 @@ class SwDrawingPdfExporter(DwgExporter):
                 continue
             try:
                 self._clear(drawing)
-                result = drawing.DeleteView(name)
+                result = drawing_doc.DeleteView(name)
                 if result is False:
                     failed.append(name)
                 else:
                     removed.append(name)
             except Exception as exc:
-                failed.append(f"{name} ({str(exc)[:45]})")
+                failed.append(f"{name} ({type(exc).__name__}: {str(exc)[:65]})")
 
         self._clear(drawing)
         self._call(drawing, "ForceRebuild3", False)
