@@ -1,7 +1,7 @@
-import csv
 import math
 import os
 import re
+import shutil
 import time
 from pathlib import Path
 
@@ -15,65 +15,40 @@ from .dwg_exporter import DwgExporter
 # ---------------------------------------------------------
 SW_DOC_DRAWING = 3
 SW_OPEN_SILENT = 1
-SW_OPEN_READONLY = 2
 SW_NOTE_TYPE = 6  # swNote
-ANCHOR_BOTTOM_RIGHT = 4  # bend table anchor corner (bottom right)
-FIRST_BEND_TAG = "A"  # first tag shown on the flat-pattern bend lines and in the table
 NO_OPTION_SPECIFIED = 0
 
 # ---------------------------------------------------------
-# Layout (sheet metres). The sheet itself (size, frame, title block)
-# comes from the DEFAULT SolidWorks drawing template, so everything below
-# is relative to the real sheet size read from the template.
+# Layout / dimension constants (sheet metres)
 # ---------------------------------------------------------
-SIDE_MARGIN = 0.025  # free space left/right of the frame
-TOP_MARGIN = 0.025  # free space at the top
-BOTTOM_MARGIN = 0.068  # room reserved for the template's title block (bend table sits above it)
-FLAT_DIM_ROOM = 0.025  # room left/right/top of the flat pattern for its dimensions
-FLAT_BOTTOM_ROOM = 0.020  # between the bend table and the flat pattern (chain dimensions)
-ROW_HEIGHT_GUESS = 0.0065
-TABLE_WIDTH_GUESS = 0.093
-MARGIN_GUESS = 0.0084  # a view outline is wider than its geometry by about this much on the sheet
-PICK_FRACTIONS = (0.5, 0.35, 0.65, 0.2, 0.8, 0.1, 0.9)  # where along a line a pick is tried
-
-# ---------------------------------------------------------
-# Dimension layout (sheet metres)
-# ---------------------------------------------------------
-DIM_OFFSET = 0.008  # first dimension line distance from the geometry
-DIM_TIER_STEP = 0.005  # second row for neighbouring small chain dimensions
-EDGE_TOL = 1.5e-4  # two coordinates closer than this are "the same line"
-MIN_EDGE_LEN = 5e-4  # shorter edges are not used for dimensions
+MARGIN_GUESS = 0.0084  # a view outline is wider than its geometry by about this much
+PICK_FRACTIONS = (0.5, 0.35, 0.65, 0.2, 0.8, 0.1, 0.9)
+DIM_OFFSET = 0.008
+DIM_TIER_STEP = 0.005
+EDGE_TOL = 1.5e-4
+MIN_EDGE_LEN = 5e-4
 
 
 class SwDrawingPdfExporter(DwgExporter):
     """
-    Creates a real SolidWorks drawing for every sheet metal part:
-    flat pattern + bend table + native (editable) flat pattern dimensions,
-    from the DEFAULT drawing template of SolidWorks.
-    Saves the .slddrw and exports the PDF from the saved drawing.
-    Every optional step is best effort and logged in `steps`.
+    For every sheet metal part:
+      1) copies master.slddrw (a complete sample drawing: flat pattern, bend table, bent views, title block),
+      2) replaces the model referenced by the copy with the part,
+      3) fits every view into the space it had in the master (same centre),
+      4) adds native dimensions on the flat pattern,
+      5) saves the .slddrw and exports the PDF from the SAVED .slddrw.
+    Every step is logged in `steps`.
     """
 
-    
     def __init__(
         self,
         sw_app,
         assembly_path=None,
         reconnect=None,
-        template=None,
-        paper_size=None,
-        bend_table=True,
+        master_drawing=None,
         dimensions=True,
-        bend_template=None,
-        pdf_from_saved_file=True,
-        edit_bend_table_text=True,
         dim_text_height=0.0025,
-        bottom_margin=BOTTOM_MARGIN,
-        sheet_format=None,        # Custom .slddrt sheet format (optional)
-        sheet_width=None,
-        sheet_height=None,
-        table_corner="bottom_right",   # bend table sits at the bottom right, against the frame
-        frame_right=0.011,             # distance of the template frame from the right sheet edge (m)
+        pdf_from_saved_file=True,
         **legacy_options,
     ):
         super().__init__(
@@ -81,123 +56,21 @@ class SwDrawingPdfExporter(DwgExporter):
             assembly_path=assembly_path,
             reconnect=reconnect,
         )
-
-        self.template = template
-        self.paper_size = paper_size
-        self.bend_table = bend_table
+        self.master_drawing = Path(master_drawing).resolve() if master_drawing else None
         self.dimensions = dimensions
-        self.bend_template = bend_template
-        self.pdf_from_saved_file = pdf_from_saved_file
-        self.edit_bend_table_text = edit_bend_table_text
         self.dim_text_height = dim_text_height
-        self.bottom_margin = bottom_margin
-        self.sheet_width = sheet_width
-        self.sheet_height = sheet_height
-        self.table_corner = table_corner
-        self.frame_right = frame_right
-        self._current_drawing = None
-        # Custom SolidWorks sheet format (.slddrt)
-        self.sheet_format = (
-            Path(sheet_format).resolve()
-            if sheet_format is not None
-            else None
-        )
-
-        self._template_path = None
+        self.pdf_from_saved_file = pdf_from_saved_file
         self._constants_cache = None
         self._select_error = ""
-    # =====================================================
-    # TEMPLATE (default SolidWorks drawing template)
-    # =====================================================
-
-    def find_template(self):
-        if self._template_path:
-            return self._template_path
-
-        candidates = []
-        if self.template:
-            candidates.append(str(self.template))
-
-        # 1) the default drawing template from the user's SolidWorks options
-        for index in range(0, 100):
-            try:
-                value = self.sw_app.GetUserPreferenceStringValue(index)
-            except Exception:
-                continue
-            if value and str(value).lower().endswith(".drwdot"):
-                candidates.append(str(value))
-
-        # 2) documented helper
-        try:
-            value = self.sw_app.GetDocumentTemplate(3, "", 0, 0.0, 0.0)
-            if value:
-                candidates.append(str(value))
-        except Exception:
-            pass
-
-        # 3) standard install folder
-        program_data = os.environ.get("ProgramData")
-        if program_data:
-            base = Path(program_data) / "SolidWorks"
-            if base.exists():
-                candidates += [
-                    str(p)
-                    for p in sorted(base.glob("SOLIDWORKS*/templates/*.drwdot"), reverse=True)
-                ]
-
-        for candidate in candidates:
-            if Path(candidate).exists():
-                self._template_path = candidate
-                return candidate
-        return None
-
-    def _find_bend_table_template(self):
-        if self.bend_template and Path(str(self.bend_template)).exists():
-            return str(self.bend_template)
-
-        roots = []
-        try:
-            executable = self.sw_app.GetExecutablePath()
-            if executable:
-                roots.append(Path(str(executable)))
-        except Exception:
-            pass
-
-        program_data = os.environ.get("ProgramData")
-        if program_data:
-            roots.append(Path(program_data) / "SolidWorks")
-
-        for root in roots:
-            try:
-                if root.exists():
-                    found = sorted(root.glob("**/*.sldbndtbt"), reverse=True)
-                    if found:
-                        return str(found[0])
-            except Exception:
-                continue
-        return ""
-
-    def _new_drawing(self, template, steps):
-        """New drawing from the default template, with the sheet of the template."""
-        size = self.paper_size if self.paper_size is not None else 0
-        try:
-            drawing = self.sw_app.NewDocument(template, size, 0.0, 0.0)
-            if drawing is not None:
-                return drawing
-        except Exception as exc:
-            steps.append(f"NewDocument failed ({str(exc)[:60]})")
-        return None
 
     # =====================================================
     # SOLIDWORKS CONSTANTS / UNITS
     # =====================================================
 
     def _constants(self):
-        """Enumeration values from the swconst.tlb installed with YOUR SolidWorks."""
         if self._constants_cache is not None:
             return self._constants_cache or None
         self._constants_cache = False
-
         try:
             import win32com.client as client
             from win32com.client import gencache
@@ -225,31 +98,6 @@ class SwDrawingPdfExporter(DwgExporter):
             pass
         return None
 
-    def _ensure_millimeters(self, drawing, steps):
-        """A template in INCHES shows a 2 mm radius as 0.08: switch the drawing to MMGS."""
-        constants = self._constants()
-        if constants is None:
-            steps.append(
-                "units: swconst.tlb could not be loaded - units NOT changed "
-                "(use a metric .drwdot as DRAWING_TEMPLATE_PATH if values look like inches)"
-            )
-            return False
-        try:
-            extension = self._call(drawing, "Extension")
-            extension.SetUserPreferenceInteger(
-                getattr(constants, "swUnitSystem"), NO_OPTION_SPECIFIED, getattr(constants, "swUnitSystem_MMGS")
-            )
-            extension.SetUserPreferenceInteger(
-                getattr(constants, "swUnitsLinear"), NO_OPTION_SPECIFIED, getattr(constants, "swMM")
-            )
-            current = extension.GetUserPreferenceInteger(getattr(constants, "swUnitsLinear"), NO_OPTION_SPECIFIED)
-            ok = current == getattr(constants, "swMM")
-            steps.append("units: " + ("millimetres" if ok else f"NOT millimetres (code {current})"))
-            return ok
-        except Exception as exc:
-            steps.append(f"units: could not set millimetres: {str(exc)[:60]}")
-            return False
-
     def _edge_code(self):
         constants = self._constants()
         try:
@@ -264,17 +112,6 @@ class SwDrawingPdfExporter(DwgExporter):
     @staticmethod
     def _r8_array(*values):
         return VARIANT(pythoncom.VT_ARRAY | pythoncom.VT_R8, tuple(float(v) for v in values))
-
-    def _sheet_size(self, drawing):
-        sheet = self._call(drawing, "GetCurrentSheet")
-        props = self._call(sheet, "GetProperties2")
-        try:
-            width, height = float(props[5]), float(props[6])
-            if width > 0 and height > 0:
-                return sheet, width, height
-        except Exception:
-            pass
-        return sheet, 0.297, 0.210
 
     def _outline(self, view):
         values = self._call(view, "GetOutline")
@@ -318,22 +155,6 @@ class SwDrawingPdfExporter(DwgExporter):
             and abs((after[1] + after[3]) / 2 - cy) < 0.002
         )
 
-    def _create_flat_view(self, drawing, model_path, configuration, x, y):
-        try:
-            view = drawing.CreateFlatPatternViewFromModelView3(
-                str(model_path), str(configuration or ""), x, y, 0.0, False, False
-            )
-            if view is not None:
-                return view
-        except Exception:
-            pass
-        try:
-            return drawing.CreateDrawViewFromModelView3(
-                str(model_path), "*Flat pattern", x, y, 0.0
-            )
-        except Exception:
-            return None
-
     def _close_doc(self, doc):
         """Close a document by its CURRENT title and path (the title changes after SaveAs)."""
         if doc is None:
@@ -349,212 +170,39 @@ class SwDrawingPdfExporter(DwgExporter):
             except Exception:
                 pass
 
-    # =====================================================
-    # BEND TABLE
-    # =====================================================
-
-    @staticmethod
-    def _method_signature(obj, method_name):
-        """(parameter names, parameter variant types) of a COM method, read from its type library."""
+    def _ensure_millimeters(self, drawing, steps):
+        constants = self._constants()
+        if constants is None:
+            steps.append("units: swconst.tlb could not be loaded - units NOT changed")
+            return False
         try:
-            typeinfo = obj._oleobj_.GetTypeInfo()
-            attr = typeinfo.GetTypeAttr()
-            for index in range(attr.cFuncs):
-                desc = typeinfo.GetFuncDesc(index)
-                names = typeinfo.GetNames(desc.memid)
-                if names and names[0].lower() == method_name.lower():
-                    args = getattr(desc, "args", None) or desc[2]
-                    types = []
-                    for arg in args:
-                        try:
-                            types.append(int(arg[0][0]))
-                        except Exception:
-                            types.append(None)
-                    return list(names[1:]), types
-        except Exception:
-            pass
-        return None, None
-
-    @staticmethod
-    def _guess_arguments(names, types, x, y, template):
-        values = []
-        for position, name in enumerate(names):
-            key = str(name).lower()
-            vt = types[position] if position < len(types) else None
-            if "anchorpoint" in key or "useanchor" in key:
-                values.append(False)
-            elif key == "x":
-                values.append(x)
-            elif key == "y":
-                values.append(y)
-            elif "anchortype" in key or key == "anchor":
-                values.append(ANCHOR_BOTTOM_RIGHT)
-            elif "template" in key:
-                values.append(template)
-            elif "startvalue" in key or "starttag" in key or "firsttag" in key:
-                values.append(FIRST_BEND_TAG)
-            elif vt == 11:  # VT_BOOL
-                values.append(False)
-            elif vt == 5:  # VT_R8
-                values.append(0.0)
-            elif vt == 8:  # VT_BSTR
-                values.append("")
-            else:
-                values.append(0)
-        return values
-
-    def _insert_bend_table(self, flat_view, x, y, steps):
-        template = self._find_bend_table_template()
-
-        attempts = []
-
-        names, types = self._method_signature(flat_view, "InsertBendTable")
-        if names:
-            arguments = self._guess_arguments(names, types, x, y, template)
-            steps.append(f"bend table signature: InsertBendTable({', '.join(map(str, names))})")
-            attempts.append(lambda: flat_view.InsertBendTable(*arguments))
-        else:
-            steps.append("bend table signature: could not be read from SolidWorks")
-
-        attempts += [
-            lambda: flat_view.InsertBendTable(False, x, y, ANCHOR_BOTTOM_RIGHT, FIRST_BEND_TAG, template),
-            lambda: flat_view.InsertBendTable(False, x, y, ANCHOR_BOTTOM_RIGHT, FIRST_BEND_TAG, ""),
-            lambda: flat_view.InsertBendTable(False, x, y, ANCHOR_BOTTOM_RIGHT, template),
-            lambda: flat_view.InsertBendTable(False, x, y, ANCHOR_BOTTOM_RIGHT, ""),
-            lambda: flat_view.InsertBendTable(False, ANCHOR_BOTTOM_RIGHT, template),
-            lambda: flat_view.InsertBendTable(False, ANCHOR_BOTTOM_RIGHT, ""),
-        ]
-        errors = []
-        for number, attempt in enumerate(attempts, start=1):
-            try:
-                table = attempt()
-                if table is not None:
-                    steps.append(f"bend table: inserted (variant {number}; first bend tag={FIRST_BEND_TAG})")
-                    return table
-                errors.append(f"v{number}: returned nothing")
-            except Exception as exc:
-                errors.append(f"v{number}: {str(exc)[:70]}")
-        steps.append("bend table: FAILED (" + " | ".join(errors) + ")")
-        return None
-
-    def _set_bend_table_headers(self, table, steps):
-        headers = ("Tag", "Direction", "Angle", "Inner Radius")
-        try:
-            columns = int(self._get(table, "ColumnCount") or 0)
-        except Exception:
-            columns = 0
-        if columns < len(headers):
-            steps.append(f"bend table headers: expected 4 columns, found {columns}")
+            extension = self._call(drawing, "Extension")
+            extension.SetUserPreferenceInteger(
+                getattr(constants, "swUnitSystem"), NO_OPTION_SPECIFIED, getattr(constants, "swUnitSystem_MMGS")
+            )
+            extension.SetUserPreferenceInteger(
+                getattr(constants, "swUnitsLinear"), NO_OPTION_SPECIFIED, getattr(constants, "swMM")
+            )
+            current = extension.GetUserPreferenceInteger(getattr(constants, "swUnitsLinear"), NO_OPTION_SPECIFIED)
+            ok = current == getattr(constants, "swMM")
+            steps.append("units: " + ("millimetres" if ok else f"NOT millimetres (code {current})"))
+            return ok
+        except Exception as exc:
+            steps.append(f"units: could not set millimetres: {str(exc)[:60]}")
             return False
 
-        changed = 0
-        for column, header in enumerate(headers):
-            current = self._call(table, "Text", 0, column)
-            if isinstance(current, str) and current.strip() == header:
-                changed += 1
-                continue
-            written = False
-            for setter in (
-                lambda c=column, h=header: table.SetText(0, c, h),
-                lambda c=column, h=header: table.Text(0, c, h),
-            ):
-                try:
-                    setter()
-                    written = True
-                    break
-                except Exception:
-                    pass
-            if written:
-                changed += 1
-            else:
-                steps.append(f"bend table header not changed: column {column} -> {header}")
+    # =====================================================
+    # TABLE REPORT
+    # =====================================================
 
-        try:
-            self._call(table, "Update")
-        except Exception:
-            pass
-        steps.append(f"bend table headers: {changed}/4 ok (Tag / Direction / Angle / Inner Radius)")
-        return changed == 4
-
-    def _drop_blank_row(self, table, steps):
-        """The default bend table has an empty row under the header; remove it."""
-        try:
-            rows = int(self._get(table, "RowCount"))
-            columns = int(self._get(table, "ColumnCount"))
-            if rows < 3:
-                return
-
-            def row_text(r):
-                return "".join(str(self._call(table, "Text", r, c) or "").strip() for c in range(columns))
-
-            if row_text(1) or not row_text(2):
-                return
-            for args in ((1, True), (1,)):
-                try:
-                    table.DeleteRow2(*args)
-                    break
-                except Exception:
-                    continue
-            after = int(self._get(table, "RowCount"))
-            steps.append("bend table: empty row removed" if after < rows else "bend table: empty row could not be removed")
-        except Exception as exc:
-            steps.append(f"bend table: empty row not removed ({str(exc)[:50]})")
-
-    def _table_size(self, table):
-        rows = self._get(table, "RowCount")
-        columns = self._get(table, "ColumnCount")
-        try:
-            rows = int(rows)
-        except Exception:
-            rows = 0
-        try:
-            columns = int(columns)
-        except Exception:
-            columns = 0
-
-        height = 0.0
-        for row in range(rows):
-            value = self._call(table, "GetRowHeight", row)
-            try:
-                height += float(value)
-            except Exception:
-                height += ROW_HEIGHT_GUESS
-        if height <= 0:
-            height = max(rows, 1) * ROW_HEIGHT_GUESS
-
-        width = 0.0
-        for column in range(columns):
-            value = self._call(table, "GetColumnWidth", column)
-            try:
-                width += float(value)
-            except Exception:
-                width = 0.0
-                break
-        if width <= 0:
-            width = TABLE_WIDTH_GUESS
-        return width, height
-
-    def _place_bend_table(self, table, x_right, y_bottom, steps):
-        """
-        InsertBendTable already places the table with its bottom-right corner at
-        (x_right, y_bottom) because it is called with anchor type BOTTOM_RIGHT,
-        so no move is needed. This only reports the size.
-        """
-        width, height = self._table_size(table)
-        steps.append(
-            f"bend table: bottom-right corner at ({x_right * 1000:.0f}, {y_bottom * 1000:.0f}) mm, "
-            f"size {width * 1000:.0f} x {height * 1000:.0f} mm"
-        )
-        return height
     def _describe_table(self, table, steps):
         try:
             rows = int(self._get(table, "RowCount"))
             columns = int(self._get(table, "ColumnCount"))
         except Exception:
-            steps.append("bend table content: could not be read")
+            steps.append("table content: could not be read")
             return
-
-        steps.append(f"bend table content ({max(rows - 1, 0)} rows after the header):")
+        steps.append(f"table content ({max(rows - 1, 0)} rows after the header):")
         for row in range(min(rows, 40)):
             cells = []
             for column in range(columns):
@@ -568,7 +216,6 @@ class SwDrawingPdfExporter(DwgExporter):
 
     @staticmethod
     def _xyz(value):
-        """Read a SolidWorks point (object with X/Y/Z) or an array into an XYZ tuple."""
         if value is None:
             return None
         try:
@@ -597,7 +244,6 @@ class SwDrawingPdfExporter(DwgExporter):
             return []
 
     def _select_at(self, drawing, x, y, append, kinds=("EDGE", "SKETCHSEGMENT")):
-        """Select an entity at sheet coordinates (metres). Only used as a fallback for bend lines."""
         try:
             ext = drawing.Extension
         except Exception as exc:
@@ -616,7 +262,6 @@ class SwDrawingPdfExporter(DwgExporter):
         return False
 
     def _select_object(self, drawing, view, obj, append):
-        """Select a COM entity (edge, bend line segment ...) inside a drawing view."""
         try:
             sel_mgr = drawing.SelectionManager
             data = sel_mgr.CreateSelectData()
@@ -650,7 +295,6 @@ class SwDrawingPdfExporter(DwgExporter):
         self._clear(drawing)
 
     def _style_dimension(self, dim):
-        """No parentheses and a text height that fits small views."""
         try:
             dim.ShowParenthesis = False
         except Exception:
@@ -665,7 +309,6 @@ class SwDrawingPdfExporter(DwgExporter):
                 pass
 
     def _add_checked_dimension(self, drawing, label, expected, tol=None):
-        """AddDimension2 for the current selection. Kept only if its value matches `expected` (metres)."""
         try:
             dim = drawing.AddDimension2(float(label[0]), float(label[1]), 0.0)
         except Exception as exc:
@@ -700,11 +343,10 @@ class SwDrawingPdfExporter(DwgExporter):
         return self._add_checked_dimension(drawing, label, expected, tol)
 
     # =====================================================
-    # VIEW GEOMETRY: the real edges of a view, in sheet coordinates
+    # VIEW GEOMETRY
     # =====================================================
 
     def _visible_edges(self, view):
-        """[{edge, points (model xyz of the end vertices), line (bool)}] of the edges SolidWorks shows in the view."""
         null = VARIANT(pythoncom.VT_DISPATCH, None)
         try:
             result = view.GetVisibleEntities2(null, self._edge_code())
@@ -730,11 +372,6 @@ class SwDrawingPdfExporter(DwgExporter):
         return edges
 
     def _projector(self, view):
-        """
-        Returns (project, how, errors): project(model_xyz) -> (x, y) in view space.
-        1) SolidWorks' own math objects (several ways to pass the point),
-        2) the 4x4 transform data (ArrayData of ModelToViewTransform, or IView.GetXform) applied in Python.
-        """
         errors = []
         transform = self._call(view, "ModelToViewTransform")
         math_util = self._call(self.sw_app, "GetMathUtility")
@@ -757,7 +394,10 @@ class SwDrawingPdfExporter(DwgExporter):
                 except Exception as exc:
                     errors.append(f"{label}: {str(exc)[:70]}")
         else:
-            errors.append(f"transform={'ok' if transform is not None else 'None'}, math utility={'ok' if math_util is not None else 'None'}")
+            errors.append(
+                f"transform={'ok' if transform is not None else 'None'}, "
+                f"math utility={'ok' if math_util is not None else 'None'}"
+            )
 
         sources = (
             ("ModelToViewTransform.ArrayData", lambda: transform.ArrayData),
@@ -792,12 +432,6 @@ class SwDrawingPdfExporter(DwgExporter):
         return fallback
 
     def _view_geometry(self, view, scale_hint, steps, tag):
-        """
-        Reads the edges of a view and puts them on the sheet.
-        The transform SolidWorks gives (model -> view) is checked against the view outline
-        (scale included or not, origin at the view or at the sheet), so the result is
-        self-calibrating. Returns None - and no dimension is made - when nothing fits.
-        """
         edges = self._visible_edges(view)
         if not edges:
             steps.append(f"{tag}: no edges returned by SolidWorks ({self._select_error or 'empty list'})")
@@ -890,7 +524,6 @@ class SwDrawingPdfExporter(DwgExporter):
     # =====================================================
 
     def _dimension_overall(self, drawing, view, geo, steps, tag):
-        """Overall length (above the view) and height (right of the view), between the outermost straight edges."""
         x0, y0, x1, y1 = geo["bbox"]
         scale = geo["scale"]
         vertical, horizontal = self._vertical(geo["lines"]), self._horizontal(geo["lines"])
@@ -920,11 +553,10 @@ class SwDrawingPdfExporter(DwgExporter):
         return made
 
     # =====================================================
-    # BEND LINES: positions from the geometry, checked with the A/B/C tag notes
+    # BEND LINES
     # =====================================================
 
     def _view_tags(self, view):
-        """[(letter, x, y)] of the single-letter notes (bend tags) that SolidWorks put on the flat pattern."""
         found = []
 
         def add(text, pos):
@@ -968,10 +600,6 @@ class SwDrawingPdfExporter(DwgExporter):
         return sorted(unique.values(), key=lambda t: t[0])
 
     def _fit_bend_mapping(self, pairs, tags, bbox, den, steps):
-        """
-        Fallback: sketch coordinates (real metres) -> sheet coordinates:  sheet = T + (1/den) * M * p.
-        M is one of the 8 rotations/flips; T comes from the tag positions (a tag sits on its bend line).
-        """
         n = len(pairs)
         if n == 0 or len(tags) < n:
             steps.append(f"flat dimensions: {len(tags)} tags found for {n} bend lines - cannot locate the bend lines")
@@ -1026,11 +654,6 @@ class SwDrawingPdfExporter(DwgExporter):
         return mapper
 
     def _bend_mapper(self, pairs, tags, geo, steps):
-        """
-        Returns (mapper, exact). First try: the bend lines go through the same model->view transform as the
-        edges (exact). It is accepted only if every bend line lies inside the geometry and, when tags exist,
-        each tag is next to its bend line. Otherwise the tag based fit is used.
-        """
         x0, y0, x1, y1 = geo["bbox"]
         pad = 0.001
         n = len(pairs)
@@ -1071,7 +694,6 @@ class SwDrawingPdfExporter(DwgExporter):
         return self._select_object(drawing, view, ent["edge"], append)
 
     def _dimension_chain(self, drawing, view, entities, geo, bottom_row, exact):
-        """edge -> bend -> bend -> ... -> edge, one dimension between every neighbouring pair."""
         x0, y0, x1, y1 = geo["bbox"]
         scale = geo["scale"]
         made = 0
@@ -1087,7 +709,7 @@ class SwDrawingPdfExporter(DwgExporter):
                 self._clear(drawing)
                 continue
             mid = (e1["coord"] + e2["coord"]) / 2
-            tier = DIM_TIER_STEP if (gap < 0.012 and index % 2) else 0.0  # small neighbours: texts on two rows
+            tier = DIM_TIER_STEP if (gap < 0.012 and index % 2) else 0.0
             label = (mid, y0 - DIM_OFFSET - tier) if bottom_row else (x0 - DIM_OFFSET - tier, mid)
             both_bends = e1["kind"] == "bend" and e2["kind"] == "bend"
             tol = None if (exact or both_bends) else 0.003 / scale
@@ -1098,11 +720,6 @@ class SwDrawingPdfExporter(DwgExporter):
         return made
 
     def _insert_flat_pattern_dimensions(self, drawing, view, den, steps):
-        """
-        Overall length (top) and height (right) + chain dimensions
-        edge | bend | bend | edge along the bottom (vertical bend lines) and the left (horizontal bend lines).
-        Needs the bend table to exist already (its A/B/C tags are used to check where the bend lines are).
-        """
         tag = "flat dimensions"
         self._select_error = ""
         geo = self._view_geometry(view, 1.0 / den, steps, tag)
@@ -1176,8 +793,18 @@ class SwDrawingPdfExporter(DwgExporter):
         return "1:" + f"{den:.2f}".rstrip("0").rstrip(".")
 
     # =====================================================
-    # SAVE / PDF
+    # OPEN / SAVE / PDF
     # =====================================================
+
+    def _open_drawing(self, path, steps):
+        try:
+            return self.sw_app.OpenDoc6(
+                str(path), SW_DOC_DRAWING, SW_OPEN_SILENT, "",
+                self._byref_i4(), self._byref_i4(),
+            )
+        except Exception as exc:
+            steps.append(f"opening the .slddrw failed: {str(exc)[:100]}")
+            return None
 
     def _export_pdf(self, doc, pdf_path, steps):
         attempts = (
@@ -1197,71 +824,138 @@ class SwDrawingPdfExporter(DwgExporter):
                 return True
         return False
 
-    
-    def _open_drawing(self, path, steps):
+    # =====================================================
+    # MASTER DRAWING
+    # =====================================================
+
+    def _model_views(self, drawing):
+        """All real views of the drawing (the first 'view' is the sheet itself and is skipped)."""
+        views = []
+        view = self._call(drawing, "GetFirstView")
+        view = self._call(view, "GetNextView") if view is not None else None
+        guard = 0
+        while view is not None and guard < 100:
+            guard += 1
+            views.append(view)
+            view = self._call(view, "GetNextView")
+        return views
+
+    def _set_view_scale(self, view, scale):
         try:
-            return self.sw_app.OpenDoc6(
-                str(path),
-                SW_DOC_DRAWING,
-                SW_OPEN_SILENT,
-                "",
-                self._byref_i4(),
-                self._byref_i4(),
-            )
-        except Exception as exc:
-            steps.append(
-                f"reopening the .slddrw failed: {str(exc)[:100]}"
-            )
-            return None
-
-    
-    def _apply_sheet_format(self, drawing, steps):
-        if not self.sheet_format:
-            steps.append("sheet format: none configured, using the template sheet")
+            view.UseSheetScale = False
+        except Exception:
+            pass
+        try:
+            view.ScaleDecimal = float(scale)
             return True
-
-        format_path = Path(self.sheet_format).resolve()
-        if not format_path.is_file():
-            steps.append(f"sheet format: file not found: {format_path}")
+        except Exception:
+            pass
+        try:
+            view.ScaleRatio = self._r8_array(1.0, 1.0 / float(scale))
+            return True
+        except Exception:
             return False
 
-        constants = self._constants()
-        custom = getattr(constants, "swDwgTemplateCustom", 12) if constants else 12
-        user_defined = getattr(constants, "swDwgPapersUserDefined", 12) if constants else 12
+    def _fit_view_to_slot(self, view, slot, steps):
+        """Scale a view so that it fits the space it had in the master and keep the same centre."""
+        name = slot["name"]
+        cx, cy, slot_w, slot_h = slot["box"]
+        if not self._set_view_scale(view, 1.0):
+            steps.append(f"view {name}: scale could not be set (child view follows its parent?)")
+            return 1.0 / self._scale_of(view, 1.0)
+        outline = self._outline(view)
+        if outline is None:
+            steps.append(f"view {name}: outline not readable")
+            return 1.0
+        raw_w, raw_h = outline[2] - outline[0], outline[3] - outline[1]
+        den = self._fit_denominator(raw_w, raw_h, slot_w, slot_h)
+        self._set_view_scale(view, 1.0 / den)
+        moved = self._move_view_center(view, cx, cy)
+        steps.append(
+            f"view {name}: {raw_w * 1000:.0f} x {raw_h * 1000:.0f} mm at 1:1 -> scale {self._scale_text(den)}"
+            + ("" if moved else " (centre NOT confirmed)")
+        )
+        return den
 
+    def _replace_model(self, drawing_path, old_ref, new_ref, steps):
+        """The drawing must be CLOSED. Replaces the model referenced by the drawing file."""
         try:
-            sheet = drawing.GetCurrentSheet()
-            name = sheet.GetName()
-            _, w, h = self._sheet_size(drawing)
-            # size of YOUR format (A3 = 0.420 x 0.297)
-            w = self.sheet_width or w
-            h = self.sheet_height or h
-
-            ok = drawing.SetupSheet5(
-                name, user_defined, custom, 1.0, 1.0, True,
-                str(format_path), float(w), float(h), "", True,
-            )
-            if ok:
-                drawing.ForceRebuild3(False)
-                steps.append(f"sheet format applied (SetupSheet5): {format_path.name}")
+            result = self.sw_app.ReplaceReferencedDocument(str(drawing_path), str(old_ref), str(new_ref))
+            steps.append(f"model replaced (ReplaceReferencedDocument): result={result}")
+            if result in (None, True, 1):
                 return True
-            steps.append("SetupSheet5 returned False")
         except Exception as exc:
-            steps.append(f"SetupSheet5 failed: {type(exc).__name__}: {str(exc)[:100]}")
-
-        # second attempt
-        try:
-            sheet = drawing.GetCurrentSheet()
-            sheet.SetTemplateName(str(format_path))
-            code = sheet.ReloadTemplate(True)      # 0 = success
-            if code in (0, None, True):
-                drawing.ForceRebuild3(False)
-                steps.append(f"sheet format applied (ReloadTemplate): {format_path.name}")
-                return True
-            steps.append(f"ReloadTemplate error code: {code}")
-        except Exception as exc:
-            steps.append(f"ReloadTemplate failed: {type(exc).__name__}: {str(exc)[:100]}")
+            steps.append(f"ReplaceReferencedDocument failed ({type(exc).__name__}: {str(exc)[:80]})")
         return False
+
+    def _replace_model_in_open_drawing(self, drawing, views, new_ref, steps):
+        """Fallback: replace the model of the views while the drawing is open (IDrawingDoc.ReplaceViewModel)."""
+        names = [str(self._call(v, "GetName2") or "") for v in views]
+        attempts = (
+            ("names", lambda: drawing.ReplaceViewModel(str(new_ref), tuple(names), tuple([""] * len(names)))),
+            ("variant", lambda: drawing.ReplaceViewModel(
+                str(new_ref),
+                VARIANT(pythoncom.VT_ARRAY | pythoncom.VT_VARIANT, tuple(names)),
+                VARIANT(pythoncom.VT_ARRAY | pythoncom.VT_VARIANT, tuple([""] * len(names))))),
+        )
+        for label, attempt in attempts:
+            try:
+                result = attempt()
+                steps.append(f"model replaced (ReplaceViewModel {label}): result={result}")
+                if result in (None, True, 1):
+                    return True
+            except Exception as exc:
+                steps.append(f"ReplaceViewModel {label} failed ({type(exc).__name__}: {str(exc)[:70]})")
+        return False
+
+    def _update_tables(self, view, steps, tag):
+        try:
+            tables = list(self._call(view, "GetTableAnnotations") or [])
+        except Exception:
+            tables = []
+        steps.append(f"{tag}: tables on the flat pattern view: {len(tables)}")
+        for table in tables:
+            try:
+                table.Update()
+            except Exception:
+                pass
+            self._describe_table(table, steps)
+
+    def _save_and_pdf(self, drawing, slddrw_path, pdf_path, steps):
+        """Saves the drawing, closes it, reopens the SAVED file and exports the PDF from it."""
+        before = slddrw_path.stat().st_mtime if slddrw_path.exists() else 0
+        saved = False
+        try:
+            result = drawing.Save3(1, self._byref_i4(), self._byref_i4())
+            saved = bool(result) or (slddrw_path.exists() and slddrw_path.stat().st_mtime > before)
+        except Exception as exc:
+            steps.append(f"Save3 failed ({str(exc)[:60]})")
+        if not saved:
+            try:
+                drawing.SaveAs3(str(slddrw_path), 0, 1)
+                saved = self._written(slddrw_path)
+            except Exception as exc:
+                steps.append(f"SaveAs3 failed ({str(exc)[:60]})")
+        steps.append("saved .slddrw" if saved else "save .slddrw: NOT confirmed")
+
+        if pdf_path.exists():
+            try:
+                pdf_path.unlink()
+            except Exception:
+                pass
+
+        if self.pdf_from_saved_file and saved:
+            self._close_doc(drawing)
+            reopened = self._open_drawing(slddrw_path, steps)
+            if reopened is not None:
+                ok = self._export_pdf(reopened, pdf_path, steps)
+                if ok:
+                    steps.append("PDF exported from the saved .slddrw")
+                self._close_doc(reopened)
+                return ok, True
+            steps.append("could not reopen the saved .slddrw")
+            return False, True
+        return self._export_pdf(drawing, pdf_path, steps), False
 
     # =====================================================
     # ONE PART
@@ -1275,157 +969,123 @@ class SwDrawingPdfExporter(DwgExporter):
         opened_by_us = False
         previous_config = None
         drawing = None
-        reopened = None
 
         try:
-            template = self.find_template()
-            if not template:
-                return False, "no drawing template found (set DRAWING_TEMPLATE_PATH in main.py)", steps
-            steps.append(f"template: {Path(template).name}")
-
+            master = self.master_drawing
+            if master is None or not master.is_file():
+                return False, f"master drawing not found: {master}", steps
+            steps.append(f"master: {master.name}")
             steps.append(f"part file: {path} (exists={path.exists()})")
+
             model, opened_by_us, open_status = self._open_part(path)
             if model is None:
                 time.sleep(2)
                 model, opened_by_us, open_status = self._open_part(path)
             if model is None:
                 return False, f"cannot open part: {open_status}", steps
-
             _, previous_config = self._activate_configuration(model, configuration)
 
-            drawing = self._new_drawing(template, steps)
-            self._current_drawing = drawing
-            if drawing is None:
-                return False, "NewDocument returned nothing", steps
-
-            self._ensure_millimeters(drawing, steps)
-
-            if not self._apply_sheet_format(drawing, steps):
-                steps.append("WARNING: custom sheet format NOT applied, continuing with the default template")
-
-            sheet, sheet_w, sheet_h = self._sheet_size(drawing)
-            steps.append(f"sheet: {sheet_w * 1000:.0f} x {sheet_h * 1000:.0f} mm (from the default template)")
-            self._call(sheet, "SetScale", 1.0, 1.0, True, True)
-            self._select_error = ""
-
-            # ---- 1) flat pattern at 1:1 to learn its size ----
-            flat = self._create_flat_view(drawing, path, configuration, sheet_w / 2, sheet_h / 2)
-            outline = self._outline(flat) if flat is not None else None
-            if outline is None:
-                return False, "flat pattern view could not be created", steps
-            raw_w, raw_h = outline[2] - outline[0], outline[3] - outline[1]
-            steps.append(f"flat pattern view: {raw_w * 1000:.0f} x {raw_h * 1000:.0f} mm at 1:1")
-
-            # ---- 2) layout and scale ----
-            bend_count = len(self._get_bend_lines(flat))
-            table_estimate = (bend_count + 3) * ROW_HEIGHT_GUESS if self.bend_table else 0.0
-
-            # bottom-right corner of the bend table, against the template frame
-            table_right = sheet_w - self.frame_right - 0.001
-
-            area_x0 = SIDE_MARGIN + FLAT_DIM_ROOM
-            area_x1 = sheet_w - SIDE_MARGIN - FLAT_DIM_ROOM
-
-            if self.table_corner == "top_right":
-                table_bottom = sheet_h - TOP_MARGIN - table_estimate
-                area_top = table_bottom - FLAT_BOTTOM_ROOM
-                area_bottom = self.bottom_margin + FLAT_DIM_ROOM
-            else:  # "bottom_right"
-                table_bottom = self.bottom_margin + 0.001
-                area_top = sheet_h - TOP_MARGIN - FLAT_DIM_ROOM
-                area_bottom = table_bottom + table_estimate + FLAT_BOTTOM_ROOM
-
-            flat_den = self._fit_denominator(
-                raw_w, raw_h, area_x1 - area_x0, area_top - area_bottom
-            )
-            steps.append(f"scale: flat pattern {self._scale_text(flat_den)}")
-            self._call(sheet, "SetScale", 1.0, float(flat_den), True, True)
-
-            # ---- 3) position ----
-            fx = (area_x0 + area_x1) / 2
-            fy = (area_top + area_bottom) / 2
-            if not self._move_view_center(flat, fx, fy):
-                return False, "could not move the flat view", steps
-            self._call(drawing, "ForceRebuild3", False)
-
-            # ---- 4) bend table first: it creates the A/B/C tags used to check the bend line positions ----
-            if self.bend_table:
-                table = self._insert_bend_table(flat, table_right, table_bottom, steps)
-                if table is not None:
-                    if self.edit_bend_table_text:
-                        self._set_bend_table_headers(table, steps)
-                        self._drop_blank_row(table, steps)
-                    table_height = self._place_bend_table(table, table_right, table_bottom, steps)
-                    if table_height > table_estimate + 0.003:
-                        steps.append(
-                            f"WARNING: table is {table_height * 1000:.0f} mm tall, only "
-                            f"{table_estimate * 1000:.0f} mm were reserved - it may touch the flat pattern"
-                        )
-                    self._describe_table(table, steps)
-                else:
-                    steps.append("BEND TABLE MISSING in this drawing")
-
-            # ---- 5) native dimensions of the flat pattern ----
-            self._call(drawing, "ForceRebuild3", False)
-            self._call(drawing, "ViewZoomtofit2")
-            if self.dimensions:
-                self._insert_flat_pattern_dimensions(drawing, flat, flat_den, steps)
-                self._clear(drawing)
-            self._call(drawing, "ForceRebuild3", False)
-
-            # ---- 6) save the drawing, then the PDF ----
-            self._call(drawing, "ViewZoomtofit2")
+            # ---- 1) copy the master ----
             slddrw_path.parent.mkdir(parents=True, exist_ok=True)
             pdf_path.parent.mkdir(parents=True, exist_ok=True)
-            for old in (slddrw_path, pdf_path):
-                if old.exists():
+            if slddrw_path.exists():
+                slddrw_path.unlink()
+            shutil.copy2(str(master), str(slddrw_path))
+            try:
+                os.chmod(str(slddrw_path), 0o666)
+            except Exception:
+                pass
+
+            # ---- 2) read the model reference and the space of every view ----
+            doc = self._open_drawing(slddrw_path, steps)
+            if doc is None:
+                return False, "cannot open the copy of the master", steps
+            old_ref = None
+            slots = {}
+            for view in self._model_views(doc):
+                name = str(self._call(view, "GetName2") or "")
+                ref = self._call(view, "GetReferencedModelName")
+                if ref and not old_ref:
+                    old_ref = str(ref)
+                outline = self._outline(view)
+                if outline is None or not name:
+                    continue
+                slots[name] = {
+                    "name": name,
+                    "box": ((outline[0] + outline[2]) / 2, (outline[1] + outline[3]) / 2,
+                            outline[2] - outline[0], outline[3] - outline[1]),
+                }
+            self._close_doc(doc)
+            doc = None
+            steps.append(f"master views: {', '.join(slots) or 'NONE'}; model: {Path(old_ref).name if old_ref else '?'}")
+            if not old_ref or not slots:
+                return False, "no model views found in the master drawing", steps
+
+            # ---- 3) replace the model (drawing closed) ----
+            replaced_in_closed = True
+            same_part = False
+            try:
+                same_part = Path(old_ref).resolve() == path
+            except Exception:
+                pass
+            if not same_part:
+                try:
+                    self.sw_app.CloseDoc(old_ref)
+                except Exception:
+                    pass
+                replaced_in_closed = self._replace_model(slddrw_path, old_ref, path, steps)
+            else:
+                steps.append("the part is the master's own part - no replacement needed")
+
+            # ---- 4) reopen, replace in the open drawing if needed, rebuild, fit views ----
+            drawing = self._open_drawing(slddrw_path, steps)
+            if drawing is None:
+                return False, "cannot reopen the drawing", steps
+            if not replaced_in_closed:
+                if not self._replace_model_in_open_drawing(drawing, self._model_views(drawing), path, steps):
+                    return False, "could not replace the model in the drawing", steps
+            self._ensure_millimeters(drawing, steps)
+            self._call(drawing, "ForceRebuild3", False)
+
+            flat_view, flat_den = None, 1.0
+            for view in self._model_views(drawing):
+                name = str(self._call(view, "GetName2") or "")
+                if configuration:
                     try:
-                        old.unlink()
+                        view.ReferencedConfiguration = str(configuration)
                     except Exception:
                         pass
+                slot = slots.get(name)
+                if slot is None:
+                    continue
+                den = self._fit_view_to_slot(view, slot, steps)
+                is_flat = bool(self._call(view, "IsFlatPatternView", default=False))
+                if is_flat:
+                    flat_view, flat_den = view, den
+            self._call(drawing, "ForceRebuild3", False)
 
-            saved_drawing = False
-            try:
-                drawing.SaveAs3(str(slddrw_path), 0, 1)
-            except Exception as exc:
-                steps.append(f"save .slddrw: FAILED ({str(exc)[:60]})")
+            # ---- 5) bend table update + dimensions ----
+            if flat_view is None:
+                steps.append("WARNING: no flat pattern view found in the drawing")
             else:
-                saved_drawing = self._written(slddrw_path)
-                steps.append("saved .slddrw" if saved_drawing else "save .slddrw: no file")
+                self._update_tables(flat_view, steps, "bend table")
+                if self.dimensions:
+                    self._insert_flat_pattern_dimensions(drawing, flat_view, flat_den, steps)
+                    self._clear(drawing)
+            self._call(drawing, "ForceRebuild3", False)
+            self._call(drawing, "ViewZoomtofit2")
 
-            # first PDF straight from the open drawing (safety net) ...
-            saved_pdf = self._export_pdf(drawing, pdf_path, steps)
-
-            # ... then the final PDF from the SAVED .slddrw (close it, open the file again)
-            if self.pdf_from_saved_file and saved_drawing:
-                self._close_doc(drawing)
+            # ---- 6) save + PDF from the saved file ----
+            ok, closed = self._save_and_pdf(drawing, slddrw_path, pdf_path, steps)
+            if closed:
                 drawing = None
-                reopened = self._open_drawing(slddrw_path, steps)
-                if reopened is not None:
-                    temp_pdf = pdf_path.with_name(pdf_path.stem + "__from_slddrw.pdf")
-                    if temp_pdf.exists():
-                        try:
-                            temp_pdf.unlink()
-                        except Exception:
-                            pass
-                    if self._export_pdf(reopened, temp_pdf, steps):
-                        try:
-                            os.replace(str(temp_pdf), str(pdf_path))
-                            saved_pdf = True
-                            steps.append("PDF exported from the saved .slddrw")
-                        except Exception as exc:
-                            steps.append(f"could not replace the PDF ({str(exc)[:50]}), kept the first one")
-                    else:
-                        steps.append("PDF from the saved .slddrw failed, kept the PDF made from the open drawing")
-
-            if not saved_pdf:
+            if not ok:
                 return False, "PDF was not written", steps
-            return True, "SolidWorks drawing", steps
+            return True, "SolidWorks drawing (from master)", steps
 
         except Exception as exc:
             return False, f"{type(exc).__name__}: {exc}", steps
         finally:
-            self._close_doc(reopened)
             self._close_doc(drawing)
             if model is not None:
                 self._restore_configuration(model, previous_config)
@@ -1442,111 +1102,7 @@ class SwDrawingPdfExporter(DwgExporter):
 
         return ok, message, steps
 
-    # =====================================================
-    # ALL PARTS
-    # =====================================================
-
     @staticmethod
     def _safe_name(name):
         cleaned = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", str(name)).strip().rstrip(".")
         return re.sub(r"\s+", " ", cleaned) or "part"
-
-    def export_all(self, exported_parts, output_folder, fallback=None, limit=None):
-        """
-        exported_parts: [{"item": {...}, "dxf": Path}] as returned by ThicknessDwgBuilder.
-        PDFs go to <output_folder>/<thickness>mm/<part>.pdf, editable drawings to
-        <output_folder>/_drawings/<thickness>mm/<part>.slddrw.
-        fallback: a PdfDrawingExporter used when the SolidWorks drawing fails.
-        """
-        output_folder = Path(output_folder)
-        output_folder.mkdir(parents=True, exist_ok=True)
-
-        entries = sorted(
-            exported_parts,
-            key=lambda e: (e["item"].get("thickness") or 0, e["item"]["name"]),
-        )
-        if limit:
-            entries = entries[: int(limit)]
-        total = len(entries)
-
-        print()
-        print("=" * 60)
-        print("PDF DRAWINGS (flat pattern + bend table, one folder per thickness)")
-        print("=" * 60)
-        template = self.find_template()
-        print(f"Drawing template: {template or 'NOT FOUND'}")
-        if limit:
-            print(f"TEST MODE: only the first {total} parts")
-
-        rows, used = [], set()
-        sw_count = fallback_count = 0
-        failed = []
-
-        for index, entry in enumerate(entries, start=1):
-            item, dxf_path = entry["item"], entry["dxf"]
-            name = item["name"]
-            thickness = item.get("thickness")
-            folder_name = "unknown_thickness" if thickness is None else f"{thickness:g}mm"
-
-            base = self._safe_name(name)
-            unique, counter = base, 2
-            while f"{folder_name}/{unique}".lower() in used:
-                unique, counter = f"{base}_{counter}", counter + 1
-            used.add(f"{folder_name}/{unique}".lower())
-
-            pdf_path = output_folder / folder_name / f"{unique}.pdf"
-            slddrw_path = output_folder / "_drawings" / folder_name / f"{unique}.slddrw"
-            pdf_path.parent.mkdir(parents=True, exist_ok=True)
-
-            label = f"[{index}/{total}] {name}"
-            started = time.time()
-            ok, message, steps = self.export_part(item, slddrw_path, pdf_path)
-
-            if ok:
-                sw_count += 1
-                print(f"{label} -> {folder_name}/{pdf_path.name} ({time.time() - started:.0f}s)")
-                for line in steps:
-                    print(f"      {line}")
-                rows.append([name, thickness, item.get("quantity"),
-                             f"{folder_name}/{pdf_path.name}", "SolidWorks", " | ".join(steps)])
-                continue
-
-            print(f"{label} -> SolidWorks drawing FAILED: {message}")
-            for line in steps:
-                print(f"      {line}")
-
-            if fallback is not None:
-                ok2, message2 = fallback.export_part(item, dxf_path, pdf_path)
-                if ok2:
-                    fallback_count += 1
-                    print(f"      fallback PDF created ({message2})")
-                    rows.append([name, thickness, item.get("quantity"),
-                                 f"{folder_name}/{pdf_path.name}", "fallback",
-                                 f"{message} | " + " | ".join(steps)])
-                    continue
-                message = f"{message}; fallback: {message2}"
-
-            failed.append((name, message))
-            rows.append([name, thickness, item.get("quantity"), "", "FAILED", message])
-
-        report = output_folder / "pdf_report.csv"
-        try:
-            with open(report, "w", newline="", encoding="utf-8-sig") as f:
-                writer = csv.writer(f)
-                writer.writerow(["Part", "Thickness (mm)", "Quantity", "PDF", "Method", "Details"])
-                writer.writerows(rows)
-        except Exception as exc:
-            print(f"Could not save PDF report: {exc}")
-            report = None
-
-        print()
-        print(f"PDFs: {sw_count} SolidWorks drawings, {fallback_count} fallback, {len(failed)} failed (of {total})")
-
-        return {
-            "created": sw_count + fallback_count,
-            "solidworks": sw_count,
-            "fallback": fallback_count,
-            "failed": len(failed),
-            "failed_parts": failed,
-            "report_path": report,
-        }
