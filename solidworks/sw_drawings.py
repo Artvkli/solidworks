@@ -74,6 +74,7 @@ class SwDrawingPdfExporter(DwgExporter):
         self.pdf_from_saved_file = pdf_from_saved_file
         self.remove_master_dimensions = remove_master_dimensions
         self._constants_cache = None
+        self._typelib_cache = None
         self._select_error = ""
 
     # =====================================================
@@ -110,6 +111,49 @@ class SwDrawingPdfExporter(DwgExporter):
         except Exception:
             pass
         return None
+
+    def _typelib_module(self):
+        """sldworks.tlb of YOUR SolidWorks as a generated (early-bound) module."""
+        if self._typelib_cache is not None:
+            return self._typelib_cache or None
+        self._typelib_cache = False
+        try:
+            from win32com.client import gencache
+
+            exe = self._get(self.sw_app, "GetExecutablePath")
+            if not exe:
+                return None
+            install = Path(str(exe))
+            if install.suffix:
+                install = install.parent
+            for tlb_path in install.glob("sldworks.tlb"):
+                tlb = pythoncom.LoadTypeLib(str(tlb_path))
+                guid, lcid, _syskind, major, minor, _flags = tlb.GetLibAttr()
+                module = gencache.EnsureModule(str(guid), lcid, major, minor)
+                if module is not None:
+                    self._typelib_cache = module
+                    return module
+        except Exception:
+            pass
+        return None
+
+    def _cast_strict(self, obj, interface):
+        """Typed wrapper of a COM object for one interface, or None when that is not possible."""
+        if obj is None:
+            return None
+        module = self._typelib_module()
+        if module is None:
+            return None
+        try:
+            iid = module.NamesToIIDMap[interface]
+            cls = getattr(module, interface)
+            return cls(obj._oleobj_.QueryInterface(iid, pythoncom.IID_IDispatch))
+        except Exception:
+            return None
+
+    def _cast(self, obj, interface):
+        typed = self._cast_strict(obj, interface)
+        return typed if typed is not None else obj
 
     def _edge_code(self):
         constants = self._constants()
@@ -251,10 +295,12 @@ class SwDrawingPdfExporter(DwgExporter):
         return start, end
 
     def _get_bend_lines(self, view):
-        try:
-            return list(self._call(view, "GetBendLines") or [])
-        except Exception:
-            return []
+        for target in (self._cast(view, "IView"), view):
+            try:
+                return list(target.GetBendLines() or [])
+            except Exception:
+                continue
+        return []
 
     def _select_at(self, drawing, x, y, append, kinds=("EDGE", "SKETCHSEGMENT")):
         try:
@@ -279,11 +325,25 @@ class SwDrawingPdfExporter(DwgExporter):
         try:
             sel_mgr = drawing.SelectionManager
             stage = "CreateSelectData"
-            data = sel_mgr.CreateSelectData()
+            try:
+                data = sel_mgr.CreateSelectData()
+            except Exception:
+                data = self._cast(sel_mgr, "ISelectionMgr").CreateSelectData()
             stage = "SelectData.View"
             data.View = view
             stage = "Select4"
-            return bool(obj.Select4(bool(append), data))
+            candidates = [obj]
+            for name in ("IEdge", "IEntity", "ISketchSegment"):
+                typed = self._cast_strict(obj, name)
+                if typed is not None:
+                    candidates.append(typed)
+            last = None
+            for candidate in candidates:
+                try:
+                    return bool(candidate.Select4(bool(append), data))
+                except Exception as exc:
+                    last = exc
+            raise last
         except Exception as exc:
             self._select_error = f"{stage}: {str(exc)[:70]}"
             return False
@@ -945,6 +1005,7 @@ class SwDrawingPdfExporter(DwgExporter):
         guard = guard if guard is not None else [0]
         while feat is not None and guard[0] < 3000:
             guard[0] += 1
+            feat = self._cast(feat, "IFeature")
             yield feat
             try:
                 sub = feat.GetFirstSubFeature()
@@ -961,7 +1022,7 @@ class SwDrawingPdfExporter(DwgExporter):
         tables = []
         # route 1: the feature tree (Drawing View > Bend Table1)
         try:
-            first = self._val(drawing, "FirstFeature")
+            first = self._val(self._cast(drawing, "IModelDoc2"), "FirstFeature")
             seen = []
             for feat in self._walk_features(first):
                 try:
@@ -978,7 +1039,9 @@ class SwDrawingPdfExporter(DwgExporter):
                     except Exception:
                         spec = None
                     if spec is not None:
-                        tables.append(spec)
+                        typed = (self._cast_strict(spec, "IBendTableAnnotation")
+                                 or self._cast_strict(spec, "ITableAnnotation"))
+                        tables.append(typed if typed is not None else spec)
             steps.append(f"{tag}: table features seen: {', '.join(seen) or 'none'}")
         except Exception as exc:
             steps.append(f"{tag}: feature walk failed ({type(exc).__name__}: {str(exc)[:60]})")
@@ -986,7 +1049,7 @@ class SwDrawingPdfExporter(DwgExporter):
         if not tables:
             for method in ("GetBendTableAnnotations", "GetTableAnnotations"):
                 try:
-                    found = list(self._call(flat_view, method) or [])
+                    found = list(self._call(self._cast(flat_view, "IView"), method) or [])
                 except Exception:
                     found = []
                 steps.append(f"{tag}: view.{method}() -> {len(found)}")
@@ -1009,20 +1072,31 @@ class SwDrawingPdfExporter(DwgExporter):
             self._call(drawing, "ForceRebuild3", False)
             rows_after = self._get(table, "RowCount")
             steps.append(f"{tag} {index}: rows {rows_before} -> {rows_after}")
+            try:
+                ann = self._val(table, "GetAnnotation")
+                pos = self._val(ann, "GetPosition")
+                steps.append(
+                    f"{tag} {index}: position ({float(pos[0]) * 1000:.0f}, {float(pos[1]) * 1000:.0f}) mm, "
+                    f"visible={self._val(ann, 'Visible')}"
+                )
+            except Exception as exc:
+                steps.append(f"{tag} {index}: position not readable ({type(exc).__name__}: {str(exc)[:50]})")
             self._describe_table(table, steps)
 
     def _remove_view_dimensions(self, drawing, views, steps):
         """Deletes the dimensions that were drawn on the master (they do not belong to the new part)."""
         dims = []
         for view in views:
+            typed_view = self._cast(view, "IView")
             try:
-                dim = view.GetFirstDisplayDimension5()
+                dim = typed_view.GetFirstDisplayDimension5()
             except Exception as exc:
                 steps.append(f"master dimensions: cannot be read ({type(exc).__name__}: {str(exc)[:60]})")
                 return 0
             guard = 0
             while dim is not None and guard < 3000:
                 guard += 1
+                dim = self._cast(dim, "IDisplayDimension")
                 dims.append(dim)
                 try:
                     dim = dim.GetNext5()
@@ -1032,7 +1106,11 @@ class SwDrawingPdfExporter(DwgExporter):
         for dim in dims:
             self._clear(drawing)
             try:
-                dim.GetAnnotation().Select3(False, VARIANT(pythoncom.VT_DISPATCH, None))
+                ann = self._cast(dim.GetAnnotation(), "IAnnotation")
+                try:
+                    ann.Select3(False, None)
+                except Exception:
+                    ann.Select3(False, VARIANT(pythoncom.VT_DISPATCH, None))
                 if drawing.Extension.DeleteSelection2(0):
                     removed += 1
             except Exception:
@@ -1165,6 +1243,7 @@ class SwDrawingPdfExporter(DwgExporter):
                 if not self._replace_model_in_open_drawing(drawing, self._model_views(drawing), path, steps):
                     return False, "could not replace the model in the drawing", steps
             self._ensure_millimeters(drawing, steps)
+            steps.append("typed SolidWorks API (sldworks.tlb): " + ("loaded" if self._typelib_module() else "NOT available"))
             self._call(drawing, "ForceRebuild3", False)
 
             if self.remove_master_dimensions:
