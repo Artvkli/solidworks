@@ -1083,6 +1083,55 @@ class SwDrawingPdfExporter(DwgExporter):
                 steps.append(f"{tag} {index}: position not readable ({type(exc).__name__}: {str(exc)[:50]})")
             self._describe_table(table, steps)
 
+    def _keep_only_flat_pattern_view(self, drawing, steps):
+        """Keep the flat-pattern view and delete the other model views from the copied master."""
+        views = self._model_views(drawing)
+        flat = None
+        for view in views:
+            try:
+                if bool(self._call(view, "IsFlatPatternView", default=False)):
+                    flat = view
+                    break
+            except Exception:
+                continue
+
+        if flat is None:
+            steps.append("view cleanup: no flat-pattern view found; no views deleted")
+            return None
+
+        flat_name = str(self._call(flat, "GetName2") or "")
+        removed, failed = [], []
+        # Delete in reverse order so child/derived views are less likely to block cleanup.
+        for view in reversed(views):
+            name = str(self._call(view, "GetName2") or "")
+            if not name or name == flat_name:
+                continue
+            try:
+                self._clear(drawing)
+                result = drawing.DeleteView(name)
+                if result is False:
+                    failed.append(name)
+                else:
+                    removed.append(name)
+            except Exception as exc:
+                failed.append(f"{name} ({str(exc)[:45]})")
+
+        self._clear(drawing)
+        self._call(drawing, "ForceRebuild3", False)
+        steps.append(
+            f"view cleanup: kept flat pattern '{flat_name}', removed {len(removed)} view(s)"
+            + (f"; could not remove: {', '.join(failed)}" if failed else "")
+        )
+
+        # COM view objects can become stale after DeleteView; retrieve the surviving view again.
+        for view in self._model_views(drawing):
+            if str(self._call(view, "GetName2") or "") == flat_name:
+                return view
+            if bool(self._call(view, "IsFlatPatternView", default=False)):
+                return view
+        steps.append("view cleanup: flat-pattern view could not be reacquired after deletion")
+        return None
+
     def _remove_view_dimensions(self, drawing, views, steps):
         """Deletes the dimensions that were drawn on the master (they do not belong to the new part)."""
         dims = []
@@ -1249,21 +1298,26 @@ class SwDrawingPdfExporter(DwgExporter):
             if self.remove_master_dimensions:
                 self._remove_view_dimensions(drawing, self._model_views(drawing), steps)
 
-            flat_view, flat_den = None, 1.0
+            # Apply the requested configuration before identifying the flat-pattern view.
             for view in self._model_views(drawing):
-                name = str(self._call(view, "GetName2") or "")
                 if configuration:
                     try:
                         view.ReferencedConfiguration = str(configuration)
                     except Exception:
                         pass
-                slot = slots.get(name)
-                if slot is None:
-                    continue
-                den = self._fit_view_to_slot(view, slot, steps)
-                is_flat = bool(self._call(view, "IsFlatPatternView", default=False))
-                if is_flat:
-                    flat_view, flat_den = view, den
+            self._call(drawing, "ForceRebuild3", False)
+
+            # Keep only the flat pattern from the master. The bend table is refreshed later
+            # while this view still exists, so it can remain associated with the flat pattern.
+            flat_view = self._keep_only_flat_pattern_view(drawing, steps)
+            flat_den = 1.0
+            if flat_view is not None:
+                flat_name = str(self._call(flat_view, "GetName2") or "")
+                slot = slots.get(flat_name)
+                if slot is not None:
+                    flat_den = self._fit_view_to_slot(flat_view, slot, steps)
+                else:
+                    steps.append(f"flat pattern: no master layout slot for view '{flat_name}'; keeping its current position/scale")
             self._call(drawing, "ForceRebuild3", False)
 
             # ---- 5) bend table update + dimensions ----
