@@ -28,6 +28,17 @@ DIM_TIER_STEP = 0.005
 EDGE_TOL = 1.5e-4
 MIN_EDGE_LEN = 5e-4
 
+STANDARD_DENOMINATORS = (1, 1.5, 2, 2.5, 3, 4, 5, 7.5, 10, 15, 20, 25, 30, 40, 50, 60, 75,
+                         100, 150, 200, 250, 300, 500)
+
+
+def _standard_denominator(den):
+    """Smallest standard scale denominator that is not smaller than `den`."""
+    for value in STANDARD_DENOMINATORS:
+        if value >= den - 1e-9:
+            return float(value)
+    return float(math.ceil(den))
+
 
 class SwDrawingPdfExporter(DwgExporter):
     """
@@ -49,6 +60,7 @@ class SwDrawingPdfExporter(DwgExporter):
         dimensions=True,
         dim_text_height=0.0025,
         pdf_from_saved_file=True,
+        remove_master_dimensions=True,
         **legacy_options,
     ):
         super().__init__(
@@ -60,6 +72,7 @@ class SwDrawingPdfExporter(DwgExporter):
         self.dimensions = dimensions
         self.dim_text_height = dim_text_height
         self.pdf_from_saved_file = pdf_from_saved_file
+        self.remove_master_dimensions = remove_master_dimensions
         self._constants_cache = None
         self._select_error = ""
 
@@ -262,14 +275,29 @@ class SwDrawingPdfExporter(DwgExporter):
         return False
 
     def _select_object(self, drawing, view, obj, append):
+        stage = "SelectionManager"
         try:
             sel_mgr = drawing.SelectionManager
+            stage = "CreateSelectData"
             data = sel_mgr.CreateSelectData()
+            stage = "SelectData.View"
             data.View = view
+            stage = "Select4"
             return bool(obj.Select4(bool(append), data))
         except Exception as exc:
-            self._select_error = f"Select4: {str(exc)[:70]}"
+            self._select_error = f"{stage}: {str(exc)[:70]}"
             return False
+
+    def _select_edge(self, drawing, view, edge, append, line=None):
+        """Select an edge by its COM object; if that fails, by its middle point on the sheet."""
+        if self._select_object(drawing, view, edge, append):
+            return True
+        if line is not None:
+            mx = (line["a"][0] + line["b"][0]) / 2
+            my = (line["a"][1] + line["b"][1]) / 2
+            if self._select_at(drawing, mx, my, append, kinds=("EDGE",)):
+                return True
+        return False
 
     def _clear(self, drawing):
         try:
@@ -334,10 +362,10 @@ class SwDrawingPdfExporter(DwgExporter):
 
     def _dim_between(self, drawing, view, first, second, label, expected, tol=None):
         self._clear(drawing)
-        if not self._select_object(drawing, view, first, False):
+        if not self._select_edge(drawing, view, first["edge"], False, first):
             self._clear(drawing)
             return False
-        if not self._select_object(drawing, view, second, True):
+        if not self._select_edge(drawing, view, second["edge"], True, second):
             self._clear(drawing)
             return False
         return self._add_checked_dimension(drawing, label, expected, tol)
@@ -533,7 +561,7 @@ class SwDrawingPdfExporter(DwgExporter):
         if left and right and left is not right:
             expected = (right["a"][0] - left["a"][0]) / scale
             self._select_error = ""
-            if self._dim_between(drawing, view, left["edge"], right["edge"], ((x0 + x1) / 2, y1 + DIM_OFFSET), expected):
+            if self._dim_between(drawing, view, left, right, ((x0 + x1) / 2, y1 + DIM_OFFSET), expected):
                 made += 1
             else:
                 steps.append(f"{tag}: overall length not created ({self._select_error or 'selection failed'})")
@@ -544,7 +572,7 @@ class SwDrawingPdfExporter(DwgExporter):
         if bottom and top and bottom is not top:
             expected = (top["a"][1] - bottom["a"][1]) / scale
             self._select_error = ""
-            if self._dim_between(drawing, view, bottom["edge"], top["edge"], (x1 + DIM_OFFSET, (y0 + y1) / 2), expected):
+            if self._dim_between(drawing, view, bottom, top, (x1 + DIM_OFFSET, (y0 + y1) / 2), expected):
                 made += 1
             else:
                 steps.append(f"{tag}: overall height not created ({self._select_error or 'selection failed'})")
@@ -691,7 +719,7 @@ class SwDrawingPdfExporter(DwgExporter):
                 if self._select_at(drawing, p[0], p[1], append, kinds=("SKETCHSEGMENT", "EDGE")):
                     return True
             return False
-        return self._select_object(drawing, view, ent["edge"], append)
+        return self._select_edge(drawing, view, ent["edge"], append, ent.get("line"))
 
     def _dimension_chain(self, drawing, view, entities, geo, bottom_row, exact):
         x0, y0, x1, y1 = geo["bbox"]
@@ -760,13 +788,13 @@ class SwDrawingPdfExporter(DwgExporter):
                     chain = list(v_bends)
                     for line, coord in ((self._extreme(vertical, 0, x0), x0), (self._extreme(vertical, 0, x1), x1)):
                         if line:
-                            chain.append({"kind": "edge", "coord": coord, "edge": line["edge"]})
+                            chain.append({"kind": "edge", "coord": coord, "edge": line["edge"], "line": line})
                     n_v = self._dimension_chain(drawing, view, chain, geo, True, exact)
                 if h_bends:
                     chain = list(h_bends)
                     for line, coord in ((self._extreme(horizontal, 1, y0), y0), (self._extreme(horizontal, 1, y1), y1)):
                         if line:
-                            chain.append({"kind": "edge", "coord": coord, "edge": line["edge"]})
+                            chain.append({"kind": "edge", "coord": coord, "edge": line["edge"], "line": line})
                     n_h = self._dimension_chain(drawing, view, chain, geo, False, exact)
                 steps.append(
                     f"{tag}: chain along the bottom {n_v}/{len(v_bends) + 1 if v_bends else 0}, "
@@ -786,7 +814,7 @@ class SwDrawingPdfExporter(DwgExporter):
     def _fit_denominator(raw_w, raw_h, avail_w, avail_h):
         aw, ah = max(avail_w - MARGIN_GUESS, 0.005), max(avail_h - MARGIN_GUESS, 0.005)
         den = max((raw_w - MARGIN_GUESS) / aw, (raw_h - MARGIN_GUESS) / ah, 1.0)
-        return math.ceil(den * 10) / 10
+        return _standard_denominator(den)
 
     @staticmethod
     def _scale_text(den):
@@ -908,18 +936,110 @@ class SwDrawingPdfExporter(DwgExporter):
                 steps.append(f"ReplaceViewModel {label} failed ({type(exc).__name__}: {str(exc)[:70]})")
         return False
 
-    def _update_tables(self, view, steps, tag):
+    @staticmethod
+    def _val(obj, name):
+        attr = getattr(obj, name)
+        return attr() if callable(attr) else attr
+
+    def _walk_features(self, feat, depth=0, guard=None):
+        guard = guard if guard is not None else [0]
+        while feat is not None and guard[0] < 3000:
+            guard[0] += 1
+            yield feat
+            try:
+                sub = feat.GetFirstSubFeature()
+            except Exception:
+                sub = None
+            if sub is not None and depth < 6:
+                yield from self._walk_features(sub, depth + 1, guard)
+            try:
+                feat = feat.GetNextFeature() if depth == 0 else feat.GetNextSubFeature()
+            except Exception:
+                feat = None
+
+    def _find_bend_tables(self, drawing, flat_view, steps, tag):
+        tables = []
+        # route 1: the feature tree (Drawing View > Bend Table1)
         try:
-            tables = list(self._call(view, "GetTableAnnotations") or [])
-        except Exception:
-            tables = []
-        steps.append(f"{tag}: tables on the flat pattern view: {len(tables)}")
-        for table in tables:
+            first = self._val(drawing, "FirstFeature")
+            seen = []
+            for feat in self._walk_features(first):
+                try:
+                    type_name = str(feat.GetTypeName2())
+                    name = str(self._val(feat, "Name"))
+                except Exception:
+                    continue
+                low = (type_name + " " + name).lower()
+                if "table" in low:
+                    seen.append(f"{name} [{type_name}]")
+                if "bend" in low and "table" in low and "anchor" not in low:
+                    try:
+                        spec = feat.GetSpecificFeature2()
+                    except Exception:
+                        spec = None
+                    if spec is not None:
+                        tables.append(spec)
+            steps.append(f"{tag}: table features seen: {', '.join(seen) or 'none'}")
+        except Exception as exc:
+            steps.append(f"{tag}: feature walk failed ({type(exc).__name__}: {str(exc)[:60]})")
+        # route 2: methods of the view
+        if not tables:
+            for method in ("GetBendTableAnnotations", "GetTableAnnotations"):
+                try:
+                    found = list(self._call(flat_view, method) or [])
+                except Exception:
+                    found = []
+                steps.append(f"{tag}: view.{method}() -> {len(found)}")
+                if found:
+                    tables = found
+                    break
+        return tables
+
+    def _refresh_bend_tables(self, drawing, flat_view, steps):
+        tag = "bend table"
+        steps.append(f"{tag}: bend lines readable by the API: {len(self._get_bend_lines(flat_view))}")
+        tables = self._find_bend_tables(drawing, flat_view, steps, tag)
+        steps.append(f"{tag}: tables found: {len(tables)}")
+        for index, table in enumerate(tables, 1):
+            rows_before = self._get(table, "RowCount")
             try:
                 table.Update()
+            except Exception as exc:
+                steps.append(f"{tag} {index}: Update failed ({type(exc).__name__}: {str(exc)[:60]})")
+            self._call(drawing, "ForceRebuild3", False)
+            rows_after = self._get(table, "RowCount")
+            steps.append(f"{tag} {index}: rows {rows_before} -> {rows_after}")
+            self._describe_table(table, steps)
+
+    def _remove_view_dimensions(self, drawing, views, steps):
+        """Deletes the dimensions that were drawn on the master (they do not belong to the new part)."""
+        dims = []
+        for view in views:
+            try:
+                dim = view.GetFirstDisplayDimension5()
+            except Exception as exc:
+                steps.append(f"master dimensions: cannot be read ({type(exc).__name__}: {str(exc)[:60]})")
+                return 0
+            guard = 0
+            while dim is not None and guard < 3000:
+                guard += 1
+                dims.append(dim)
+                try:
+                    dim = dim.GetNext5()
+                except Exception:
+                    break
+        removed = 0
+        for dim in dims:
+            self._clear(drawing)
+            try:
+                dim.GetAnnotation().Select3(False, VARIANT(pythoncom.VT_DISPATCH, None))
+                if drawing.Extension.DeleteSelection2(0):
+                    removed += 1
             except Exception:
                 pass
-            self._describe_table(table, steps)
+        self._clear(drawing)
+        steps.append(f"master dimensions: {removed}/{len(dims)} removed")
+        return removed
 
     def _save_and_pdf(self, drawing, slddrw_path, pdf_path, steps):
         """Saves the drawing, closes it, reopens the SAVED file and exports the PDF from it."""
@@ -1047,6 +1167,9 @@ class SwDrawingPdfExporter(DwgExporter):
             self._ensure_millimeters(drawing, steps)
             self._call(drawing, "ForceRebuild3", False)
 
+            if self.remove_master_dimensions:
+                self._remove_view_dimensions(drawing, self._model_views(drawing), steps)
+
             flat_view, flat_den = None, 1.0
             for view in self._model_views(drawing):
                 name = str(self._call(view, "GetName2") or "")
@@ -1068,8 +1191,9 @@ class SwDrawingPdfExporter(DwgExporter):
             if flat_view is None:
                 steps.append("WARNING: no flat pattern view found in the drawing")
             else:
-                self._update_tables(flat_view, steps, "bend table")
+                self._refresh_bend_tables(drawing, flat_view, steps)
                 if self.dimensions:
+                    flat_den = 1.0 / self._scale_of(flat_view, 1.0 / flat_den)
                     self._insert_flat_pattern_dimensions(drawing, flat_view, flat_den, steps)
                     self._clear(drawing)
             self._call(drawing, "ForceRebuild3", False)
