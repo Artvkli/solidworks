@@ -1176,13 +1176,37 @@ class SwDrawingPdfExporter(DwgExporter):
             x, y = 0.15, 0.08
         try:
             typed_view = self._cast(flat_view, "IView")
+            # A bend table should use the bend tags belonging to THIS flat-pattern view.
+            # Explicitly disable merged bend tags where supported; otherwise several
+            # bends of the same type may be represented by a single table row.
+            bend_lines_before = len(self._get_bend_lines(typed_view))
+            merge_result = "unsupported"
+            for merge_value in (False,):
+                try:
+                    merge_result = self._call(typed_view, "MergeBendTags", merge_value)
+                    merge_result = f"called(False), result={merge_result}"
+                    break
+                except Exception as merge_exc:
+                    merge_result = f"failed: {type(merge_exc).__name__}: {str(merge_exc)[:70]}"
+            self._call(drawing, "ForceRebuild3", False)
+            bend_lines_after = len(self._get_bend_lines(typed_view))
+            steps.append(
+                f"flat-pattern bend lines before table: {bend_lines_before}; "
+                f"after unmerge attempt: {bend_lines_after}; MergeBendTags={merge_result}"
+            )
             table = typed_view.InsertBendTable(False, x, y, 1, "A", template)
             if table is None:
                 steps.append("bend table creation failed: IView.InsertBendTable returned None")
                 return False
             self._call(drawing, "ForceRebuild3", False)
+            # Reacquire the annotation through the view after rebuild if possible.
             rows = self._get(table, "RowCount")
-            steps.append(f"new bend table created from flat-pattern view; rows={rows}; template={template}")
+            steps.append(
+                f"new bend table created from flat-pattern view; rows={rows}; "
+                f"bend_lines={bend_lines_after}; template={template}. "
+                "If rows remain fewer than bend lines, inspect the bend-tag merge setting "
+                "and the actual flat-pattern view in SolidWorks."
+            )
             return True
         except Exception as exc:
             steps.append(f"bend table creation failed ({type(exc).__name__}: {str(exc)[:120]})")
