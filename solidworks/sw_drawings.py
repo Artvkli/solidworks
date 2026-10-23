@@ -43,11 +43,11 @@ def _standard_denominator(den):
 class SwDrawingPdfExporter(DwgExporter):
     """
     For every sheet metal part:
-      1) copies master.slddrw (a complete sample drawing: flat pattern, bend table, bent views, title block),
-      2) replaces the model referenced by the copy with the part,
-      3) fits every view into the space it had in the master (same centre),
-      4) adds native dimensions on the flat pattern,
-      5) saves the .slddrw and exports the PDF from the SAVED .slddrw.
+      1) copies master.slddrw and replaces the referenced model,
+      2) removes the master's model views,
+      3) inserts a fresh flat-pattern view from the target part,
+      4) creates a new bend table from that exact view,
+      5) optionally adds native dimensions and exports the saved drawing as PDF.
     Every step is logged in `steps`.
     """
 
@@ -61,6 +61,7 @@ class SwDrawingPdfExporter(DwgExporter):
         dim_text_height=0.0025,
         pdf_from_saved_file=True,
         remove_master_dimensions=True,
+        bend_table_template=None,
         **legacy_options,
     ):
         super().__init__(
@@ -73,6 +74,7 @@ class SwDrawingPdfExporter(DwgExporter):
         self.dim_text_height = dim_text_height
         self.pdf_from_saved_file = pdf_from_saved_file
         self.remove_master_dimensions = remove_master_dimensions
+        self.bend_table_template = Path(bend_table_template).resolve() if bend_table_template else None
         self._constants_cache = None
         self._typelib_cache = None
         self._select_error = ""
@@ -1083,6 +1085,109 @@ class SwDrawingPdfExporter(DwgExporter):
                 steps.append(f"{tag} {index}: position not readable ({type(exc).__name__}: {str(exc)[:50]})")
             self._describe_table(table, steps)
 
+
+    def _find_bend_table_template(self):
+        """Find a usable SOLIDWORKS bend-table template, unless one was configured explicitly."""
+        if self.bend_table_template and self.bend_table_template.is_file():
+            return str(self.bend_table_template)
+        try:
+            exe = self._get(self.sw_app, "GetExecutablePath")
+            if exe:
+                install = Path(str(exe))
+                if install.suffix:
+                    install = install.parent
+                candidates = [
+                    install / "lang" / "english" / "bendtable-standard.sldbndtbt",
+                    install / "lang" / "English" / "bendtable-standard.sldbndtbt",
+                ]
+                # Also allow non-English installs where the standard template has a localized path.
+                candidates.extend(install.glob("lang/*/bendtable-standard.sldbndtbt"))
+                for candidate in candidates:
+                    if candidate.is_file():
+                        return str(candidate)
+        except Exception:
+            pass
+        return None
+
+    def _delete_model_views(self, drawing, steps):
+        """Delete all model views from the copied master before inserting a fresh flat-pattern view."""
+        views = self._model_views(drawing)
+        removed, failed = [], []
+        for view in reversed(views):
+            name = str(self._call(view, "GetName2") or "")
+            if not name:
+                continue
+            try:
+                self._clear(drawing)
+                result = drawing.DeleteView(name)
+                if result is False:
+                    failed.append(name)
+                else:
+                    removed.append(name)
+            except Exception as exc:
+                failed.append(f"{name} ({str(exc)[:60]})")
+        self._clear(drawing)
+        self._call(drawing, "ForceRebuild3", False)
+        steps.append(f"master view cleanup: removed {len(removed)} view(s)" +
+                     (f"; failed: {', '.join(failed)}" if failed else ""))
+        return not failed
+
+    def _create_flat_pattern_view(self, drawing, model_path, configuration, slots, steps):
+        """Insert a new flat-pattern view from the target part, not by reusing the master's view."""
+        slot = next((v for v in slots.values() if v.get("is_flat_pattern")), None)
+        if slot:
+            x, y = float(slot["box"][0]), float(slot["box"][1])
+        else:
+            # Safe fallback for a standard drawing sheet; user can adjust placement in the master.
+            x, y = 0.15, 0.15
+        config_name = str(configuration or "")
+        try:
+            view = drawing.CreateFlatPatternViewFromModelView3(
+                str(model_path), config_name, x, y, 0.0, False, False
+            )
+        except Exception as exc:
+            steps.append(f"flat-pattern insertion failed ({type(exc).__name__}: {str(exc)[:120]})")
+            return None
+        if view is None:
+            steps.append("flat-pattern insertion failed: SolidWorks returned no view")
+            return None
+        self._call(drawing, "ForceRebuild3", False)
+        # Reacquire from drawing's view chain to avoid stale COM wrappers after rebuild.
+        for candidate in self._model_views(drawing):
+            if bool(self._call(candidate, "IsFlatPatternView", default=False)):
+                steps.append(f"inserted new flat-pattern view: {self._call(candidate, 'GetName2')}")
+                return candidate
+        steps.append("flat-pattern insertion returned a view, but IsFlatPatternView was not found")
+        return view
+
+    def _create_bend_table_for_view(self, drawing, flat_view, steps):
+        """Create a new bend table directly from the newly inserted flat-pattern view."""
+        template = self._find_bend_table_template()
+        if not template:
+            steps.append("bend table creation skipped: bendtable-standard.sldbndtbt not found; "
+                         "set bend_table_template in SwDrawingPdfExporter")
+            return False
+        outline = self._outline(flat_view)
+        if outline:
+            # Place the table just below the flat-pattern view, on the same side of the sheet.
+            x = max(0.01, float(outline[0]))
+            y = max(0.01, float(outline[1]) - 0.025)
+        else:
+            x, y = 0.15, 0.08
+        try:
+            typed_view = self._cast(flat_view, "IView")
+            table = typed_view.InsertBendTable(False, x, y, 1, "A", template)
+            if table is None:
+                steps.append("bend table creation failed: IView.InsertBendTable returned None")
+                return False
+            self._call(drawing, "ForceRebuild3", False)
+            rows = self._get(table, "RowCount")
+            steps.append(f"new bend table created from flat-pattern view; rows={rows}; template={template}")
+            return True
+        except Exception as exc:
+            steps.append(f"bend table creation failed ({type(exc).__name__}: {str(exc)[:120]})")
+            return False
+
     def _keep_only_flat_pattern_view(self, drawing, steps):
         """Keep the flat-pattern view and delete the other model views from the copied master."""
         views = self._model_views(drawing)
@@ -1259,6 +1364,7 @@ class SwDrawingPdfExporter(DwgExporter):
                     continue
                 slots[name] = {
                     "name": name,
+                    "is_flat_pattern": bool(self._call(view, "IsFlatPatternView", default=False)),
                     "box": ((outline[0] + outline[2]) / 2, (outline[1] + outline[3]) / 2,
                             outline[2] - outline[0], outline[3] - outline[1]),
                 }
@@ -1307,28 +1413,25 @@ class SwDrawingPdfExporter(DwgExporter):
                         pass
             self._call(drawing, "ForceRebuild3", False)
 
-            # Keep only the flat pattern from the master. The bend table is refreshed later
-            # while this view still exists, so it can remain associated with the flat pattern.
-            flat_view = self._keep_only_flat_pattern_view(drawing, steps)
+            # ---- 5) remove the master's model views, insert a NEW flat-pattern view, then create its bend table ----
+            # Keep the master flat-view slot if present, but never reuse the master's actual view/table.
+            flat_slot = next((v for v in slots.values() if v.get("is_flat_pattern")), None)
+            self._delete_model_views(drawing, steps)
+            flat_view = self._create_flat_pattern_view(drawing, path, configuration, slots, steps)
             flat_den = 1.0
             if flat_view is not None:
-                flat_name = str(self._call(flat_view, "GetName2") or "")
-                slot = slots.get(flat_name)
-                if slot is not None:
-                    flat_den = self._fit_view_to_slot(flat_view, slot, steps)
-                else:
-                    steps.append(f"flat pattern: no master layout slot for view '{flat_name}'; keeping its current position/scale")
-            self._call(drawing, "ForceRebuild3", False)
-
-            # ---- 5) bend table update + dimensions ----
-            if flat_view is None:
-                steps.append("WARNING: no flat pattern view found in the drawing")
-            else:
-                self._refresh_bend_tables(drawing, flat_view, steps)
+                if flat_slot is not None:
+                    flat_den = self._fit_view_to_slot(flat_view, flat_slot, steps)
+                self._call(drawing, "ForceRebuild3", False)
+                # The table is created from this exact view; it is not copied/refreshed from the master.
+                self._create_bend_table_for_view(drawing, flat_view, steps)
+                self._call(drawing, "ForceRebuild3", False)
                 if self.dimensions:
                     flat_den = 1.0 / self._scale_of(flat_view, 1.0 / flat_den)
                     self._insert_flat_pattern_dimensions(drawing, flat_view, flat_den, steps)
                     self._clear(drawing)
+            else:
+                steps.append("WARNING: could not create a flat-pattern view; bend table was not created")
             self._call(drawing, "ForceRebuild3", False)
             self._call(drawing, "ViewZoomtofit2")
 
