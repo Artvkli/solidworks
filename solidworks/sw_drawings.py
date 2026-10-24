@@ -25,7 +25,10 @@ INVALID_FILENAME = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 class SwDrawingExporter:
     """For every part: open part -> new drawing -> flat pattern view -> save .SLDDRW."""
 
-    def __init__(self, sw_app, assembly_path=None, reconnect=None, template_path=None):
+    def __init__(self, sw_app, assembly_path=None, reconnect=None, template_path=None,
+                 sheet_format_path=None, text_replacements=None):
+        self.sheet_format_path = Path(sheet_format_path) if sheet_format_path else None
+        self.text_replacements = dict(text_replacements or {})
         self.sw_app = sw_app
         self.assembly_path = Path(assembly_path).resolve() if assembly_path else None
         self.reconnect = reconnect
@@ -176,6 +179,80 @@ class SwDrawingExporter:
             return f"fit skipped ({exc})"
         return "fit skipped"
 
+    def _replace_sheet_texts(self, drawing, values):
+        """Inside Edit Sheet Format: replaces placeholders such as {PART_NAME} in the notes."""
+        if not self.text_replacements:
+            return 0
+        count = 0
+        view = self._get(drawing, "GetFirstView")      # in Edit Sheet Format the first view is the sheet format
+        note = self._get(view, "GetFirstNote")
+        for _ in range(10000):
+            if note is None:
+                break
+            try:
+                text = self._get(note, "GetText")
+                if text:
+                    new = str(text)
+                    for placeholder, field in self.text_replacements.items():
+                        new = new.replace(placeholder, str(values.get(field, "")))
+                    if new != text:
+                        note.SetText(new)
+                        count += 1
+            except Exception:
+                pass
+            note = self._get(note, "GetNext")
+        return count
+
+    def _apply_sheet_format(self, drawing, item, steps):
+        """Loads the sheet format, writes drawing properties and runs Edit Sheet Format."""
+        values = {
+            "PartName": item.get("name") or Path(item["path"]).stem,
+            "Quantity": item.get("quantity", 1),
+            "Thickness": item.get("thickness"),
+            "Material": item.get("material"),
+            "Configuration": item.get("configuration"),
+        }
+
+        # 1) sheet format file (.slddrt); without it the format inside the .drwdot is used
+        if self.sheet_format_path:
+            if not self.sheet_format_path.is_file():
+                steps.append(f"sheet format file not found: {self.sheet_format_path}")
+            else:
+                try:
+                    sheet = self._get(drawing, "GetCurrentSheet")
+                    sheet.SetTemplateName(str(self.sheet_format_path.resolve()))
+                    sheet.ReloadTemplate(True)
+                    steps.append(f"sheet format loaded: {self.sheet_format_path.name}")
+                except Exception as exc:
+                    steps.append(f"sheet format not loaded: {exc}")
+
+        # 2) drawing custom properties (title block can link to them: $PRP:"PartName")
+        try:
+            manager = drawing.Extension.CustomPropertyManager("")
+            for key, value in values.items():
+                if value not in (None, ""):
+                    manager.Add3(key, 30, str(value), 2)     # 30 = text, 2 = overwrite
+            steps.append("drawing properties written")
+        except Exception as exc:
+            steps.append(f"drawing properties skipped: {exc}")
+
+        # 3) Edit Sheet Format -> replace placeholders -> back to sheet
+        in_template = False
+        try:
+            in_template = bool(drawing.EditTemplate())
+            if in_template:
+                steps.append(f"Edit Sheet Format: {self._replace_sheet_texts(drawing, values)} text(s) replaced")
+            else:
+                steps.append("Edit Sheet Format: EditTemplate returned False")
+        except Exception as exc:
+            steps.append(f"Edit Sheet Format failed: {exc}")
+        finally:
+            if in_template:
+                try:
+                    drawing.EditSheet()
+                except Exception as exc:
+                    steps.append(f"EditSheet failed: {exc}")
+
     # ---------------- public ----------------
     def export_part(self, item, slddrw_path):
         """Returns (ok, message, steps)."""
@@ -244,6 +321,7 @@ class SwDrawingExporter:
             drawing = self.sw_app.NewDocument(template, SW_PAPER_A3, 0.0, 0.0)
             if drawing is None:
                 return False, "NewDocument returned None", steps
+            self._apply_sheet_format(drawing, item, steps)
             width, height = self._sheet_size(drawing)
 
             active_cfg = configuration or self._get(
@@ -256,6 +334,11 @@ class SwDrawingExporter:
 
             try:
                 drawing.ViewZoomtofit2()
+            except Exception:
+                pass
+
+            try:
+                drawing.ForceRebuild3(False)      # refresh linked title block fields
             except Exception:
                 pass
 

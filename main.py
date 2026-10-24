@@ -12,7 +12,7 @@ except ImportError:
     raise
 
 from solidworks.assembly import SolidWorksAssembly, find_assemblies
-from solidworks.sw_drawings import SwDrawingExporter
+from solidworks.sw_drawing import SwDrawingExporter
 from solidworks.dwg_exporter import DwgExporter
 from solidworks.thickness_dwg import ThicknessDwgBuilder
 from solidworks.sheet_metal import SheetMetalDetector
@@ -32,6 +32,14 @@ USE_SCAN_CACHE = True
 # ---- flat pattern SLDDRW ----
 EXPORT_SLDDRW = True
 DRAWING_TEMPLATE_PATH = None   # e.g. input / "A3.drwdot"; None = SolidWorks default drawing template
+SHEET_FORMAT_PATH = None       # e.g. input_folder / "format.slddrt"; None = format already inside the .drwdot
+# Placeholder text in the sheet format -> value. Fields: PartName, Quantity, Thickness, Material, Configuration
+SHEET_TEXT_REPLACEMENTS = {
+    "{PART_NAME}": "PartName",
+    "{QTY}": "Quantity",
+    "{THICKNESS}": "Thickness",
+    "{MATERIAL}": "Material",
+}
 SLDDRW_LIMIT = None            # e.g. 1 = test on the first part only, None = all parts
 
 
@@ -166,6 +174,8 @@ def export_slddrw_files(sw_app, assembly_path, scan_result, output_folder):
         assembly_path=assembly_path,
         reconnect=connect_to_solidworks,
         template_path=DRAWING_TEMPLATE_PATH,
+        sheet_format_path=SHEET_FORMAT_PATH,
+        text_replacements=SHEET_TEXT_REPLACEMENTS,
     )
     folder = output_folder / "flat_drawings"
     folder.mkdir(parents=True, exist_ok=True)
