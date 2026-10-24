@@ -42,7 +42,7 @@ class SwDrawingExporter:
         self.view_width_ratio = view_width_ratio
         self.view_left_mm = view_left_mm
         self.view_center_y_ratio = view_center_y_ratio
-        
+
     # ---------------- helpers ----------------
     @staticmethod
     def _safe_name(name):
@@ -154,32 +154,36 @@ class SwDrawingExporter:
             pass
         return FALLBACK_SHEET
 
-    def _create_flat_view(self, drawing, part_path, config, x, y):
-        try:
-            view = drawing.CreateFlatPatternViewFromModelView3(
-                part_path, config or "", x, y, 0.0, False, False)
-            if view is not None:
-                return view, "CreateFlatPatternViewFromModelView3"
-        except Exception:
-            pass
-        try:
-            view = drawing.CreateDrawViewFromModelView3(part_path, "*Flat pattern", x, y, 0.0)
-            if view is not None:
-                return view, "CreateDrawViewFromModelView3(*Flat pattern)"
-        except Exception:
-            pass
+    def _create_flat_view(self, drawing, part_path, config, x, y, steps):
+        attempts = (
+            ("CreateFlatPatternViewFromModelView3",
+             lambda cfg: drawing.CreateFlatPatternViewFromModelView3(part_path, cfg, x, y, 0.0, False, False)),
+            ("CreateDrawViewFromModelView3(*Flat pattern)",
+             lambda cfg: drawing.CreateDrawViewFromModelView3(part_path, "*Flat pattern", x, y, 0.0)),
+        )
+        for round_no in range(1, 4):
+            for name, call in attempts:
+                for cfg in dict.fromkeys((config or "", "")):
+                    try:
+                        view = call(cfg)
+                        if view is not None:
+                            if round_no > 1:
+                                steps.append(f"view created on attempt {round_no}")
+                            return view, name
+                        steps.append(f"attempt {round_no}: {name} (cfg='{cfg}') returned None")
+                    except Exception as exc:
+                        steps.append(f"attempt {round_no}: {name} (cfg='{cfg}') {type(exc).__name__}: {exc}")
+            time.sleep(1.5)
+            try:
+                title = self._get(drawing, "GetTitle")
+                self.sw_app.ActivateDoc3(str(title), False, 0, self._byref_i4())
+            except Exception:
+                pass
         return None, None
 
     def _fit_view(self, drawing, view):
-        """Chooses a standard scale so the view fits the free area, then centers it in that area."""
+        """Scale so the view is ~half the sheet width, then place it at the left, slightly low."""
         width, height = self._sheet_size(drawing)
-        if self.view_area_mm:
-            left, bottom, right, top = (v / 1000.0 for v in self.view_area_mm)
-        else:
-            left, bottom, right, top = width * 0.05, height * 0.05, width * 0.95, height * 0.95
-        area_w, area_h = right - left, top - bottom
-        target_x, target_y = (left + right) / 2.0, (bottom + top) / 2.0
-
         try:
             outline = self._get(view, "GetOutline")
             vw, vh = outline[2] - outline[0], outline[3] - outline[1]
@@ -187,12 +191,16 @@ class SwDrawingExporter:
             if vw <= 0 or vh <= 0 or current <= 0:
                 return "fit skipped (empty outline)"
 
-            wanted = current * min(area_w * FIT_RATIO / vw, area_h * FIT_RATIO / vh)
-            chosen = next((s for s in STANDARD_SCALES if s <= wanted), STANDARD_SCALES[-1])
+            wanted = current * min(width * self.view_width_ratio / vw, height * 0.6 / vh)
+            chosen = next((s for s in STANDARD_SCALES if s <= wanted * 1.001), STANDARD_SCALES[-1])
             view.ScaleDecimal = chosen
 
-            # center the REAL bounding box of the view, not view.Position
-            for _ in range(2):                      # second pass corrects any small drift
+            outline = self._get(view, "GetOutline")
+            new_w = outline[2] - outline[0]
+            target_x = self.view_left_mm / 1000.0 + new_w / 2.0
+            target_y = height * self.view_center_y_ratio
+
+            for _ in range(2):
                 outline = self._get(view, "GetOutline")
                 cx = (outline[0] + outline[2]) / 2.0
                 cy = (outline[1] + outline[3]) / 2.0
@@ -201,12 +209,12 @@ class SwDrawingExporter:
                                         (pos[0] + target_x - cx, pos[1] + target_y - cy))
 
             outline = self._get(view, "GetOutline")
-            err_x = ((outline[0] + outline[2]) / 2.0 - target_x) * 1000
-            err_y = ((outline[1] + outline[3]) / 2.0 - target_y) * 1000
             scale_txt = f"1:{1 / chosen:g}" if chosen < 1 else f"{chosen:g}:1"
-            return f"scale {scale_txt}, centered (offset {err_x:.2f}, {err_y:.2f} mm)"
+            return (f"scale {scale_txt}, width {(outline[2] - outline[0]) / width * 100:.0f}% of sheet, "
+                    f"left edge {outline[0] * 1000:.1f} mm, center y {((outline[1] + outline[3]) / 2) * 1000:.1f} mm")
         except Exception as exc:
             return f"fit skipped ({exc})"
+
 
     def _replace_sheet_texts(self, drawing, values):
         """Inside Edit Sheet Format: replaces placeholders such as {PART_NAME} in the notes."""
@@ -407,7 +415,12 @@ class SwDrawingExporter:
 
             active_cfg = configuration or self._get(
                 self._get(model.ConfigurationManager, "ActiveConfiguration"), "Name") or ""
-            view, method = self._create_flat_view(drawing, part_path, active_cfg, width / 2, height / 2)
+            try:
+                self.sw_app.ActivateDoc3(str(self._get(drawing, "GetTitle")), False, 0, self._byref_i4())
+            except Exception:
+                pass
+            model_path = str(self._get(model, "GetPathName") or part_path)
+            view, method = self._create_flat_view(drawing, model_path, active_cfg, width / 2, height / 2, steps)
             if view is None:
                 return False, "could not create the flat pattern view", steps
             steps.append(f"flat view created ({method})")
