@@ -258,26 +258,49 @@ class SwDrawingExporter:
         return self.sw_app.OpenDoc6(str(path), SW_DOC_DRAWING, SW_OPEN_SILENT, "", errors, warnings)
 
     def _remove_existing_views(self, drawing, steps):
-        """Deletes the views that exist in master.slddrw so only the new flat pattern remains."""
-        names = []
-        view = self._get(self._get(drawing, "GetFirstView"), "GetNextView")   # first view = sheet format
+        """Deletes everything that came from master.slddrw: bend tables, flat pattern and other views."""
+        nothing = VARIANT(pythoncom.VT_DISPATCH, None)
+
+        views = []
+        view = self._get(self._get(drawing, "GetFirstView"), "GetNextView")   # skip the sheet-format view
         while view is not None:
-            names.append(str(self._get(view, "GetName2")))
+            views.append(view)
             view = self._get(view, "GetNextView")
-        removed = 0
+        names = [str(self._get(v, "GetName2")) for v in views]
+        steps.append(f"master views found: {names}")
+
+        # 1) tables first (bend table, hole table...) - they belong to the views
+        tables_removed = 0
+        for v in views:
+            tables = self._get(v, "GetTableAnnotations")
+            for table in (tables or ()):
+                try:
+                    annotation = self._get(table, "GetAnnotation")
+                    drawing.ClearSelection2(True)
+                    if annotation is not None and annotation.Select3(False, nothing):
+                        drawing.Extension.DeleteSelection2(6)      # 2 = absorbed, 4 = children
+                        tables_removed += 1
+                except Exception as exc:
+                    steps.append(f"table delete failed: {exc}")
+        steps.append(f"tables removed: {tables_removed}")
+
+        # 2) then the views themselves
+        views_removed = 0
         for name in names:
             try:
-                nothing = VARIANT(pythoncom.VT_DISPATCH, None)
+                drawing.ClearSelection2(True)
                 if drawing.Extension.SelectByID2(name, "DRAWINGVIEW", 0, 0, 0, False, 0, nothing, 0):
-                    drawing.Extension.DeleteSelection2(0)
-                    removed += 1
-            except Exception:
-                pass
+                    drawing.Extension.DeleteSelection2(6)
+                    views_removed += 1
+                else:
+                    steps.append(f"could not select view: {name}")
+            except Exception as exc:
+                steps.append(f"view delete failed ({name}): {exc}")
         try:
             drawing.ClearSelection2(True)
         except Exception:
             pass
-        steps.append(f"old views removed: {removed}")
+        steps.append(f"old views removed: {views_removed}/{len(names)}")
 
     # ---------------- public ----------------
     def export_part(self, item, slddrw_path):
