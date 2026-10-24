@@ -12,7 +12,7 @@ except ImportError:
     raise
 
 from solidworks.assembly import SolidWorksAssembly, find_assemblies
-from solidworks.sw_drawing import SwDrawingExporter
+from solidworks.sw_drawings import SwDrawingExporter
 from solidworks.dwg_exporter import DwgExporter
 from solidworks.thickness_dwg import ThicknessDwgBuilder
 from solidworks.sheet_metal import SheetMetalDetector
@@ -46,6 +46,12 @@ VIEW_LEFT_MM = 25             # distance of the view's left edge from the sheet'
 VIEW_CENTER_Y_RATIO = 0.42    # vertical center as a fraction of sheet height (0.5 = middle, smaller = lower)
 SLDDRW_LIMIT = None            # e.g. 1 = test on the first part only, None = all parts
 
+
+INSERT_BEND_TABLE = True
+BEND_TABLE_TEMPLATE_NAME = None        # e.g. "bend.sldbndtbt" in the input folder; None = SolidWorks default template
+BEND_TABLE_GAP_MM = 15                 # gap between the flat pattern and the table
+# Columns whose header contains one of these words are deleted (we keep Tag, Direction, Angle, Radius)
+BEND_TABLE_REMOVE_WORDS = ("factor", "allowance", "deduction", "length", "thickness")
 
 def connect_to_solidworks():
     print("\nConnecting to SolidWorks...")
@@ -189,6 +195,10 @@ def export_slddrw_files(sw_app, assembly_path, scan_result, output_folder, input
         view_width_ratio=VIEW_WIDTH_RATIO,
         view_left_mm=VIEW_LEFT_MM,
         view_center_y_ratio=VIEW_CENTER_Y_RATIO,
+        insert_bend_table=INSERT_BEND_TABLE,
+        bend_table_template=(input_folder / BEND_TABLE_TEMPLATE_NAME) if BEND_TABLE_TEMPLATE_NAME else None,
+        bend_table_gap_mm=BEND_TABLE_GAP_MM,
+        bend_table_remove_words=BEND_TABLE_REMOVE_WORDS,
     )
     folder = output_folder / "flat_drawings"
     folder.mkdir(parents=True, exist_ok=True)

@@ -31,7 +31,8 @@ class SwDrawingExporter:
 
     def __init__(self, sw_app, assembly_path=None, reconnect=None, template_path=None,
                  sheet_format_path=None, text_replacements=None, master_drawing=None,
-                 view_width_ratio=0.5, view_left_mm=25, view_center_y_ratio=0.42):
+                 view_width_ratio=0.5, view_left_mm=25, view_center_y_ratio=0.42,insert_bend_table=True, bend_table_template=None,
+                 bend_table_gap_mm=15, bend_table_remove_words=()):
         self.sw_app = sw_app
         self.assembly_path = Path(assembly_path).resolve() if assembly_path else None
         self.reconnect = reconnect
@@ -42,6 +43,10 @@ class SwDrawingExporter:
         self.view_width_ratio = view_width_ratio
         self.view_left_mm = view_left_mm
         self.view_center_y_ratio = view_center_y_ratio
+        self.insert_bend_table = insert_bend_table
+        self.bend_table_template = Path(bend_table_template) if bend_table_template else None
+        self.bend_table_gap_mm = bend_table_gap_mm
+        self.bend_table_remove_words = tuple(w.lower() for w in bend_table_remove_words)
 
     # ---------------- helpers ----------------
     @staticmethod
@@ -214,7 +219,62 @@ class SwDrawingExporter:
                     f"left edge {outline[0] * 1000:.1f} mm, center y {((outline[1] + outline[3]) / 2) * 1000:.1f} mm")
         except Exception as exc:
             return f"fit skipped ({exc})"
+    def _default_bend_templates(self):
+        found = []
+        try:
+            exe = Path(str(self._get(self.sw_app, "GetExecutablePath")))
+            for base in (exe, exe.parent):
+                found += [str(p) for p in base.glob("lang/*/*.sldbndtbt")]
+        except Exception:
+            pass
+        return found
 
+    def _insert_bend_table(self, drawing, view, steps):
+        """Native bend table: tags on the bend lines + table with Tag / Direction / Angle / Radius."""
+        try:
+            view.ShowSheetMetalBendNotes = False      # no direction/angle notes on the flat pattern, only tags
+        except Exception:
+            pass
+
+        outline = self._get(view, "GetOutline")
+        x = outline[2] + self.bend_table_gap_mm / 1000.0
+        y = outline[3]
+
+        templates = [str(self.bend_table_template)] if self.bend_table_template else []
+        templates += [""] + self._default_bend_templates()
+
+        table = None
+        for tpl in templates:
+            try:
+                table = view.InsertBendTable(False, x, y, 1, tpl)      # 1 = anchor at top-left
+                if table is not None:
+                    steps.append(f"bend table inserted (template: {Path(tpl).name if tpl else 'default'})")
+                    break
+            except Exception as exc:
+                steps.append(f"bend table failed ({Path(tpl).name if tpl else 'default'}): {exc}")
+        if table is None:
+            steps.append("bend table NOT created")
+            return
+
+        try:
+            cols = int(self._get(table, "ColumnCount"))
+            headers = [str(table.Text(0, c)).strip() for c in range(cols)]
+            if len(set(headers)) == 1 and cols > 1:                # row 0 is a merged title row
+                headers = [str(table.Text(1, c)).strip() for c in range(cols)]
+            steps.append(f"bend table columns: {headers}")
+
+            removed = []
+            for c in range(cols - 1, -1, -1):                      # from the last so indexes stay valid
+                if any(w in headers[c].lower() for w in self.bend_table_remove_words):
+                    try:
+                        table.DeleteColumn(c)
+                    except Exception:
+                        table.DeleteColumn2(c, False)
+                    removed.append(headers[c])
+            steps.append(f"bend table columns removed: {removed}")
+            steps.append(f"bend table rows: {self._get(table, 'RowCount')}")
+        except Exception as exc:
+            steps.append(f"bend table column cleanup failed: {exc}")
 
     def _replace_sheet_texts(self, drawing, values):
         """Inside Edit Sheet Format: replaces placeholders such as {PART_NAME} in the notes."""
@@ -425,6 +485,8 @@ class SwDrawingExporter:
                 return False, "could not create the flat pattern view", steps
             steps.append(f"flat view created ({method})")
             steps.append(self._fit_view(drawing, view))
+            if self.insert_bend_table:
+                self._insert_bend_table(drawing, view, steps)
             try:
                 steps.append(f"view: {self._get(view, 'GetName2')}, outline: {tuple(round(v, 4) for v in self._get(view, 'GetOutline'))}")
             except Exception:
