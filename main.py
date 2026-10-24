@@ -12,9 +12,7 @@ except ImportError:
     raise
 
 from solidworks.assembly import SolidWorksAssembly, find_assemblies
-from solidworks.bend_table import BendTableReader
-from solidworks.bend_table_pdf import BendTablePdfWriter, attach_flat_dxfs
-from solidworks.sw_drawings import SwDrawingPdfExporter
+from solidworks.sw_drawings import SwDrawingExporter
 from solidworks.dwg_exporter import DwgExporter
 from solidworks.thickness_dwg import ThicknessDwgBuilder
 from solidworks.sheet_metal import SheetMetalDetector
@@ -25,23 +23,16 @@ ODA_CONVERTER_PATH = None
 PART_GAP = 20.0
 MAX_ROW_WIDTH = 6000.0
 
-# PDF_ONLY = True  -> no flat pattern DXF export, no merging, no DWG.
-PDF_ONLY = True
-# USE_SCAN_CACHE = True -> the sheet metal scan of the last run (output/scan_cache.json) is reused.
+# True  -> only one SLDDRW (flat pattern) per part, no DXF/DWG.
+# False -> additionally run the old DXF merge / DWG export.
+SLDDRW_ONLY = True
+# Reuse the sheet metal scan of the last run (output/scan_cache.json).
 USE_SCAN_CACHE = True
 
-# ---- native SLDDRW + PDF ----
-EXPORT_BEND_TABLE_PDF = True
-NATIVE_SLDDRW_PDF = True          # SLDDRW from input/master.slddrw, PDF exported from the saved SLDDRW
-MASTER_DRAWING_NAME = "master.slddrw"
-BEND_TABLE_LIMIT = None           # e.g. 1 = test on the first part only, None = all parts
-
-# ---- old PDF path (only used when NATIVE_SLDDRW_PDF = False) ----
-COMBINE_BEND_TABLE_PDF = True
-FOLDED_VIEWS_IN_PDF = True
-FLAT_VIEW_IN_PDF = True
-DRAWING_TEMPLATE_PATH = None
-BEND_TABLE_TEMPLATE_PATH = None
+# ---- flat pattern SLDDRW ----
+EXPORT_SLDDRW = True
+DRAWING_TEMPLATE_PATH = None   # e.g. input / "A3.drwdot"; None = SolidWorks default drawing template
+SLDDRW_LIMIT = None            # e.g. 1 = test on the first part only, None = all parts
 
 
 def connect_to_solidworks():
@@ -81,7 +72,7 @@ def print_summary(components, unique_parts):
     print(f"Unique part/config: {len(unique_parts)}")
 
 
-def save_run_summary(output_folder, assembly_path, scan_result, drawing_result):
+def save_run_summary(output_folder, assembly_path, scan_result, drawing_result, slddrw_result):
     data = {
         "assembly": str(assembly_path),
         "scan": {
@@ -91,6 +82,10 @@ def save_run_summary(output_folder, assembly_path, scan_result, drawing_result):
             "failed": scan_result.get("failed", 0),
             "total_quantity": scan_result.get("total_quantity", 0),
             "failed_parts": scan_result.get("failed_parts", []),
+        },
+        "slddrw": {
+            "created": len(slddrw_result["created"]) if slddrw_result else 0,
+            "failed": slddrw_result["failed"] if slddrw_result else [],
         },
         "drawings": {
             "created": len(drawing_result.get("files", [])) if drawing_result else 0,
@@ -164,56 +159,53 @@ def load_scan_cache(output_folder, assembly_path):
         return None
 
 
-def export_native_drawings(sw_app, assembly_path, master_path, scan_result, output_folder):
-    """Copies master.slddrw for every part, updates it with the part data and exports SLDDRW + PDF."""
-    if not master_path.is_file():
-        print(f"\nMASTER DRAWING NOT FOUND: {master_path}")
-        print("Put your sample drawing there (flat pattern + bend table + views) and run again.")
-        return
-
-    native_exporter = SwDrawingPdfExporter(
+def export_slddrw_files(sw_app, assembly_path, scan_result, output_folder):
+    """Creates one SLDDRW with the flat pattern view for every sheet metal part."""
+    exporter = SwDrawingExporter(
         sw_app,
         assembly_path=assembly_path,
         reconnect=connect_to_solidworks,
-        master_drawing=master_path,
-        dimensions=True,
+        template_path=DRAWING_TEMPLATE_PATH,
     )
-    native_folder = output_folder / "bend_drawings"
-    native_folder.mkdir(parents=True, exist_ok=True)
+    folder = output_folder / "flat_drawings"
+    folder.mkdir(parents=True, exist_ok=True)
     results = {"created": [], "failed": []}
 
     items = scan_result["sheet_metal_parts"]
-    if BEND_TABLE_LIMIT:
-        items = items[:int(BEND_TABLE_LIMIT)]
+    if SLDDRW_LIMIT:
+        items = items[:int(SLDDRW_LIMIT)]
 
     print("\n" + "=" * 60)
-    print(f"NATIVE DRAWINGS FROM {master_path.name} ({len(items)} parts)")
+    print(f"FLAT PATTERN SLDDRW FILES ({len(items)} parts)")
     print("=" * 60)
 
+    used_names = set()
     for index, item in enumerate(items, 1):
-        stem = native_exporter._safe_name(item.get("name") or Path(item["path"]).stem)
-        slddrw_path = native_folder / f"{stem}.SLDDRW"
-        pdf_path = native_folder / f"{stem}.PDF"
-        ok, message, steps = native_exporter.export_part(item, slddrw_path, pdf_path)
+        stem = exporter._safe_name(item.get("name") or Path(item["path"]).stem)
+        base, n = stem, 2
+        while stem.lower() in used_names:      # same name with different configuration
+            stem = f"{base}_{n}"
+            n += 1
+        used_names.add(stem.lower())
+
+        slddrw_path = folder / f"{stem}.SLDDRW"
+        ok, message, steps = exporter.export_part(item, slddrw_path)
         record = {"part": item.get("name"), "message": message, "steps": steps}
         if ok:
-            record.update({
-                "slddrw": str(slddrw_path),
-                "pdf": str(pdf_path),
-                "quantity": item.get("quantity", 1),
-            })
+            record.update({"slddrw": str(slddrw_path), "quantity": item.get("quantity", 1)})
             results["created"].append(record)
-            print(f"[{index}/{len(items)}] SLDDRW + PDF: {item.get('name')}")
+            print(f"[{index}/{len(items)}] OK: {item.get('name')}")
         else:
             results["failed"].append(record)
             print(f"[{index}/{len(items)}] FAILED: {item.get('name')} -> {message}")
         for line in steps:
             print(f"      {line}")
 
-    summary = native_folder / "native_drawing_summary.json"
+    summary = folder / "slddrw_summary.json"
     summary.write_text(json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(f"\nNative drawings: {len(results['created'])} created, {len(results['failed'])} failed")
+    print(f"\nSLDDRW: {len(results['created'])} created, {len(results['failed'])} failed")
     print(f"Summary: {summary}")
+    return results
 
 
 def main():
@@ -223,10 +215,8 @@ def main():
     input_folder.mkdir(exist_ok=True)
     output_folder.mkdir(exist_ok=True)
 
-    master_path = input_folder / MASTER_DRAWING_NAME
-
     print("\n" + "=" * 60)
-    print("SOLIDWORKS SHEET METAL -> DXF/DWG EXPORTER")
+    print("SOLIDWORKS SHEET METAL -> FLAT PATTERN SLDDRW / DXF / DWG")
     print("=" * 60)
 
     sw_app = connect_to_solidworks()
@@ -264,65 +254,33 @@ def main():
         if USE_SCAN_CACHE:
             save_scan_cache(output_folder, assembly_path, scan_result)
 
+    slddrw_result = None
+    if EXPORT_SLDDRW:
+        try:
+            slddrw_result = export_slddrw_files(sw_app, assembly_path, scan_result, output_folder)
+        except Exception as exc:
+            print(f"\nSLDDRW EXPORT FAILED (continuing): {type(exc).__name__}: {exc}")
+            traceback.print_exc()
+
     exporter = DwgExporter(
         sw_app,
         assembly_path=assembly_path,
         reconnect=connect_to_solidworks,
     )
 
-    if EXPORT_BEND_TABLE_PDF:
-        try:
-            if NATIVE_SLDDRW_PDF:
-                # master.slddrw is copied for every part, updated, saved; the PDF comes from the saved SLDDRW.
-                export_native_drawings(sw_app, assembly_path, master_path, scan_result, output_folder)
-            else:
-                reader = BendTableReader(
-                    sw_app,
-                    assembly_path=assembly_path,
-                    drawing_template=DRAWING_TEMPLATE_PATH,
-                    bend_template=BEND_TABLE_TEMPLATE_PATH,
-                    probe_folder=output_folder / "flat_view" if FLAT_VIEW_IN_PDF else None,
-                    probe_limit=10 ** 9,
-                    folded_views=FOLDED_VIEWS_IN_PDF and FLAT_VIEW_IN_PDF,
-                )
-                reader.read_all(scan_result["sheet_metal_parts"], output_folder, limit=BEND_TABLE_LIMIT)
-
-                if FLAT_VIEW_IN_PDF:
-                    print("\n" + "=" * 60 + "\nFLAT PATTERNS FOR THE PDF\n" + "=" * 60)
-                    attach_flat_dxfs(
-                        [p for p in scan_result["sheet_metal_parts"] if not p.get("view_dxf")],
-                        search_folders=[
-                            output_folder / "by_thickness" / "_parts_dxf",
-                            output_folder / "combined" / "_parts_dxf",
-                            output_folder / "flat_dxf",
-                        ],
-                        export_folder=output_folder / "flat_dxf",
-                        exporter=exporter,
-                    )
-
-                BendTablePdfWriter().write_all(
-                    scan_result["sheet_metal_parts"],
-                    output_folder / "bend_tables_pdf",
-                    combined_name=f"{assembly_path.stem}_bend_tables" if COMBINE_BEND_TABLE_PDF else None,
-                )
-        except Exception as exc:
-            print(f"\nBEND TABLES FAILED (continuing without them): {type(exc).__name__}: {exc}")
-            traceback.print_exc()
-
     drawing_result = None
-    builder = ThicknessDwgBuilder(
-        exporter,
-        gap=PART_GAP,
-        max_row_width=MAX_ROW_WIDTH,
-        repeat_by_quantity=REPEAT_BY_QUANTITY,
-        oda_path=ODA_CONVERTER_PATH,
-        group_by_thickness=GROUP_BY_THICKNESS,
-    )
-
     try:
-        if PDF_ONLY:
-            print("\nPDF_ONLY is on: flat pattern DXF export, merging and DWG conversion are skipped.")
+        if SLDDRW_ONLY:
+            print("\nSLDDRW_ONLY is on: DXF export, merging and DWG conversion are skipped.")
         else:
+            builder = ThicknessDwgBuilder(
+                exporter,
+                gap=PART_GAP,
+                max_row_width=MAX_ROW_WIDTH,
+                repeat_by_quantity=REPEAT_BY_QUANTITY,
+                oda_path=ODA_CONVERTER_PATH,
+                group_by_thickness=GROUP_BY_THICKNESS,
+            )
             drawing_result = builder.build(
                 scan_result["sheet_metal_parts"],
                 output_folder / ("by_thickness" if GROUP_BY_THICKNESS else "combined"),
@@ -341,7 +299,7 @@ def main():
         except Exception:
             pass
 
-    save_run_summary(output_folder, assembly_path, scan_result, drawing_result)
+    save_run_summary(output_folder, assembly_path, scan_result, drawing_result, slddrw_result)
 
     print("\n" + "=" * 60)
     print("PROCESS FINISHED")
@@ -350,6 +308,8 @@ def main():
     print(f"Sheet metal (quantity): {scan_result['total_quantity']}")
     print(f"Not sheet metal: {scan_result['not_sheet_metal']}")
     print(f"Scan failures: {scan_result['failed']}")
+    if slddrw_result:
+        print(f"SLDDRW created: {len(slddrw_result['created'])}  |  failed: {len(slddrw_result['failed'])}")
     if drawing_result:
         print(f"Drawings created: {len(drawing_result['files'])}")
         print(f"Export failures: {len(drawing_result['failed_parts'])}")

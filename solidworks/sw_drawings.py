@@ -1,363 +1,289 @@
-import os
+"""Creates one SLDDRW per sheet-metal part containing its flat pattern view."""
+import gc
 import re
-import shutil
 import time
 from pathlib import Path
 
 import pythoncom
 from win32com.client import VARIANT
 
-from .dwg_exporter import DwgExporter
-
-SW_DOC_DRAWING = 3
+SW_DOC_PART = 1
 SW_OPEN_SILENT = 1
+SW_SAVE_SILENT = 1
+SW_SAVE_AS_CURRENT_VERSION = 0
+SW_UNSUPPRESS = 0
+SW_SUPPRESS = 1
+SW_THIS_CONFIGURATION = 1
+SW_PAPER_A3 = 8                       # swDwgPaperA3size
+SW_DEFAULT_TEMPLATE_DRAWING = 10      # swUserPreferenceStringValue_e.swDefaultTemplateDrawing
+FALLBACK_SHEET = (0.420, 0.297)       # A3 landscape, meters
+FIT_RATIO = 0.70                      # flat view uses at most 70% of the sheet
+STANDARD_SCALES = (10, 5, 4, 2, 1, 0.5, 0.4, 0.25, 0.2, 0.1, 0.05, 0.04, 0.02, 0.01, 0.005)
+INVALID_FILENAME = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 
 
-class SwDrawingPdfExporter(DwgExporter):
-    """
-    For every sheet metal part:
-      1) copies master.slddrw and replaces the referenced model,
-      2) removes the master's model views,
-      3) inserts a flat-pattern view of the target part,
-      4) saves the .slddrw.
-    """
+class SwDrawingExporter:
+    """For every part: open part -> new drawing -> flat pattern view -> save .SLDDRW."""
 
-    def __init__(self, sw_app, assembly_path=None, reconnect=None,
-                 master_drawing=None, **legacy_options):
-        super().__init__(sw_app, assembly_path=assembly_path, reconnect=reconnect)
-        self.master_drawing = Path(master_drawing).resolve() if master_drawing else None
-        self._typelib_cache = None
+    def __init__(self, sw_app, assembly_path=None, reconnect=None, template_path=None):
+        self.sw_app = sw_app
+        self.assembly_path = Path(assembly_path).resolve() if assembly_path else None
+        self.reconnect = reconnect
+        self.template_path = Path(template_path) if template_path else None
 
-    # =====================================================
-    # TYPED API (early binding)
-    # =====================================================
+    # ---------------- helpers ----------------
+    @staticmethod
+    def _safe_name(name):
+        cleaned = INVALID_FILENAME.sub("_", str(name)).strip().rstrip(".")
+        return re.sub(r"\s+", " ", cleaned) or "part"
 
-    def _typelib_module(self):
-        if self._typelib_cache is not None:
-            return self._typelib_cache or None
-        self._typelib_cache = False
+    @staticmethod
+    def _byref_i4():
+        return VARIANT(pythoncom.VT_BYREF | pythoncom.VT_I4, 0)
+
+    @staticmethod
+    def _get(obj, name, default=None):
+        if obj is None:
+            return default
         try:
-            from win32com.client import gencache
+            value = getattr(obj, name)
+            return value() if callable(value) else value
+        except Exception:
+            return default
 
-            exe = self._get(self.sw_app, "GetExecutablePath")
-            if not exe:
-                return None
-            install = Path(str(exe))
-            if install.suffix:
-                install = install.parent
-            for tlb_path in install.glob("sldworks.tlb"):
-                tlb = pythoncom.LoadTypeLib(str(tlb_path))
-                guid, lcid, _syskind, major, minor, _flags = tlb.GetLibAttr()
-                module = gencache.EnsureModule(str(guid), lcid, major, minor)
-                if module is not None:
-                    self._typelib_cache = module
-                    return module
+    @staticmethod
+    def _written(path):
+        try:
+            p = Path(path)
+            return p.exists() and p.stat().st_size > 0
+        except Exception:
+            return False
+
+    @staticmethod
+    def _is_connection_error(text):
+        text = str(text).lower()
+        return any(t in text for t in (
+            "rpc server is unavailable", "remote procedure call failed",
+            "server execution failed", "object invoked has disconnected",
+            "disconnected from its clients", "catastrophic failure",
+        ))
+
+    def _reconnect(self):
+        if not self.reconnect:
+            return False
+        try:
+            app = self.reconnect()
+            if app is not None:
+                self.sw_app = app
+                return True
+        except Exception as exc:
+            print(f"  Reconnect failed: {exc}")
+        return False
+
+    def _find_template(self):
+        if self.template_path and self.template_path.is_file():
+            return str(self.template_path.resolve())
+        try:
+            tpl = self.sw_app.GetUserPreferenceStringValue(SW_DEFAULT_TEMPLATE_DRAWING)
+            if tpl and Path(tpl).is_file():
+                return str(tpl)
         except Exception:
             pass
         return None
 
-    def _cast(self, obj, interface):
-        if obj is None:
-            return None
-        module = self._typelib_module()
-        if module is None:
-            return obj
-        try:
-            iid = module.NamesToIIDMap[interface]
-            cls = getattr(module, interface)
-            return cls(obj._oleobj_.QueryInterface(iid, pythoncom.IID_IDispatch))
-        except Exception:
-            return obj
-
-    # =====================================================
-    # SMALL HELPERS
-    # =====================================================
-
-    def _clear(self, drawing):
-        try:
-            drawing.ClearSelection2(True)
-        except Exception:
-            pass
-
     def _close_doc(self, doc):
         if doc is None:
             return
-        for getter in ("GetTitle", "GetPathName"):
-            value = self._get(doc, getter)
-            if value:
+        try:
+            title = self._get(doc, "GetTitle")
+            if title:
+                self.sw_app.CloseDoc(str(title))
+        except Exception:
+            pass
+
+    def _open_part(self, path):
+        path = str(Path(path).resolve())
+        try:
+            existing = self.sw_app.GetOpenDocumentByName(path)
+            if existing is not None:
+                return existing, False, "already open"
+        except Exception:
+            pass
+        errors, warnings = self._byref_i4(), self._byref_i4()
+        model = self.sw_app.OpenDoc6(path, SW_DOC_PART, SW_OPEN_SILENT, "", errors, warnings)
+        if model is None:
+            return None, False, f"OpenDoc6 returned None (errors={getattr(errors, 'value', errors)})"
+        return model, True, "opened"
+
+    def _find_flat_pattern(self, model):
+        for name in ("Flat-Pattern1", "Flat-Pattern", "FlatPattern"):
+            try:
+                feature = model.FeatureByName(name)
+            except Exception:
+                feature = None
+            if feature is not None:
+                return feature
+        current = self._get(model, "FirstFeature")
+        for _ in range(100000):
+            if current is None:
+                break
+            if str(self._get(current, "GetTypeName2") or "").lower() == "flatpattern":
+                return current
+            current = self._get(current, "GetNextFeature")
+        return None
+
+    def _sheet_size(self, drawing):
+        try:
+            props = drawing.GetCurrentSheet().GetProperties2()
+            if props and len(props) >= 7 and props[5] > 0 and props[6] > 0:
+                return float(props[5]), float(props[6])
+        except Exception:
+            pass
+        return FALLBACK_SHEET
+
+    def _create_flat_view(self, drawing, part_path, config, x, y):
+        try:
+            view = drawing.CreateFlatPatternViewFromModelView3(
+                part_path, config or "", x, y, 0.0, False, False)
+            if view is not None:
+                return view, "CreateFlatPatternViewFromModelView3"
+        except Exception:
+            pass
+        try:
+            view = drawing.CreateDrawViewFromModelView3(part_path, "*Flat pattern", x, y, 0.0)
+            if view is not None:
+                return view, "CreateDrawViewFromModelView3(*Flat pattern)"
+        except Exception:
+            pass
+        return None, None
+
+    def _fit_view(self, drawing, view):
+        """Picks a standard scale so the flat pattern fits the sheet and centers it."""
+        width, height = self._sheet_size(drawing)
+        try:
+            outline = view.GetOutline()
+            vw, vh = outline[2] - outline[0], outline[3] - outline[1]
+            current = float(view.ScaleDecimal)
+            if vw > 0 and vh > 0 and current > 0:
+                wanted = current * min(width * FIT_RATIO / vw, height * FIT_RATIO / vh)
+                chosen = next((s for s in STANDARD_SCALES if s <= wanted), STANDARD_SCALES[-1])
+                view.ScaleDecimal = chosen
+                view.Position = VARIANT(pythoncom.VT_ARRAY | pythoncom.VT_R8,
+                                        (width / 2.0, height / 2.0))
+                return f"scale 1:{1 / chosen:g}" if chosen < 1 else f"scale {chosen:g}:1"
+        except Exception as exc:
+            return f"fit skipped ({exc})"
+        return "fit skipped"
+
+    # ---------------- public ----------------
+    def export_part(self, item, slddrw_path):
+        """Returns (ok, message, steps)."""
+        ok, message, steps = self._export_once(item, slddrw_path)
+        if not ok and self._is_connection_error(message):
+            steps.append("connection lost -> reconnecting and retrying once")
+            time.sleep(3)
+            if self._reconnect():
+                ok, message, steps2 = self._export_once(item, slddrw_path)
+                steps += steps2
+        return ok, message, steps
+
+    def _export_once(self, item, slddrw_path):
+        steps = []
+        slddrw_path = Path(slddrw_path)
+        slddrw_path.parent.mkdir(parents=True, exist_ok=True)
+        if slddrw_path.exists():
+            try:
+                slddrw_path.unlink()
+            except Exception as exc:
+                return False, f"cannot remove old file: {exc}", steps
+
+        part_path = str(Path(item["path"]).resolve())
+        configuration = item.get("configuration")
+        model = drawing = flat = None
+        opened_by_us = False
+        was_suppressed = False
+        previous_config = None
+
+        try:
+            template = self._find_template()
+            if not template:
+                return False, "no drawing template found - set DRAWING_TEMPLATE_PATH in main.py", steps
+            steps.append(f"template: {Path(template).name}")
+
+            model, opened_by_us, status = self._open_part(part_path)
+            steps.append(f"part {status}")
+            if model is None:
+                return False, status, steps
+
+            if configuration:
                 try:
-                    self.sw_app.CloseDoc(str(value))
+                    previous_config = self._get(
+                        self._get(model.ConfigurationManager, "ActiveConfiguration"), "Name")
+                    model.ShowConfiguration2(str(configuration))
+                    steps.append(f"configuration: {configuration}")
+                except Exception as exc:
+                    steps.append(f"configuration not activated: {exc}")
+
+            try:
+                model.ForceRebuild3(True)
+            except Exception:
+                try:
+                    model.EditRebuild3()
                 except Exception:
                     pass
 
-    def _outline(self, view):
-        values = self._call(view, "GetOutline")
-        try:
-            x0, y0, x1, y1 = (float(v) for v in values[:4])
-            return x0, y0, x1, y1
-        except Exception:
-            return None
+            flat = self._find_flat_pattern(model)
+            if flat is None:
+                return False, "Flat-Pattern feature not found", steps
+            was_suppressed = bool(self._get(flat, "IsSuppressed", False))
+            if was_suppressed:
+                flat.SetSuppression2(SW_UNSUPPRESS, SW_THIS_CONFIGURATION, None)
+                steps.append("flat pattern unsuppressed")
 
-    def _model_views(self, drawing):
-        """All real views of the drawing (the first 'view' is the sheet itself and is skipped)."""
-        views = []
-        view = self._call(drawing, "GetFirstView")
-        view = self._call(view, "GetNextView") if view is not None else None
-        guard = 0
-        while view is not None and guard < 100:
-            guard += 1
-            views.append(view)
-            view = self._call(view, "GetNextView")
-        return views
+            drawing = self.sw_app.NewDocument(template, SW_PAPER_A3, 0.0, 0.0)
+            if drawing is None:
+                return False, "NewDocument returned None", steps
+            width, height = self._sheet_size(drawing)
 
-    # =====================================================
-    # OPEN / SAVE
-    # =====================================================
+            active_cfg = configuration or self._get(
+                self._get(model.ConfigurationManager, "ActiveConfiguration"), "Name") or ""
+            view, method = self._create_flat_view(drawing, part_path, active_cfg, width / 2, height / 2)
+            if view is None:
+                return False, "could not create the flat pattern view", steps
+            steps.append(f"flat view created ({method})")
+            steps.append(self._fit_view(drawing, view))
 
-    def _open_drawing(self, path, steps):
-        try:
-            return self.sw_app.OpenDoc6(
-                str(path), SW_DOC_DRAWING, SW_OPEN_SILENT, "",
-                self._byref_i4(), self._byref_i4(),
-            )
-        except Exception as exc:
-            steps.append(f"opening the .slddrw failed: {str(exc)[:100]}")
-            return None
-
-    def _save_drawing(self, drawing, slddrw_path, steps):
-        before = slddrw_path.stat().st_mtime if slddrw_path.exists() else 0
-        saved = False
-        try:
-            result = drawing.Save3(1, self._byref_i4(), self._byref_i4())
-            saved = bool(result) or (slddrw_path.exists() and slddrw_path.stat().st_mtime > before)
-        except Exception as exc:
-            steps.append(f"Save3 failed ({str(exc)[:60]})")
-        if not saved:
             try:
-                drawing.SaveAs3(str(slddrw_path), 0, 1)
-                saved = self._written(slddrw_path)
-            except Exception as exc:
-                steps.append(f"SaveAs3 failed ({str(exc)[:60]})")
-        steps.append("saved .slddrw" if saved else "save .slddrw: NOT confirmed")
-        return saved
-
-    # =====================================================
-    # MODEL REPLACEMENT
-    # =====================================================
-
-    def _replace_model(self, drawing_path, old_ref, new_ref, steps):
-        """The drawing must be CLOSED."""
-        try:
-            result = self.sw_app.ReplaceReferencedDocument(str(drawing_path), str(old_ref), str(new_ref))
-            steps.append(f"model replaced: result={result}")
-            return result in (None, True, 1)
-        except Exception as exc:
-            steps.append(f"ReplaceReferencedDocument failed ({type(exc).__name__}: {str(exc)[:80]})")
-            return False
-
-    def _replace_model_in_open_drawing(self, drawing, views, new_ref, steps):
-        """Fallback: replace the model while the drawing is open."""
-        names = [str(self._call(v, "GetName2") or "") for v in views]
-        attempts = (
-            lambda: drawing.ReplaceViewModel(str(new_ref), tuple(names), tuple([""] * len(names))),
-            lambda: drawing.ReplaceViewModel(
-                str(new_ref),
-                VARIANT(pythoncom.VT_ARRAY | pythoncom.VT_VARIANT, tuple(names)),
-                VARIANT(pythoncom.VT_ARRAY | pythoncom.VT_VARIANT, tuple([""] * len(names)))),
-        )
-        for attempt in attempts:
-            try:
-                result = attempt()
-                steps.append(f"model replaced (ReplaceViewModel): result={result}")
-                if result in (None, True, 1):
-                    return True
-            except Exception as exc:
-                steps.append(f"ReplaceViewModel failed ({type(exc).__name__}: {str(exc)[:70]})")
-        return False
-
-    # =====================================================
-    # MASTER CLEANUP + FLAT PATTERN
-    # =====================================================
-
-    def _delete_model_views(self, drawing, steps):
-        """Delete every model view of the copied master."""
-        drawing_doc = self._cast(drawing, "IDrawingDoc")
-        removed, failed = 0, []
-        for _ in range(len(self._model_views(drawing)) + 2):
-            views = self._model_views(drawing)
-            if not views:
-                break
-            name = str(self._call(views[-1], "GetName2") or "")
-            if not name:
-                failed.append("unnamed view")
-                break
-            try:
-                self._clear(drawing)
-                if drawing_doc.DeleteView(name) is False:
-                    failed.append(name)
-                    break
-                removed += 1
-                self._call(drawing, "ForceRebuild3", False)
-            except Exception as exc:
-                failed.append(f"{name} ({type(exc).__name__}: {str(exc)[:80]})")
-                break
-        self._clear(drawing)
-        steps.append(f"master views removed: {removed}" + (f"; failed: {', '.join(failed)}" if failed else ""))
-        return not failed
-
-    def _create_flat_pattern_view(self, drawing, model_path, configuration, slot, steps):
-        """Insert a new flat-pattern view from the target part."""
-        x, y = (float(slot["box"][0]), float(slot["box"][1])) if slot else (0.15, 0.15)
-        config_name = str(configuration or "")
-        drawing_doc = self._cast(drawing, "IDrawingDoc")
-        model_name = str(Path(model_path).resolve())
-        view, errors = None, []
-
-        for cfg in dict.fromkeys((config_name, "")):
-            try:
-                view = drawing_doc.CreateFlatPatternViewFromModelView3(
-                    model_name, cfg, x, y, 0.0, False, False
-                )
-                if view is not None:
-                    steps.append(f"flat-pattern view created (configuration={cfg!r})")
-                    break
-                errors.append(f"configuration={cfg!r}: returned None")
-            except Exception as exc:
-                errors.append(f"configuration={cfg!r}: {type(exc).__name__}: {str(exc)[:90]}")
-
-        if view is None:
-            try:
-                view = drawing_doc.CreateFlatPatternViewFromModelView2(
-                    model_name, config_name, x, y, 0.0, False
-                )
-                if view is not None:
-                    steps.append("flat-pattern view created (CreateFlatPatternViewFromModelView2)")
-            except Exception as exc:
-                errors.append(f"ViewFromModelView2: {type(exc).__name__}: {str(exc)[:90]}")
-
-        if view is None:
-            steps.append("flat-pattern insertion failed: " + " | ".join(errors))
-            steps.append("Check that the part is sheet metal, Flat-Pattern is unsuppressed, "
-                         "and the configuration can be unfolded.")
-            return None
-
-        self._call(drawing, "ForceRebuild3", False)
-        for candidate in self._model_views(drawing):  # reacquire to avoid stale COM wrappers
-            if bool(self._call(candidate, "IsFlatPatternView", default=False)):
-                return candidate
-        return view
-
-    # =====================================================
-    # ONE PART
-    # =====================================================
-
-    def _build_drawing(self, item, slddrw_path):
-        steps = []
-        path = Path(item["path"]).resolve()
-        configuration = item.get("configuration")
-        model = None
-        opened_by_us = False
-        previous_config = None
-        drawing = None
-
-        try:
-            master = self.master_drawing
-            if master is None or not master.is_file():
-                return False, f"master drawing not found: {master}", steps
-            steps.append(f"master: {master.name}")
-
-            model, opened_by_us, open_status = self._open_part(path)
-            if model is None:
-                time.sleep(2)
-                model, opened_by_us, open_status = self._open_part(path)
-            if model is None:
-                return False, f"cannot open part: {open_status}", steps
-            _, previous_config = self._activate_configuration(model, configuration)
-
-            # ---- 1) copy the master ----
-            slddrw_path.parent.mkdir(parents=True, exist_ok=True)
-            if slddrw_path.exists():
-                slddrw_path.unlink()
-            shutil.copy2(str(master), str(slddrw_path))
-            try:
-                os.chmod(str(slddrw_path), 0o666)
+                drawing.ViewZoomtofit2()
             except Exception:
                 pass
 
-            # ---- 2) read the master's model reference and the position of its flat view ----
-            doc = self._open_drawing(slddrw_path, steps)
-            if doc is None:
-                return False, "cannot open the copy of the master", steps
-            old_ref, flat_slot = None, None
-            for view in self._model_views(doc):
-                ref = self._call(view, "GetReferencedModelName")
-                if ref and not old_ref:
-                    old_ref = str(ref)
-                outline = self._outline(view)
-                if outline is not None and flat_slot is None \
-                        and bool(self._call(view, "IsFlatPatternView", default=False)):
-                    flat_slot = {"box": ((outline[0] + outline[2]) / 2, (outline[1] + outline[3]) / 2,
-                                         outline[2] - outline[0], outline[3] - outline[1])}
-            self._close_doc(doc)
-            if not old_ref:
-                return False, "no model views found in the master drawing", steps
-
-            # ---- 3) replace the model (drawing closed) ----
-            replaced_in_closed = True
-            try:
-                same_part = Path(old_ref).resolve() == path
-            except Exception:
-                same_part = False
-            if not same_part:
-                try:
-                    self.sw_app.CloseDoc(old_ref)
-                except Exception:
-                    pass
-                replaced_in_closed = self._replace_model(slddrw_path, old_ref, path, steps)
-
-            # ---- 4) reopen, replace in the open drawing if needed ----
-            drawing = self._open_drawing(slddrw_path, steps)
-            if drawing is None:
-                return False, "cannot reopen the drawing", steps
-            if not replaced_in_closed:
-                if not self._replace_model_in_open_drawing(drawing, self._model_views(drawing), path, steps):
-                    return False, "could not replace the model in the drawing", steps
-            self._call(drawing, "ForceRebuild3", False)
-
-            # ---- 5) delete master views, insert the new flat pattern ----
-            self._delete_model_views(drawing, steps)
-            flat_view = self._create_flat_pattern_view(drawing, path, configuration, flat_slot, steps)
-            if flat_view is None:
-                return False, "could not create the flat-pattern view", steps
-            self._call(drawing, "ForceRebuild3", False)
-            self._call(drawing, "ViewZoomtofit2")
-
-            # ---- 6) save the .slddrw ----
-            if not self._save_drawing(drawing, slddrw_path, steps):
-                return False, ".slddrw was not saved", steps
-            return True, "SolidWorks drawing (flat pattern from master)", steps
+            err = drawing.SaveAs3(str(slddrw_path), SW_SAVE_AS_CURRENT_VERSION, SW_SAVE_SILENT)
+            if not self._written(slddrw_path):
+                return False, f"SaveAs3 failed (code {err})", steps
+            steps.append("SLDDRW saved")
+            return True, "ok", steps
 
         except Exception as exc:
             return False, f"{type(exc).__name__}: {exc}", steps
         finally:
+            # close the drawing first, then restore and close the part
             self._close_doc(drawing)
-            if model is not None:
-                self._restore_configuration(model, previous_config)
-            self._close_part(model, opened_by_us)
-
-    def export_part(self, item, slddrw_path, pdf_path=None):
-        # pdf_path is kept only for compatibility with the caller; it is ignored.
-        ok, message, steps = self._build_drawing(item, Path(slddrw_path))
-
-        if not ok and self._is_connection_error(RuntimeError(message + " " + " ".join(steps))):
-            print("  SolidWorks connection problem. Reconnecting and retrying once...")
-            time.sleep(3)
-            if self._reconnect():
-                ok, message, steps = self._build_drawing(item, Path(slddrw_path))
-
-        return ok, message, steps
-
-    @staticmethod
-    def _safe_name(name):
-        cleaned = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", str(name)).strip().rstrip(".")
-        return re.sub(r"\s+", " ", cleaned) or "part"
+            if flat is not None and was_suppressed:
+                try:
+                    flat.SetSuppression2(SW_SUPPRESS, SW_THIS_CONFIGURATION, None)
+                except Exception:
+                    pass
+            if model is not None and previous_config:
+                try:
+                    model.ShowConfiguration2(str(previous_config))
+                except Exception:
+                    pass
+            if opened_by_us:
+                self._close_doc(model)
+            del drawing, model, flat
+            gc.collect()
+            try:
+                pythoncom.CoFreeUnusedLibraries()
+            except Exception:
+                pass
