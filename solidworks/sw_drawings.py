@@ -134,7 +134,8 @@ class SwDrawingExporter:
 
     def _sheet_size(self, drawing):
         try:
-            props = drawing.GetCurrentSheet().GetProperties2()
+            sheet = self._get(drawing, "GetCurrentSheet")
+            props = self._get(sheet, "GetProperties2")
             if props and len(props) >= 7 and props[5] > 0 and props[6] > 0:
                 return float(props[5]), float(props[6])
         except Exception:
@@ -161,9 +162,9 @@ class SwDrawingExporter:
         """Picks a standard scale so the flat pattern fits the sheet and centers it."""
         width, height = self._sheet_size(drawing)
         try:
-            outline = view.GetOutline()
+            outline = self._get(view, "GetOutline")
             vw, vh = outline[2] - outline[0], outline[3] - outline[1]
-            current = float(view.ScaleDecimal)
+            current = float(self._get(view, "ScaleDecimal"))
             if vw > 0 and vh > 0 and current > 0:
                 wanted = current * min(width * FIT_RATIO / vw, height * FIT_RATIO / vh)
                 chosen = next((s for s in STANDARD_SCALES if s <= wanted), STANDARD_SCALES[-1])
