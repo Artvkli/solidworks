@@ -231,10 +231,7 @@ class SwDrawingExporter:
 
     def _insert_bend_table(self, drawing, view, steps):
         """Native bend table: tags on the bend lines + table with Tag / Direction / Angle / Radius."""
-        try:
-            view.ShowSheetMetalBendNotes = False      # no direction/angle notes on the flat pattern, only tags
-        except Exception:
-            pass
+        
 
         outline = self._get(view, "GetOutline")
         x = outline[2] + self.bend_table_gap_mm / 1000.0
@@ -253,26 +250,40 @@ class SwDrawingExporter:
             except Exception as exc:
                 steps.append(f"bend table failed ({Path(tpl).name if tpl else 'default'}): {exc}")
         if table is None:
-            steps.append("bend table NOT created")
-            return
+            steps.append(f"bend table object: {type(table).__name__}")
+        try:
+            view.ShowSheetMetalBendNotes = False          # only now: tags stay, notes go
+        except Exception:
+            pass
+
+        grid = table
+        try:
+            grid.ColumnCount
+        except Exception:
+            for name in ("GetTableAnnotation", "TableAnnotation"):
+                inner = self._get(table, name)
+                if inner is not None:
+                    grid = inner
+                    steps.append(f"table accessed via {name}")
+                    break
 
         try:
-            cols = int(self._get(table, "ColumnCount"))
-            headers = [str(table.Text(0, c)).strip() for c in range(cols)]
-            if len(set(headers)) == 1 and cols > 1:                # row 0 is a merged title row
-                headers = [str(table.Text(1, c)).strip() for c in range(cols)]
+            cols = int(self._get(grid, "ColumnCount"))
+            headers = [str(grid.Text(0, c)).strip() for c in range(cols)]
+            if len(set(headers)) == 1 and cols > 1:
+                headers = [str(grid.Text(1, c)).strip() for c in range(cols)]
             steps.append(f"bend table columns: {headers}")
 
             removed = []
-            for c in range(cols - 1, -1, -1):                      # from the last so indexes stay valid
+            for c in range(cols - 1, -1, -1):
                 if any(w in headers[c].lower() for w in self.bend_table_remove_words):
                     try:
-                        table.DeleteColumn(c)
+                        grid.DeleteColumn(c)
                     except Exception:
-                        table.DeleteColumn2(c, False)
+                        grid.DeleteColumn2(c, False)
                     removed.append(headers[c])
             steps.append(f"bend table columns removed: {removed}")
-            steps.append(f"bend table rows: {self._get(table, 'RowCount')}")
+            steps.append(f"bend table rows: {self._get(grid, 'RowCount')}")
         except Exception as exc:
             steps.append(f"bend table column cleanup failed: {exc}")
 
