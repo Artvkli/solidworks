@@ -239,22 +239,19 @@ class SwDrawingExporter:
         except Exception as exc:
             steps.append(f"drawing properties skipped: {exc}")
 
-        # 3) Edit Sheet Format -> replace placeholders -> back to sheet
-        in_template = False
+        # 3) Edit Sheet Format -> replace placeholders -> ALWAYS back to sheet
         try:
-            in_template = bool(drawing.EditTemplate())
-            if in_template:
-                steps.append(f"Edit Sheet Format: {self._replace_sheet_texts(drawing, values)} text(s) replaced")
-            else:
-                steps.append("Edit Sheet Format: EditTemplate returned False")
+            drawing.EditTemplate()          # the return value is unreliable (None), so it is ignored
+            replaced = self._replace_sheet_texts(drawing, values)
+            steps.append(f"Edit Sheet Format: {replaced} text(s) replaced")
         except Exception as exc:
             steps.append(f"Edit Sheet Format failed: {exc}")
         finally:
-            if in_template:
-                try:
-                    drawing.EditSheet()
-                except Exception as exc:
-                    steps.append(f"EditSheet failed: {exc}")
+            try:
+                drawing.EditSheet()         # harmless if not in template mode
+                steps.append("back to sheet (EditSheet)")
+            except Exception as exc:
+                steps.append(f"EditSheet failed: {exc}")
 
     def _open_drawing(self, path):
         errors, warnings = self._byref_i4(), self._byref_i4()
@@ -366,6 +363,10 @@ class SwDrawingExporter:
                 return False, "could not create the flat pattern view", steps
             steps.append(f"flat view created ({method})")
             steps.append(self._fit_view(drawing, view))
+            try:
+                steps.append(f"view: {self._get(view, 'GetName2')}, outline: {tuple(round(v, 4) for v in self._get(view, 'GetOutline'))}")
+            except Exception:
+                pass
 
             try:
                 drawing.ViewZoomtofit2()
