@@ -165,22 +165,42 @@ class SwDrawingExporter:
         return None, None
 
     def _fit_view(self, drawing, view):
-        """Picks a standard scale so the flat pattern fits the sheet and centers it."""
+        """Chooses a standard scale so the view fits the free area, then centers it in that area."""
         width, height = self._sheet_size(drawing)
+        if self.view_area_mm:
+            left, bottom, right, top = (v / 1000.0 for v in self.view_area_mm)
+        else:
+            left, bottom, right, top = width * 0.05, height * 0.05, width * 0.95, height * 0.95
+        area_w, area_h = right - left, top - bottom
+        target_x, target_y = (left + right) / 2.0, (bottom + top) / 2.0
+
         try:
             outline = self._get(view, "GetOutline")
             vw, vh = outline[2] - outline[0], outline[3] - outline[1]
             current = float(self._get(view, "ScaleDecimal"))
-            if vw > 0 and vh > 0 and current > 0:
-                wanted = current * min(width * FIT_RATIO / vw, height * FIT_RATIO / vh)
-                chosen = next((s for s in STANDARD_SCALES if s <= wanted), STANDARD_SCALES[-1])
-                view.ScaleDecimal = chosen
+            if vw <= 0 or vh <= 0 or current <= 0:
+                return "fit skipped (empty outline)"
+
+            wanted = current * min(area_w * FIT_RATIO / vw, area_h * FIT_RATIO / vh)
+            chosen = next((s for s in STANDARD_SCALES if s <= wanted), STANDARD_SCALES[-1])
+            view.ScaleDecimal = chosen
+
+            # center the REAL bounding box of the view, not view.Position
+            for _ in range(2):                      # second pass corrects any small drift
+                outline = self._get(view, "GetOutline")
+                cx = (outline[0] + outline[2]) / 2.0
+                cy = (outline[1] + outline[3]) / 2.0
+                pos = self._get(view, "Position")
                 view.Position = VARIANT(pythoncom.VT_ARRAY | pythoncom.VT_R8,
-                                        (width / 2.0, height / 2.0))
-                return f"scale 1:{1 / chosen:g}" if chosen < 1 else f"scale {chosen:g}:1"
+                                        (pos[0] + target_x - cx, pos[1] + target_y - cy))
+
+            outline = self._get(view, "GetOutline")
+            err_x = ((outline[0] + outline[2]) / 2.0 - target_x) * 1000
+            err_y = ((outline[1] + outline[3]) / 2.0 - target_y) * 1000
+            scale_txt = f"1:{1 / chosen:g}" if chosen < 1 else f"{chosen:g}:1"
+            return f"scale {scale_txt}, centered (offset {err_x:.2f}, {err_y:.2f} mm)"
         except Exception as exc:
             return f"fit skipped ({exc})"
-        return "fit skipped"
 
     def _replace_sheet_texts(self, drawing, values):
         """Inside Edit Sheet Format: replaces placeholders such as {PART_NAME} in the notes."""

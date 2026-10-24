@@ -30,6 +30,8 @@ SLDDRW_ONLY = True
 USE_SCAN_CACHE = True
 
 # ---- flat pattern SLDDRW ----
+
+VIEW_AREA_MM = (20, 60, 400, 280)
 EXPORT_SLDDRW = True
 MASTER_DRAWING_NAME = "master.slddrw"   # in the input folder: your sheet format + title block
 SHEET_FORMAT_NAME = None                # e.g. "format.slddrt" (input folder); None = use the format inside master.slddrw
@@ -182,6 +184,7 @@ def export_slddrw_files(sw_app, assembly_path, scan_result, output_folder, input
         master_drawing=master_path,
         sheet_format_path=(input_folder / SHEET_FORMAT_NAME) if SHEET_FORMAT_NAME else None,
         text_replacements=SHEET_TEXT_REPLACEMENTS,
+        view_area_mm=VIEW_AREA_MM,
     )
     folder = output_folder / "flat_drawings"
     folder.mkdir(parents=True, exist_ok=True)
