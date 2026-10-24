@@ -1,6 +1,7 @@
 """Creates one SLDDRW per sheet-metal part containing its flat pattern view."""
 import gc
 import re
+import shutil
 import time
 from pathlib import Path
 
@@ -8,6 +9,7 @@ import pythoncom
 from win32com.client import VARIANT
 
 SW_DOC_PART = 1
+SW_DOC_DRAWING = 3
 SW_OPEN_SILENT = 1
 SW_SAVE_SILENT = 1
 SW_SAVE_AS_CURRENT_VERSION = 0
@@ -26,7 +28,8 @@ class SwDrawingExporter:
     """For every part: open part -> new drawing -> flat pattern view -> save .SLDDRW."""
 
     def __init__(self, sw_app, assembly_path=None, reconnect=None, template_path=None,
-                 sheet_format_path=None, text_replacements=None):
+                 sheet_format_path=None, text_replacements=None, master_drawing=None):
+        self.master_drawing = Path(master_drawing) if master_drawing else None
         self.sheet_format_path = Path(sheet_format_path) if sheet_format_path else None
         self.text_replacements = dict(text_replacements or {})
         self.sw_app = sw_app
@@ -253,6 +256,32 @@ class SwDrawingExporter:
                 except Exception as exc:
                     steps.append(f"EditSheet failed: {exc}")
 
+    def _open_drawing(self, path):
+        errors, warnings = self._byref_i4(), self._byref_i4()
+        return self.sw_app.OpenDoc6(str(path), SW_DOC_DRAWING, SW_OPEN_SILENT, "", errors, warnings)
+
+    def _remove_existing_views(self, drawing, steps):
+        """Deletes the views that exist in master.slddrw so only the new flat pattern remains."""
+        names = []
+        view = self._get(self._get(drawing, "GetFirstView"), "GetNextView")   # first view = sheet format
+        while view is not None:
+            names.append(str(self._get(view, "GetName2")))
+            view = self._get(view, "GetNextView")
+        removed = 0
+        for name in names:
+            try:
+                nothing = VARIANT(pythoncom.VT_DISPATCH, None)
+                if drawing.Extension.SelectByID2(name, "DRAWINGVIEW", 0, 0, 0, False, 0, nothing, 0):
+                    drawing.Extension.DeleteSelection2(0)
+                    removed += 1
+            except Exception:
+                pass
+        try:
+            drawing.ClearSelection2(True)
+        except Exception:
+            pass
+        steps.append(f"old views removed: {removed}")
+
     # ---------------- public ----------------
     def export_part(self, item, slddrw_path):
         """Returns (ok, message, steps)."""
@@ -263,6 +292,11 @@ class SwDrawingExporter:
             if self._reconnect():
                 ok, message, steps2 = self._export_once(item, slddrw_path)
                 steps += steps2
+        if not ok:
+            try:
+                Path(slddrw_path).unlink(missing_ok=True)   # do not leave a master copy without flat view
+            except Exception:
+                pass
         return ok, message, steps
 
     def _export_once(self, item, slddrw_path):
@@ -283,10 +317,8 @@ class SwDrawingExporter:
         previous_config = None
 
         try:
-            template = self._find_template()
-            if not template:
-                return False, "no drawing template found - set DRAWING_TEMPLATE_PATH in main.py", steps
-            steps.append(f"template: {Path(template).name}")
+            if not self.master_drawing or not self.master_drawing.is_file():
+                return False, f"master drawing not found: {self.master_drawing}", steps
 
             model, opened_by_us, status = self._open_part(part_path)
             steps.append(f"part {status}")
@@ -318,10 +350,13 @@ class SwDrawingExporter:
                 flat.SetSuppression2(SW_UNSUPPRESS, SW_THIS_CONFIGURATION, None)
                 steps.append("flat pattern unsuppressed")
 
-            drawing = self.sw_app.NewDocument(template, SW_PAPER_A3, 0.0, 0.0)
+            shutil.copyfile(self.master_drawing, slddrw_path)
+            steps.append(f"master copied: {self.master_drawing.name}")
+            drawing = self._open_drawing(slddrw_path)
             if drawing is None:
-                return False, "NewDocument returned None", steps
-            self._apply_sheet_format(drawing, item, steps)
+                return False, "could not open the copied master drawing", steps
+            self._apply_sheet_format(drawing, item, steps)      # Edit Sheet Format -> back to sheet
+            self._remove_existing_views(drawing, steps)
             width, height = self._sheet_size(drawing)
 
             active_cfg = configuration or self._get(

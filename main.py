@@ -12,7 +12,7 @@ except ImportError:
     raise
 
 from solidworks.assembly import SolidWorksAssembly, find_assemblies
-from solidworks.sw_drawing import SwDrawingExporter
+from solidworks.sw_drawings import SwDrawingExporter
 from solidworks.dwg_exporter import DwgExporter
 from solidworks.thickness_dwg import ThicknessDwgBuilder
 from solidworks.sheet_metal import SheetMetalDetector
@@ -31,8 +31,8 @@ USE_SCAN_CACHE = True
 
 # ---- flat pattern SLDDRW ----
 EXPORT_SLDDRW = True
-DRAWING_TEMPLATE_PATH = None   # e.g. input / "A3.drwdot"; None = SolidWorks default drawing template
-SHEET_FORMAT_PATH = None       # e.g. input_folder / "format.slddrt"; None = format already inside the .drwdot
+MASTER_DRAWING_NAME = "master.slddrw"   # in the input folder: your sheet format + title block
+SHEET_FORMAT_NAME = None                # e.g. "format.slddrt" (input folder); None = use the format inside master.slddrw
 # Placeholder text in the sheet format -> value. Fields: PartName, Quantity, Thickness, Material, Configuration
 SHEET_TEXT_REPLACEMENTS = {
     "{PART_NAME}": "PartName",
@@ -167,14 +167,20 @@ def load_scan_cache(output_folder, assembly_path):
         return None
 
 
-def export_slddrw_files(sw_app, assembly_path, scan_result, output_folder):
-    """Creates one SLDDRW with the flat pattern view for every sheet metal part."""
+def export_slddrw_files(sw_app, assembly_path, scan_result, output_folder, input_folder):
+    """Copies master.slddrw for every part, runs Edit Sheet Format, adds the flat pattern view and saves."""
+    master_path = input_folder / MASTER_DRAWING_NAME
+    if not master_path.is_file():
+        print(f"\nMASTER DRAWING NOT FOUND: {master_path}")
+        print("Put your master.slddrw (sheet format + title block) in the input folder and run again.")
+        return None
+
     exporter = SwDrawingExporter(
         sw_app,
         assembly_path=assembly_path,
         reconnect=connect_to_solidworks,
-        template_path=DRAWING_TEMPLATE_PATH,
-        sheet_format_path=SHEET_FORMAT_PATH,
+        master_drawing=master_path,
+        sheet_format_path=(input_folder / SHEET_FORMAT_NAME) if SHEET_FORMAT_NAME else None,
         text_replacements=SHEET_TEXT_REPLACEMENTS,
     )
     folder = output_folder / "flat_drawings"
@@ -267,7 +273,7 @@ def main():
     slddrw_result = None
     if EXPORT_SLDDRW:
         try:
-            slddrw_result = export_slddrw_files(sw_app, assembly_path, scan_result, output_folder)
+            slddrw_result = export_slddrw_files(sw_app, assembly_path, scan_result, output_folder, input_folder)
         except Exception as exc:
             print(f"\nSLDDRW EXPORT FAILED (continuing): {type(exc).__name__}: {exc}")
             traceback.print_exc()
