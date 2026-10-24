@@ -12,7 +12,7 @@ except ImportError:
     raise
 
 from solidworks.assembly import SolidWorksAssembly, find_assemblies
-from solidworks.sw_drawings import SwDrawingExporter
+from solidworks.sw_drawing import SwDrawingExporter
 from solidworks.dwg_exporter import DwgExporter
 from solidworks.thickness_dwg import ThicknessDwgBuilder
 from solidworks.sheet_metal import SheetMetalDetector
@@ -30,8 +30,6 @@ SLDDRW_ONLY = True
 USE_SCAN_CACHE = True
 
 # ---- flat pattern SLDDRW ----
-
-VIEW_AREA_MM = (20, 60, 400, 280)
 EXPORT_SLDDRW = True
 MASTER_DRAWING_NAME = "master.slddrw"   # in the input folder: your sheet format + title block
 SHEET_FORMAT_NAME = None                # e.g. "format.slddrt" (input folder); None = use the format inside master.slddrw
@@ -42,6 +40,10 @@ SHEET_TEXT_REPLACEMENTS = {
     "{THICKNESS}": "Thickness",
     "{MATERIAL}": "Material",
 }
+# Flat pattern placement on the sheet
+VIEW_WIDTH_RATIO = 0.5        # flat pattern width = half of the sheet width
+VIEW_LEFT_MM = 25             # distance of the view's left edge from the sheet's left edge
+VIEW_CENTER_Y_RATIO = 0.42    # vertical center as a fraction of sheet height (0.5 = middle, smaller = lower)
 SLDDRW_LIMIT = None            # e.g. 1 = test on the first part only, None = all parts
 
 
@@ -184,7 +186,9 @@ def export_slddrw_files(sw_app, assembly_path, scan_result, output_folder, input
         master_drawing=master_path,
         sheet_format_path=(input_folder / SHEET_FORMAT_NAME) if SHEET_FORMAT_NAME else None,
         text_replacements=SHEET_TEXT_REPLACEMENTS,
-        view_area_mm=VIEW_AREA_MM,
+        view_width_ratio=VIEW_WIDTH_RATIO,
+        view_left_mm=VIEW_LEFT_MM,
+        view_center_y_ratio=VIEW_CENTER_Y_RATIO,
     )
     folder = output_folder / "flat_drawings"
     folder.mkdir(parents=True, exist_ok=True)

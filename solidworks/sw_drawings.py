@@ -24,19 +24,25 @@ STANDARD_SCALES = (10, 5, 4, 2, 1, 0.5, 0.4, 0.25, 0.2, 0.1, 0.05, 0.04, 0.02, 0
 INVALID_FILENAME = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 
 
+
+
 class SwDrawingExporter:
     """For every part: open part -> new drawing -> flat pattern view -> save .SLDDRW."""
 
     def __init__(self, sw_app, assembly_path=None, reconnect=None, template_path=None,
-                 sheet_format_path=None, text_replacements=None, master_drawing=None):
-        self.master_drawing = Path(master_drawing) if master_drawing else None
-        self.sheet_format_path = Path(sheet_format_path) if sheet_format_path else None
-        self.text_replacements = dict(text_replacements or {})
+                 sheet_format_path=None, text_replacements=None, master_drawing=None,
+                 view_width_ratio=0.5, view_left_mm=25, view_center_y_ratio=0.42):
         self.sw_app = sw_app
         self.assembly_path = Path(assembly_path).resolve() if assembly_path else None
         self.reconnect = reconnect
         self.template_path = Path(template_path) if template_path else None
-
+        self.master_drawing = Path(master_drawing) if master_drawing else None
+        self.sheet_format_path = Path(sheet_format_path) if sheet_format_path else None
+        self.text_replacements = dict(text_replacements or {})
+        self.view_width_ratio = view_width_ratio
+        self.view_left_mm = view_left_mm
+        self.view_center_y_ratio = view_center_y_ratio
+        
     # ---------------- helpers ----------------
     @staticmethod
     def _safe_name(name):
