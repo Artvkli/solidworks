@@ -35,10 +35,14 @@ class SwDrawingPdfExporter(DwgExporter):
       4) saves the drawing and exports it as PDF.
     """
 
-    def __init__(self, sw_app, assembly_path=None, reconnect=None, master_drawing=None, **legacy_options):
+    def __init__(self, sw_app, assembly_path=None, reconnect=None,
+                    master_drawing=None, bend_table_template=None, **legacy_options):
         super().__init__(sw_app, assembly_path=assembly_path, reconnect=reconnect)
         self.master_drawing = Path(master_drawing).resolve() if master_drawing else None
+        self.bend_table_template = Path(bend_table_template).resolve() if bend_table_template else None
         self._typelib_cache = None
+    
+    
 
     # =====================================================
     # TYPED API (early binding)
@@ -339,7 +343,7 @@ class SwDrawingPdfExporter(DwgExporter):
         for cfg in dict.fromkeys((config_name, "")):
             try:
                 view = drawing_doc.CreateFlatPatternViewFromModelView3(
-                    model_name, cfg, x, y, 0.0, False, True
+                    model_name, cfg, x, y, 0.0, False, False
                 )
                 if view is not None:
                     steps.append(f"flat-pattern view created (configuration={cfg!r})")
@@ -456,6 +460,9 @@ class SwDrawingPdfExporter(DwgExporter):
             if flat_slot is not None:
                 self._fit_view_to_slot(flat_view, flat_slot, steps)
             self._call(drawing, "ForceRebuild3", False)
+
+            self._create_bend_table(drawing, flat_view, steps)   # <-- new
+            self._call(drawing, "ForceRebuild3", False)
             self._call(drawing, "ViewZoomtofit2")
 
             # ---- 6) save + PDF ----
@@ -489,3 +496,70 @@ class SwDrawingPdfExporter(DwgExporter):
     def _safe_name(name):
         cleaned = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", str(name)).strip().rstrip(".")
         return re.sub(r"\s+", " ", cleaned) or "part"
+
+    # =====================================================
+    # BEND TABLE + BEND TAGS
+    # =====================================================
+
+    def _find_bend_table_template(self):
+        """Configured template first, then the standard one from the SolidWorks install."""
+        if self.bend_table_template and self.bend_table_template.is_file():
+            return str(self.bend_table_template)
+        try:
+            exe = self._get(self.sw_app, "GetExecutablePath")
+            if exe:
+                install = Path(str(exe))
+                if install.suffix:
+                    install = install.parent
+                for candidate in install.glob("lang/*/bendtable-standard.sldbndtbt"):
+                    if candidate.is_file():
+                        return str(candidate)
+        except Exception:
+            pass
+        return None
+
+    def _create_bend_table(self, drawing, flat_view, steps):
+        """Insert the bend table (UP/DOWN, angle, radius...) and the bend tags on the flat pattern."""
+        template = self._find_bend_table_template()
+        if not template:
+            steps.append("bend table skipped: bendtable-standard.sldbndtbt not found "
+                         "(pass bend_table_template=...)")
+            return False
+
+        typed_view = self._cast(flat_view, "IView")
+
+        # make sure the bend notes/tags are shown on the view
+        try:
+            typed_view.ShowSheetMetalBendNotes = True
+        except Exception as exc:
+            steps.append(f"bend notes: could not enable ({type(exc).__name__})")
+
+        # one row per bend: do not merge tags
+        try:
+            self._call(typed_view, "MergeBendTags", False)
+        except Exception:
+            pass
+        self._call(drawing, "ForceRebuild3", False)
+
+        # table goes just under the flat view
+        outline = self._outline(flat_view)
+        if outline:
+            x = max(0.01, outline[0])
+            y = max(0.01, outline[1] - 0.025)
+        else:
+            x, y = 0.15, 0.08
+
+        try:
+            table = typed_view.InsertBendTable(False, x, y, 1, "A", template)
+        except Exception as exc:
+            steps.append(f"bend table failed ({type(exc).__name__}: {str(exc)[:100]})")
+            return False
+        if table is None:
+            steps.append("bend table failed: InsertBendTable returned None")
+            return False
+
+        self._call(drawing, "ForceRebuild3", False)
+        rows = self._get(table, "RowCount")
+        bends = len(list(self._call(typed_view, "GetBendLines") or []))
+        steps.append(f"bend table created: rows={rows}, bend lines={bends}, template={Path(template).name}")
+        return True
