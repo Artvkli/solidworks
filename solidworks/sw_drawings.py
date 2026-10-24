@@ -22,7 +22,8 @@ FALLBACK_SHEET = (0.420, 0.297)       # A3 landscape, meters
 FIT_RATIO = 0.70                      # flat view uses at most 70% of the sheet
 STANDARD_SCALES = (10, 5, 4, 2, 1, 0.5, 0.4, 0.25, 0.2, 0.1, 0.05, 0.04, 0.02, 0.01, 0.005)
 INVALID_FILENAME = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
-
+BEND_TABLE_START_VALUE = "1"      # first tag: a positive integer = number tags, "A" = letter tags
+BEND_TABLE_ANCHOR_TOP_LEFT = 1    # swBOMConfigurationAnchor_TopLeft
 
 
 
@@ -238,12 +239,13 @@ class SwDrawingExporter:
         y = outline[3]
 
         templates = [str(self.bend_table_template)] if self.bend_table_template else []
-        templates += [""] + self._default_bend_templates()
+        templates += self._default_bend_templates() + [""]
 
         table = None
         for tpl in templates:
             try:
-                table = view.InsertBendTable(False, x, y, 1, tpl)      # 1 = anchor at top-left
+                table = view.InsertBendTable(False, x, y, BEND_TABLE_ANCHOR_TOP_LEFT,
+                                            BEND_TABLE_START_VALUE, tpl)
                 if table is not None:
                     steps.append(f"bend table inserted (template: {Path(tpl).name if tpl else 'default'})")
                     break
