@@ -40,11 +40,20 @@ SHEET_TEXT_REPLACEMENTS = {
     "{THICKNESS}": "Thickness",
     "{MATERIAL}": "Material",
 }
-# Flat pattern placement on the sheet
-VIEW_WIDTH_RATIO = 0.5        # flat pattern width = half of the sheet width
-VIEW_LEFT_MM = 25             # distance of the view's left edge from the sheet's left edge
-VIEW_CENTER_Y_RATIO = 0.42    # vertical center as a fraction of sheet height (0.5 = middle, smaller = lower)
-# Overall dimensions of the flat pattern (length + width)
+# Sheet layout (like the reference drawing: Top view, Front view, Flat pattern, QTY note, bend table)
+ADD_FOLDED_VIEWS = True               # Top + Front view above the flat pattern
+LAYOUT = {
+    "width_ratio": 0.68,              # widest view = 68% of the sheet width
+    "center_x_ratio": 0.51,           # horizontal center of the views
+    "top_ratio": 0.90,                # top edge of the first view (fraction of sheet height)
+    "bottom_ratio": 0.355,            # bottom edge of the flat pattern (just above the bend table)
+    "gap_top_front_mm": 12,
+    "gap_front_flat_mm": 22,
+}
+ADD_QTY_NOTE = True
+QTY_NOTE_X_MM = 35                    # position of the "QTY=n" note (from the sheet's left / bottom edge)
+QTY_NOTE_Y_MM = 86
+# Overall dimensions of every view (length + width)
 ADD_DIMENSIONS = True
 DIMENSION_OFFSET_MM = 15              # distance of the dimension lines from the view
 # Bend table: every bend gets a letter tag (A, B, C...) on the flat pattern and the same tag in the table
@@ -197,9 +206,11 @@ def export_slddrw_files(sw_app, assembly_path, scan_result, output_folder, input
         master_drawing=master_path,
         sheet_format_path=(input_folder / SHEET_FORMAT_NAME) if SHEET_FORMAT_NAME else None,
         text_replacements=SHEET_TEXT_REPLACEMENTS,
-        view_width_ratio=VIEW_WIDTH_RATIO,
-        view_left_mm=VIEW_LEFT_MM,
-        view_center_y_ratio=VIEW_CENTER_Y_RATIO,
+        layout=LAYOUT,
+        add_folded_views=ADD_FOLDED_VIEWS,
+        add_qty_note=ADD_QTY_NOTE,
+        qty_note_x_mm=QTY_NOTE_X_MM,
+        qty_note_y_mm=QTY_NOTE_Y_MM,
         insert_bend_table=INSERT_BEND_TABLE,
         bend_table_template=(input_folder / BEND_TABLE_TEMPLATE_NAME) if BEND_TABLE_TEMPLATE_NAME else None,
         bend_table_right_margin_mm=BEND_TABLE_RIGHT_MARGIN_MM,

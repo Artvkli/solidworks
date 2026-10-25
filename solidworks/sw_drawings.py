@@ -1,4 +1,5 @@
-"""One SLDDRW per sheet-metal part: master.slddrw + flat pattern view + tagged bend table."""
+"""One SLDDRW per sheet-metal part:
+master.slddrw + Top / Front / Flat pattern views + overall dimensions + QTY note + tagged bend table."""
 import gc
 import re
 import shutil
@@ -16,23 +17,34 @@ SW_SAVE_AS_CURRENT_VERSION = 0
 SW_UNSUPPRESS = 0
 SW_SUPPRESS = 1
 SW_THIS_CONFIGURATION = 1
-BEND_TABLE_ANCHOR_BOTTOM_RIGHT = 4     # swBOMConfigurationAnchor_BottomRight
-FALLBACK_SHEET = (0.420, 0.297)        # A3 landscape, meters
-STANDARD_SCALES = (10, 5, 4, 2, 1, 0.5, 0.4, 0.25, 0.2, 0.1, 0.05, 0.04, 0.02, 0.01, 0.005)
+BEND_TABLE_ANCHOR_TOP_LEFT = 1         # swBOMConfigurationAnchor_TopLeft
+FALLBACK_SHEET = (0.210, 0.297)        # A4 portrait, meters (used only if the sheet size cannot be read)
+SCALES = (10, 5, 4, 2, 1) + tuple(1.0 / n for n in (
+    2, 3, 4, 5, 8, 10, 15, 20, 25, 30, 40, 50, 75, 100, 150, 200, 250, 300, 400, 500))
 INVALID_FILENAME = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+
+DEFAULT_LAYOUT = {
+    "width_ratio": 0.68,        # widest view = 68% of the sheet width
+    "center_x_ratio": 0.51,     # horizontal center of the views (fraction of sheet width)
+    "top_ratio": 0.90,          # top edge of the first view (fraction of sheet height)
+    "bottom_ratio": 0.355,      # bottom edge of the flat pattern (just above the bend table)
+    "gap_top_front_mm": 12,     # gap between Top and Front view
+    "gap_front_flat_mm": 22,    # gap between Front view and Flat pattern
+}
 
 
 class SwDrawingExporter:
-    """Per part: copy master.slddrw -> Edit Sheet Format -> remove old views ->
-    flat pattern view -> bend table with letter tags -> save .SLDDRW."""
+    """Per part: copy master.slddrw -> Edit Sheet Format -> remove old views -> Top / Front / Flat pattern
+    -> dimensions -> QTY note -> bend table with letter tags -> save .SLDDRW."""
 
     def __init__(self, sw_app, assembly_path=None, reconnect=None, template_path=None,
                  sheet_format_path=None, text_replacements=None, master_drawing=None,
-                 view_width_ratio=0.5, view_left_mm=25, view_center_y_ratio=0.42,
+                 layout=None, add_folded_views=True,
                  insert_bend_table=True, bend_table_template=None,
                  bend_table_right_margin_mm=10, bend_table_bottom_mm=66,
                  bend_table_remove_words=(), bend_table_start_value="A",
-                 add_dimensions=True, dimension_offset_mm=15):
+                 add_dimensions=True, dimension_offset_mm=15,
+                 add_qty_note=True, qty_note_x_mm=35, qty_note_y_mm=86):
         self.sw_app = sw_app
         self.assembly_path = Path(assembly_path).resolve() if assembly_path else None
         self.reconnect = reconnect
@@ -40,9 +52,8 @@ class SwDrawingExporter:
         self.master_drawing = Path(master_drawing) if master_drawing else None
         self.sheet_format_path = Path(sheet_format_path) if sheet_format_path else None
         self.text_replacements = dict(text_replacements or {})
-        self.view_width_ratio = view_width_ratio
-        self.view_left_mm = view_left_mm
-        self.view_center_y_ratio = view_center_y_ratio
+        self.layout = dict(DEFAULT_LAYOUT, **(layout or {}))
+        self.add_folded_views = add_folded_views
         self.insert_bend_table = insert_bend_table
         self.bend_table_template = Path(bend_table_template) if bend_table_template else None
         self.bend_table_right_margin_mm = bend_table_right_margin_mm
@@ -51,6 +62,9 @@ class SwDrawingExporter:
         self.bend_table_start_value = str(bend_table_start_value)
         self.add_dimensions = add_dimensions
         self.dimension_offset_mm = dimension_offset_mm
+        self.add_qty_note = add_qty_note
+        self.qty_note_x_mm = qty_note_x_mm
+        self.qty_note_y_mm = qty_note_y_mm
 
     # ---------------- helpers ----------------
     @staticmethod
@@ -148,8 +162,16 @@ class SwDrawingExporter:
         return None
 
     def _sheet_size(self, drawing):
+        sheet = self._get(drawing, "GetCurrentSheet")
+        try:                                              # ISheet.GetSize(ref w, ref h)
+            w = VARIANT(pythoncom.VT_BYREF | pythoncom.VT_R8, 0.0)
+            h = VARIANT(pythoncom.VT_BYREF | pythoncom.VT_R8, 0.0)
+            sheet.GetSize(w, h)
+            if w.value and h.value and w.value > 0 and h.value > 0:
+                return float(w.value), float(h.value)
+        except Exception:
+            pass
         try:
-            sheet = self._get(drawing, "GetCurrentSheet")
             props = self._get(sheet, "GetProperties2")
             if props and len(props) >= 7 and props[5] > 0 and props[6] > 0:
                 return float(props[5]), float(props[6])
@@ -269,15 +291,15 @@ class SwDrawingExporter:
             pass
         steps.append(f"old views removed: {views_removed}/{len(names)}")
 
-    # ---------------- flat pattern view ----------------
-    def _create_flat_view(self, drawing, part_path, config, x, y, steps):
+    # ---------------- views ----------------
+    def _create_flat_view(self, drawing, part_path, config, x, y, steps, rounds=3):
         attempts = (
             ("CreateFlatPatternViewFromModelView3",
              lambda cfg: drawing.CreateFlatPatternViewFromModelView3(part_path, cfg, x, y, 0.0, False, False)),
             ("CreateDrawViewFromModelView3(*Flat pattern)",
              lambda cfg: drawing.CreateDrawViewFromModelView3(part_path, "*Flat pattern", x, y, 0.0)),
         )
-        for round_no in range(1, 4):
+        for round_no in range(1, rounds + 1):
             for name, call in attempts:
                 for cfg in dict.fromkeys((config or "", "")):
                     try:
@@ -297,43 +319,62 @@ class SwDrawingExporter:
                 pass
         return None, None
 
-    def _fit_view(self, drawing, view):
-        """Scale so the view is ~half the sheet width, then place it at the left, slightly low."""
-        width, height = self._sheet_size(drawing)
+    def _create_model_view(self, drawing, part_path, view_name, x, y, steps):
         try:
-            outline = self._get(view, "GetOutline")
-            vw, vh = outline[2] - outline[0], outline[3] - outline[1]
-            current = float(self._get(view, "ScaleDecimal"))
-            if vw <= 0 or vh <= 0 or current <= 0:
-                return "fit skipped (empty outline)"
-
-            wanted = current * min(width * self.view_width_ratio / vw, height * 0.6 / vh)
-            chosen = next((s for s in STANDARD_SCALES if s <= wanted * 1.001), STANDARD_SCALES[-1])
-            view.ScaleDecimal = chosen
-
-            outline = self._get(view, "GetOutline")
-            new_w = outline[2] - outline[0]
-            target_x = self.view_left_mm / 1000.0 + new_w / 2.0
-            target_y = height * self.view_center_y_ratio
-
-            for _ in range(2):                      # second pass removes small drift
-                outline = self._get(view, "GetOutline")
-                cx = (outline[0] + outline[2]) / 2.0
-                cy = (outline[1] + outline[3]) / 2.0
-                pos = self._get(view, "Position")
-                view.Position = VARIANT(pythoncom.VT_ARRAY | pythoncom.VT_R8,
-                                        (pos[0] + target_x - cx, pos[1] + target_y - cy))
-
-            outline = self._get(view, "GetOutline")
-            scale_txt = f"1:{1 / chosen:g}" if chosen < 1 else f"{chosen:g}:1"
-            return (f"scale {scale_txt}, width {(outline[2] - outline[0]) / width * 100:.0f}% of sheet, "
-                    f"left edge {outline[0] * 1000:.1f} mm, center y {((outline[1] + outline[3]) / 2) * 1000:.1f} mm")
+            view = drawing.CreateDrawViewFromModelView3(part_path, view_name, x, y, 0.0)
+            if view is not None:
+                return view
+            steps.append(f"{view_name} view returned None")
         except Exception as exc:
-            return f"fit skipped ({exc})"
+            steps.append(f"{view_name} view failed: {exc}")
+        return None
+
+    def _move_view(self, view, target_cx, target_cy):
+        for _ in range(2):                      # second pass removes small drift
+            outline = self._get(view, "GetOutline")
+            cx = (outline[0] + outline[2]) / 2.0
+            cy = (outline[1] + outline[3]) / 2.0
+            pos = self._get(view, "Position")
+            view.Position = VARIANT(pythoncom.VT_ARRAY | pythoncom.VT_R8,
+                                    (pos[0] + target_cx - cx, pos[1] + target_cy - cy))
+
+    def _layout_views(self, drawing, views, steps):
+        """views = [(name, view), ...] from top to bottom. One common scale, stacked like the reference drawing."""
+        width, height = self._sheet_size(drawing)
+        lay = self.layout
+        steps.append(f"sheet size: {width * 1000:.0f} x {height * 1000:.0f} mm")
+        try:
+            sizes = []
+            for _, v in views:
+                o = self._get(v, "GetOutline")
+                sc = float(self._get(v, "ScaleDecimal"))
+                sizes.append(((o[2] - o[0]) / sc, (o[3] - o[1]) / sc))      # size at scale 1:1
+
+            gaps = [lay["gap_top_front_mm"] / 1000.0, lay["gap_front_flat_mm"] / 1000.0]
+            gaps = gaps[len(gaps) - (len(views) - 1):] if len(views) > 1 else []
+            area_h = (lay["top_ratio"] - lay["bottom_ratio"]) * height - sum(gaps)
+            max_w = lay["width_ratio"] * width
+
+            limit = min(max_w / max(w for w, _ in sizes), area_h / sum(h for _, h in sizes))
+            chosen = next((s for s in SCALES if s <= limit * 1.001), SCALES[-1])
+            for _, v in views:
+                v.ScaleDecimal = chosen
+
+            cursor = height * lay["top_ratio"]
+            for i, (name, v) in enumerate(views):
+                o = self._get(v, "GetOutline")
+                h = o[3] - o[1]
+                self._move_view(v, width * lay["center_x_ratio"], cursor - h / 2.0)
+                cursor -= h + (gaps[i] if i < len(gaps) else 0)
+
+            scale_txt = f"1:{1 / chosen:.0f}" if chosen < 1 else f"{chosen:g}:1"
+            steps.append(f"layout: {[n for n, _ in views]} at scale {scale_txt}")
+        except Exception as exc:
+            steps.append(f"layout failed: {exc}")
 
     # ---------------- overall dimensions ----------------
     def _view_vertices(self, view):
-        """Visible vertices of the flat pattern view (type is detected, so no enum value is assumed)."""
+        """Visible vertices of a view (the entity type is detected, so no enum value is assumed)."""
         nothing = VARIANT(pythoncom.VT_DISPATCH, None)
         for entity_type in (2, 1, 3, 4):
             try:
@@ -368,7 +409,7 @@ class SwDrawingExporter:
         return points
 
     def _select_vertex(self, view, vertex, append, sel):
-        """Vertex.Select4 first; IView.SelectEntity as fallback (the vertex dispatch may not expose Select4)."""
+        """Vertex.Select4 first; IView.SelectEntity as fallback."""
         try:
             if vertex.Select4(append, sel):
                 return True, "Select4"
@@ -381,52 +422,60 @@ class SwDrawingExporter:
             pass
         return False, None
 
-    def _add_overall_dimensions(self, drawing, view, steps):
-        """Length (horizontal) and width (vertical) of the flat pattern between its extreme corners."""
+    def _add_overall_dimensions(self, drawing, view, steps, label, length=True, width=True, width_side="right"):
+        """Length (horizontal, above the view) and/or width (vertical, left or right of the view)."""
         stage = "vertices"
         try:
-            vertices = self._view_vertices(view)
-            points = self._vertex_points(view, vertices)
-            steps.append(f"dimension vertices: {len(points)}")
+            points = self._vertex_points(view, self._view_vertices(view))
             if len(points) < 2:
-                steps.append("dimensions skipped: no vertices found in the flat pattern view")
+                steps.append(f"dimensions {label}: no vertices found")
                 return
             left, right = min(points, key=lambda t: t[0]), max(points, key=lambda t: t[0])
             bottom, top = min(points, key=lambda t: t[1]), max(points, key=lambda t: t[1])
 
-            stage = "outline"
             outline = self._get(view, "GetOutline")
             off = self.dimension_offset_mm / 1000.0
-
-            stage = "select data"
             try:
                 sel = drawing.SelectionManager.CreateSelectData()
                 sel.View = view
-            except Exception as exc:
+            except Exception:
                 sel = VARIANT(pythoncom.VT_DISPATCH, None)
-                steps.append(f"select data not created ({exc}) - selecting without it")
+
+            jobs = []
+            if length:
+                jobs.append(("length", left, right, "AddHorizontalDimension2",
+                             (outline[0] + outline[2]) / 2.0, outline[3] + off))
+            if width:
+                px = outline[2] + off if width_side == "right" else outline[0] - off
+                jobs.append(("width", bottom, top, "AddVerticalDimension2",
+                             px, (outline[1] + outline[3]) / 2.0))
 
             made = []
-            for label, a_pt, b_pt, func, px, py in (
-                ("length", left, right, "AddHorizontalDimension2",
-                 (outline[0] + outline[2]) / 2.0, outline[3] + off),
-                ("width", bottom, top, "AddVerticalDimension2",
-                 outline[2] + off, (outline[1] + outline[3]) / 2.0),
-            ):
-                stage = f"{label}: select"
+            for name, a_pt, b_pt, func, px, py in jobs:
+                stage = f"{name}: select"
                 drawing.ClearSelection2(True)
                 ok1, how1 = self._select_vertex(view, a_pt[2], False, sel)
-                ok2, how2 = self._select_vertex(view, b_pt[2], True, sel)
+                ok2, _ = self._select_vertex(view, b_pt[2], True, sel)
                 if not (ok1 and ok2):
-                    made.append(f"{label}: could not select the corners")
+                    made.append(f"{name}: could not select corners")
                     continue
-                stage = f"{label}: {func}"
+                stage = f"{name}: {func}"
                 dim = getattr(drawing, func)(px, py, 0.0)
-                made.append(f"{label}: {'ok' if dim is not None else 'failed'} ({how1})")
+                made.append(f"{name}: {'ok' if dim is not None else 'failed'}")
             drawing.ClearSelection2(True)
-            steps.append("dimensions -> " + ", ".join(made))
+            steps.append(f"dimensions {label} -> " + ", ".join(made))
         except Exception as exc:
-            steps.append(f"dimensions failed at '{stage}': {exc}")
+            steps.append(f"dimensions {label} failed at '{stage}': {exc}")
+
+    # ---------------- QTY note ----------------
+    def _add_qty_note(self, drawing, item, steps):
+        try:
+            note = drawing.InsertNote(f"QTY={item.get('quantity', 1)}")
+            annotation = self._get(note, "GetAnnotation")
+            annotation.SetPosition2(self.qty_note_x_mm / 1000.0, self.qty_note_y_mm / 1000.0, 0.0)
+            steps.append(f"QTY note added: QTY={item.get('quantity', 1)}")
+        except Exception as exc:
+            steps.append(f"QTY note failed: {exc}")
 
     # ---------------- bend table ----------------
     def _default_bend_templates(self):
@@ -446,61 +495,43 @@ class SwDrawingExporter:
         except Exception:
             return ""
 
-    def _insert_bend_table(self, drawing, view, steps):
-        """Native bend table: every bend gets a letter tag on the flat pattern (A, B, C...)
-        and the same tag is listed in the table (Tag / Direction / Angle / Inner Radius)."""
-        steps.append(f"is flat pattern view: {self._get(view, 'IsFlatPatternView')}")
-
-        width, height = self._sheet_size(drawing)
-        x, y = width / 2.0, height / 2.0       # inserted inside the sheet first, moved to the corner afterwards
-
+    def _insert_table_once(self, view, x, y, steps):
         templates = [str(self.bend_table_template)] if self.bend_table_template else []
         templates += self._default_bend_templates() + [""]
-
-        table = None
         for tpl in templates:
-            label = Path(tpl).name if tpl else "default"
+            name = Path(tpl).name if tpl else "default"
             try:
-                table = view.InsertBendTable(False, x, y, BEND_TABLE_ANCHOR_BOTTOM_RIGHT,
+                table = view.InsertBendTable(False, x, y, BEND_TABLE_ANCHOR_TOP_LEFT,
                                              self.bend_table_start_value, tpl)
                 if table is not None:
-                    steps.append(f"bend table inserted (template: {label}, start tag: {self.bend_table_start_value})")
-                    break
-                steps.append(f"bend table returned None ({label})")
+                    steps.append(f"bend table inserted (template: {name}, start tag: {self.bend_table_start_value})")
+                    return table
+                steps.append(f"bend table returned None ({name})")
             except Exception as exc:
-                steps.append(f"bend table failed ({label}): {exc}")
-        if table is None:
-            steps.append("bend table NOT created")
-            return
+                steps.append(f"bend table failed ({name}): {exc}")
+        return None
 
-        steps.append(f"bend table object: {type(table).__name__}")
+    def _table_grid(self, table, steps):
         try:
-            # with a bend table present the bend notes of the flat pattern show the TAG (A, B, C...)
-            view.ShowSheetMetalBendNotes = True
-            steps.append(f"bend notes (tags) on view: {self._get(view, 'ShowSheetMetalBendNotes')}")
-        except Exception as exc:
-            steps.append(f"could not show bend tags: {exc}")
-
-        grid = table
-        try:
-            grid.ColumnCount
+            table.ColumnCount
+            return table
         except Exception:
             for name in ("GetTableAnnotation", "TableAnnotation"):
                 inner = self._get(table, name)
                 if inner is not None:
-                    grid = inner
                     steps.append(f"table accessed via {name}")
-                    break
+                    return inner
+        return table
 
+    def _clean_columns(self, grid, steps):
         try:
             cols = int(self._get(grid, "ColumnCount"))
             headers = [self._cell(grid, 0, c) for c in range(cols)]
             if len(set(headers)) == 1 and cols > 1:           # row 0 is a merged title row
                 headers = [self._cell(grid, 1, c) for c in range(cols)]
             steps.append(f"bend table columns: {headers}")
-
             removed = []
-            for c in range(cols - 1, -1, -1):                 # from the last so indexes stay valid
+            for c in range(cols - 1, -1, -1):
                 if any(w in headers[c].lower() for w in self.bend_table_remove_words):
                     try:
                         grid.DeleteColumn(c)
@@ -512,34 +543,79 @@ class SwDrawingExporter:
         except Exception as exc:
             steps.append(f"bend table column cleanup failed: {exc}")
 
-        self._place_bend_table(drawing, grid, steps)
-
-    def _place_bend_table(self, drawing, grid, steps):
-        """Moves the table to the bottom-right corner of the sheet, right above the title block."""
+    def _table_size(self, grid, steps):
+        cols = int(self._get(grid, "ColumnCount") or 0)
+        rows = int(self._get(grid, "RowCount") or 0)
         try:
-            width, height = self._sheet_size(drawing)
-            cols = int(self._get(grid, "ColumnCount"))
-            rows = int(self._get(grid, "RowCount"))
-            try:
-                table_w = sum(float(grid.GetColumnWidth(c)) for c in range(cols))
-                table_h = sum(float(grid.GetRowHeight(r)) for r in range(rows))
-            except Exception as exc:
-                table_w, table_h = 0.070, 0.007 * rows            # rough size when it cannot be read
-                steps.append(f"bend table size estimated ({exc})")
+            return (sum(float(grid.GetColumnWidth(c)) for c in range(cols)),
+                    sum(float(grid.GetRowHeight(r)) for r in range(rows)))
+        except Exception as exc:
+            steps.append(f"bend table size estimated ({exc})")
+            return 0.070, 0.0072 * max(rows, 1)
 
-            left = width - self.bend_table_right_margin_mm / 1000.0 - table_w
-            top = self.bend_table_bottom_mm / 1000.0 + table_h    # SetPosition2 = top-left corner
-
+    def _move_table(self, grid, left, top, steps):
+        """SetPosition2 = top-left corner. Returns True when the table really is at the target."""
+        try:
             annotation = self._get(grid, "GetAnnotation")
             before = self._get(annotation, "GetPosition")
             annotation.SetPosition2(left, top, 0.0)
             after = self._get(annotation, "GetPosition")
             steps.append(
-                f"bend table size {table_w * 1000:.0f} x {table_h * 1000:.0f} mm, "
-                f"position {tuple(round(v * 1000, 1) for v in (before or ()))} -> "
-                f"{tuple(round(v * 1000, 1) for v in (after or ()))} mm")
+                f"bend table position {tuple(round(v * 1000, 1) for v in (before or ()))} -> "
+                f"{tuple(round(v * 1000, 1) for v in (after or ()))} mm (target {left * 1000:.1f}, {top * 1000:.1f})")
+            return bool(after) and abs(after[0] - left) < 0.0005 and abs(after[1] - top) < 0.0005
         except Exception as exc:
             steps.append(f"bend table not moved: {exc}")
+            return False
+
+    def _delete_table(self, drawing, grid):
+        try:
+            nothing = VARIANT(pythoncom.VT_DISPATCH, None)
+            annotation = self._get(grid, "GetAnnotation")
+            drawing.ClearSelection2(True)
+            if annotation is not None and annotation.Select3(False, nothing):
+                drawing.Extension.DeleteSelection2(6)
+                return True
+        except Exception:
+            pass
+        return False
+
+    def _insert_bend_table(self, drawing, view, steps):
+        """Native bend table: every bend gets a letter tag on the flat pattern (A, B, C...)
+        and the same tag is listed in the table (Tag / Direction / Angle / Inner Radius).
+        The table ends up in the bottom-right corner, right above the title block."""
+        width, height = self._sheet_size(drawing)
+
+        table = self._insert_table_once(view, width * 0.1, height * 0.5, steps)   # inside the sheet first
+        if table is None:
+            steps.append("bend table NOT created")
+            return
+        try:
+            # with a bend table present the bend notes of the flat pattern show the TAG (A, B, C...)
+            view.ShowSheetMetalBendNotes = True
+            steps.append(f"bend notes (tags) on view: {self._get(view, 'ShowSheetMetalBendNotes')}")
+        except Exception as exc:
+            steps.append(f"could not show bend tags: {exc}")
+
+        grid = self._table_grid(table, steps)
+        self._clean_columns(grid, steps)
+
+        table_w, table_h = self._table_size(grid, steps)
+        left = width - self.bend_table_right_margin_mm / 1000.0 - table_w
+        top = self.bend_table_bottom_mm / 1000.0 + table_h
+        steps.append(f"bend table size {table_w * 1000:.0f} x {table_h * 1000:.0f} mm")
+
+        if not self._move_table(grid, left, top, steps):
+            # moving did not work: delete it and insert again directly at the final position
+            if self._delete_table(drawing, grid):
+                steps.append("bend table re-inserted at the final position")
+                table = self._insert_table_once(view, left, top, steps)
+                if table is not None:
+                    grid = self._table_grid(table, steps)
+                    self._clean_columns(grid, steps)
+                    self._move_table(grid, left, top, steps)
+            else:
+                steps.append("bend table could not be moved or deleted - check its position manually")
 
     # ---------------- public ----------------
     def export_part(self, item, slddrw_path):
@@ -553,7 +629,7 @@ class SwDrawingExporter:
                 steps += steps2
         if not ok:
             try:
-                Path(slddrw_path).unlink(missing_ok=True)   # do not leave a master copy without flat view
+                Path(slddrw_path).unlink(missing_ok=True)   # do not leave a master copy without views
             except Exception:
                 pass
         return ok, message, steps
@@ -572,7 +648,7 @@ class SwDrawingExporter:
         configuration = item.get("configuration")
         model = drawing = flat = None
         opened_by_us = False
-        was_suppressed = False
+        unsuppressed_by_us = False
         previous_config = None
 
         try:
@@ -604,15 +680,6 @@ class SwDrawingExporter:
             flat = self._find_flat_pattern(model)
             if flat is None:
                 return False, "Flat-Pattern feature not found", steps
-            was_suppressed = bool(self._get(flat, "IsSuppressed", False))
-            if was_suppressed:
-                flat.SetSuppression2(SW_UNSUPPRESS, SW_THIS_CONFIGURATION, None)
-                steps.append("flat pattern unsuppressed")
-                try:
-                    model.ForceRebuild3(True)
-                except Exception:
-                    pass
-                steps.append(f"flat pattern suppressed after rebuild: {self._get(flat, 'IsSuppressed')}")
 
             shutil.copyfile(self.master_drawing, slddrw_path)
             steps.append(f"master copied: {self.master_drawing.name}")
@@ -632,22 +699,52 @@ class SwDrawingExporter:
                 pass
             model_path = str(self._get(model, "GetPathName") or part_path)
 
-            view, method = self._create_flat_view(drawing, model_path, active_cfg, width / 2, height / 2, steps)
-            if view is None:
+            # ---- views ----
+            flat_view, method = self._create_flat_view(drawing, model_path, active_cfg,
+                                                       width / 2, height / 3, steps, rounds=1)
+            if flat_view is None and bool(self._get(flat, "IsSuppressed", False)):
+                try:                                              # second chance: unsuppress the flat pattern
+                    flat.SetSuppression2(SW_UNSUPPRESS, SW_THIS_CONFIGURATION, None)
+                    unsuppressed_by_us = True
+                    model.ForceRebuild3(True)
+                    steps.append("flat pattern unsuppressed (retry)")
+                except Exception as exc:
+                    steps.append(f"could not unsuppress flat pattern: {exc}")
+                flat_view, method = self._create_flat_view(drawing, model_path, active_cfg,
+                                                           width / 2, height / 3, steps, rounds=2)
+            if flat_view is None:
                 return False, "could not create the flat pattern view", steps
             steps.append(f"flat view created ({method})")
-            steps.append(self._fit_view(drawing, view))
 
+            views = []
+            if self.add_folded_views:
+                top_view = self._create_model_view(drawing, model_path, "*Top", width / 2, height * 0.75, steps)
+                front_view = self._create_model_view(drawing, model_path, "*Front", width / 2, height * 0.55, steps)
+                if top_view is not None:
+                    views.append(("top", top_view))
+                if front_view is not None:
+                    views.append(("front", front_view))
+                steps.append(f"folded views: {[n for n, _ in views]}")
+            views.append(("flat", flat_view))
+
+            self._layout_views(drawing, views, steps)
+
+            # ---- dimensions ----
             if self.add_dimensions:
-                self._add_overall_dimensions(drawing, view, steps)
+                for name, v in views:
+                    if name == "top":
+                        self._add_overall_dimensions(drawing, v, steps, "top", True, True, "right")
+                    elif name == "front":
+                        self._add_overall_dimensions(drawing, v, steps, "front", False, True, "right")
+                    else:
+                        self._add_overall_dimensions(drawing, v, steps, "flat", True, True, "left")
+
+            if self.add_qty_note:
+                self._add_qty_note(drawing, item, steps)
 
             if self.insert_bend_table:
-                self._insert_bend_table(drawing, view, steps)
+                self._insert_bend_table(drawing, flat_view, steps)
 
-            try:
-                drawing.ViewZoomtofit2()
-            except Exception:
-                pass
             try:
                 drawing.ForceRebuild3(False)      # refresh linked title block fields
             except Exception:
@@ -664,7 +761,7 @@ class SwDrawingExporter:
         finally:
             # close the drawing first, then restore and close the part
             self._close_doc(drawing)
-            if flat is not None and was_suppressed:
+            if flat is not None and unsuppressed_by_us:
                 try:
                     flat.SetSuppression2(SW_SUPPRESS, SW_THIS_CONFIGURATION, None)
                 except Exception:
