@@ -1,4 +1,4 @@
-"""Creates one SLDDRW per sheet-metal part containing its flat pattern view."""
+"""One SLDDRW per sheet-metal part: master.slddrw + flat pattern view + tagged bend table."""
 import gc
 import re
 import shutil
@@ -16,24 +16,23 @@ SW_SAVE_AS_CURRENT_VERSION = 0
 SW_UNSUPPRESS = 0
 SW_SUPPRESS = 1
 SW_THIS_CONFIGURATION = 1
-SW_PAPER_A3 = 8                       # swDwgPaperA3size
-SW_DEFAULT_TEMPLATE_DRAWING = 10      # swUserPreferenceStringValue_e.swDefaultTemplateDrawing
-FALLBACK_SHEET = (0.420, 0.297)       # A3 landscape, meters
-FIT_RATIO = 0.70                      # flat view uses at most 70% of the sheet
+BEND_TABLE_ANCHOR_BOTTOM_RIGHT = 4     # swBOMConfigurationAnchor_BottomRight
+FALLBACK_SHEET = (0.420, 0.297)        # A3 landscape, meters
 STANDARD_SCALES = (10, 5, 4, 2, 1, 0.5, 0.4, 0.25, 0.2, 0.1, 0.05, 0.04, 0.02, 0.01, 0.005)
 INVALID_FILENAME = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
-BEND_TABLE_START_VALUE = "1"      # first tag: a positive integer = number tags, "A" = letter tags
-BEND_TABLE_ANCHOR_TOP_LEFT = 1    # swBOMConfigurationAnchor_TopLeft
-
 
 
 class SwDrawingExporter:
-    """For every part: open part -> new drawing -> flat pattern view -> save .SLDDRW."""
+    """Per part: copy master.slddrw -> Edit Sheet Format -> remove old views ->
+    flat pattern view -> bend table with letter tags -> save .SLDDRW."""
 
     def __init__(self, sw_app, assembly_path=None, reconnect=None, template_path=None,
                  sheet_format_path=None, text_replacements=None, master_drawing=None,
-                 view_width_ratio=0.5, view_left_mm=25, view_center_y_ratio=0.42,insert_bend_table=True, bend_table_template=None,
-                 bend_table_gap_mm=15, bend_table_remove_words=()):
+                 view_width_ratio=0.5, view_left_mm=25, view_center_y_ratio=0.42,
+                 insert_bend_table=True, bend_table_template=None,
+                 bend_table_right_margin_mm=10, bend_table_bottom_mm=66,
+                 bend_table_remove_words=(), bend_table_start_value="A",
+                 add_dimensions=True, dimension_offset_mm=15):
         self.sw_app = sw_app
         self.assembly_path = Path(assembly_path).resolve() if assembly_path else None
         self.reconnect = reconnect
@@ -46,8 +45,12 @@ class SwDrawingExporter:
         self.view_center_y_ratio = view_center_y_ratio
         self.insert_bend_table = insert_bend_table
         self.bend_table_template = Path(bend_table_template) if bend_table_template else None
-        self.bend_table_gap_mm = bend_table_gap_mm
+        self.bend_table_right_margin_mm = bend_table_right_margin_mm
+        self.bend_table_bottom_mm = bend_table_bottom_mm
         self.bend_table_remove_words = tuple(w.lower() for w in bend_table_remove_words)
+        self.bend_table_start_value = str(bend_table_start_value)
+        self.add_dimensions = add_dimensions
+        self.dimension_offset_mm = dimension_offset_mm
 
     # ---------------- helpers ----------------
     @staticmethod
@@ -61,6 +64,7 @@ class SwDrawingExporter:
 
     @staticmethod
     def _get(obj, name, default=None):
+        """Reads a property or calls a no-argument method (pywin32 exposes both styles)."""
         if obj is None:
             return default
         try:
@@ -98,17 +102,6 @@ class SwDrawingExporter:
             print(f"  Reconnect failed: {exc}")
         return False
 
-    def _find_template(self):
-        if self.template_path and self.template_path.is_file():
-            return str(self.template_path.resolve())
-        try:
-            tpl = self.sw_app.GetUserPreferenceStringValue(SW_DEFAULT_TEMPLATE_DRAWING)
-            if tpl and Path(tpl).is_file():
-                return str(tpl)
-        except Exception:
-            pass
-        return None
-
     def _close_doc(self, doc):
         if doc is None:
             return
@@ -132,6 +125,10 @@ class SwDrawingExporter:
         if model is None:
             return None, False, f"OpenDoc6 returned None (errors={getattr(errors, 'value', errors)})"
         return model, True, "opened"
+
+    def _open_drawing(self, path):
+        errors, warnings = self._byref_i4(), self._byref_i4()
+        return self.sw_app.OpenDoc6(str(path), SW_DOC_DRAWING, SW_OPEN_SILENT, "", errors, warnings)
 
     def _find_flat_pattern(self, model):
         for name in ("Flat-Pattern1", "Flat-Pattern", "FlatPattern"):
@@ -160,6 +157,119 @@ class SwDrawingExporter:
             pass
         return FALLBACK_SHEET
 
+    # ---------------- sheet format ----------------
+    def _replace_sheet_texts(self, drawing, values):
+        """Inside Edit Sheet Format: replaces placeholders such as {PART_NAME} in the notes."""
+        if not self.text_replacements:
+            return 0
+        count = 0
+        view = self._get(drawing, "GetFirstView")      # in Edit Sheet Format the first view is the sheet format
+        note = self._get(view, "GetFirstNote")
+        for _ in range(10000):
+            if note is None:
+                break
+            try:
+                text = self._get(note, "GetText")
+                if text:
+                    new = str(text)
+                    for placeholder, field in self.text_replacements.items():
+                        new = new.replace(placeholder, str(values.get(field, "")))
+                    if new != text:
+                        note.SetText(new)
+                        count += 1
+            except Exception:
+                pass
+            note = self._get(note, "GetNext")
+        return count
+
+    def _apply_sheet_format(self, drawing, item, steps):
+        values = {
+            "PartName": item.get("name") or Path(item["path"]).stem,
+            "Quantity": item.get("quantity", 1),
+            "Thickness": item.get("thickness"),
+            "Material": item.get("material"),
+            "Configuration": item.get("configuration"),
+        }
+
+        if self.sheet_format_path:
+            if not self.sheet_format_path.is_file():
+                steps.append(f"sheet format file not found: {self.sheet_format_path}")
+            else:
+                try:
+                    sheet = self._get(drawing, "GetCurrentSheet")
+                    sheet.SetTemplateName(str(self.sheet_format_path.resolve()))
+                    sheet.ReloadTemplate(True)
+                    steps.append(f"sheet format loaded: {self.sheet_format_path.name}")
+                except Exception as exc:
+                    steps.append(f"sheet format not loaded: {exc}")
+
+        try:
+            manager = drawing.Extension.CustomPropertyManager("")
+            for key, value in values.items():
+                if value not in (None, ""):
+                    manager.Add3(key, 30, str(value), 2)     # 30 = text, 2 = overwrite
+            steps.append("drawing properties written")
+        except Exception as exc:
+            steps.append(f"drawing properties skipped: {exc}")
+
+        try:
+            drawing.EditTemplate()          # return value is unreliable (None) -> ignored
+            replaced = self._replace_sheet_texts(drawing, values)
+            steps.append(f"Edit Sheet Format: {replaced} text(s) replaced")
+        except Exception as exc:
+            steps.append(f"Edit Sheet Format failed: {exc}")
+        finally:
+            try:
+                drawing.EditSheet()         # always leave Edit Sheet Format
+                steps.append("back to sheet (EditSheet)")
+            except Exception as exc:
+                steps.append(f"EditSheet failed: {exc}")
+
+    # ---------------- master cleanup ----------------
+    def _remove_existing_views(self, drawing, steps):
+        """Deletes everything that came from master.slddrw: bend tables, flat pattern and other views."""
+        nothing = VARIANT(pythoncom.VT_DISPATCH, None)
+
+        views = []
+        view = self._get(self._get(drawing, "GetFirstView"), "GetNextView")   # skip the sheet-format view
+        while view is not None:
+            views.append(view)
+            view = self._get(view, "GetNextView")
+        names = [str(self._get(v, "GetName2")) for v in views]
+        steps.append(f"master views found: {names}")
+
+        tables_removed = 0
+        for v in views:
+            tables = self._get(v, "GetTableAnnotations")
+            for table in (tables or ()):
+                try:
+                    annotation = self._get(table, "GetAnnotation")
+                    drawing.ClearSelection2(True)
+                    if annotation is not None and annotation.Select3(False, nothing):
+                        drawing.Extension.DeleteSelection2(6)
+                        tables_removed += 1
+                except Exception as exc:
+                    steps.append(f"table delete failed: {exc}")
+        steps.append(f"tables removed: {tables_removed}")
+
+        views_removed = 0
+        for name in names:
+            try:
+                drawing.ClearSelection2(True)
+                if drawing.Extension.SelectByID2(name, "DRAWINGVIEW", 0, 0, 0, False, 0, nothing, 0):
+                    drawing.Extension.DeleteSelection2(6)
+                    views_removed += 1
+                else:
+                    steps.append(f"could not select view: {name}")
+            except Exception as exc:
+                steps.append(f"view delete failed ({name}): {exc}")
+        try:
+            drawing.ClearSelection2(True)
+        except Exception:
+            pass
+        steps.append(f"old views removed: {views_removed}/{len(names)}")
+
+    # ---------------- flat pattern view ----------------
     def _create_flat_view(self, drawing, part_path, config, x, y, steps):
         attempts = (
             ("CreateFlatPatternViewFromModelView3",
@@ -206,7 +316,7 @@ class SwDrawingExporter:
             target_x = self.view_left_mm / 1000.0 + new_w / 2.0
             target_y = height * self.view_center_y_ratio
 
-            for _ in range(2):
+            for _ in range(2):                      # second pass removes small drift
                 outline = self._get(view, "GetOutline")
                 cx = (outline[0] + outline[2]) / 2.0
                 cy = (outline[1] + outline[3]) / 2.0
@@ -220,6 +330,76 @@ class SwDrawingExporter:
                     f"left edge {outline[0] * 1000:.1f} mm, center y {((outline[1] + outline[3]) / 2) * 1000:.1f} mm")
         except Exception as exc:
             return f"fit skipped ({exc})"
+
+    # ---------------- overall dimensions ----------------
+    def _view_vertices(self, view):
+        """Visible vertices of the flat pattern view (type is detected, so no enum value is assumed)."""
+        nothing = VARIANT(pythoncom.VT_DISPATCH, None)
+        for entity_type in (2, 1, 3, 4):
+            try:
+                entities = view.GetVisibleEntities2(nothing, entity_type)
+            except Exception:
+                continue
+            if entities and self._get(entities[0], "GetPoint") is not None:
+                return list(entities)
+        return []
+
+    def _vertex_points(self, view, vertices):
+        """[(x, y, vertex)] in view space, used only to find the extreme corners."""
+        transform = self._get(view, "ModelToViewTransform")
+        math = None
+        try:
+            math = self.sw_app.GetMathUtility()
+        except Exception:
+            pass
+        points = []
+        for vertex in vertices:
+            p = self._get(vertex, "GetPoint")
+            if not p:
+                continue
+            xyz = (float(p[0]), float(p[1]), float(p[2]))
+            if math is not None and transform is not None:
+                try:
+                    mp = math.CreatePoint(VARIANT(pythoncom.VT_ARRAY | pythoncom.VT_R8, xyz))
+                    xyz = tuple(float(v) for v in mp.MultiplyTransform(transform).ArrayData)
+                except Exception:
+                    pass
+            points.append((xyz[0], xyz[1], vertex))
+        return points
+
+    def _add_overall_dimensions(self, drawing, view, steps):
+        """Length (horizontal) and width (vertical) of the flat pattern between its extreme corners."""
+        try:
+            points = self._vertex_points(view, self._view_vertices(view))
+            if len(points) < 2:
+                steps.append("dimensions skipped: no vertices found in the flat pattern view")
+                return
+            left, right = min(points, key=lambda t: t[0]), max(points, key=lambda t: t[0])
+            bottom, top = min(points, key=lambda t: t[1]), max(points, key=lambda t: t[1])
+
+            outline = self._get(view, "GetOutline")
+            off = self.dimension_offset_mm / 1000.0
+            sel = drawing.SelectionManager.CreateSelectData()
+            sel.View = view
+
+            made = []
+            for label, a, b, func, px, py in (
+                ("length", left, right, "AddHorizontalDimension2",
+                 (outline[0] + outline[2]) / 2.0, outline[3] + off),
+                ("width", bottom, top, "AddVerticalDimension2",
+                 outline[2] + off, (outline[1] + outline[3]) / 2.0),
+            ):
+                drawing.ClearSelection2(True)
+                a[2].Select4(False, sel)
+                b[2].Select4(True, sel)
+                dim = getattr(drawing, func)(px, py, 0.0)
+                made.append(f"{label}: {'ok' if dim is not None else 'failed'}")
+            drawing.ClearSelection2(True)
+            steps.append("dimensions -> " + ", ".join(made))
+        except Exception as exc:
+            steps.append(f"dimensions failed: {exc}")
+
+    # ---------------- bend table ----------------
     def _default_bend_templates(self):
         found = []
         try:
@@ -230,31 +410,44 @@ class SwDrawingExporter:
             pass
         return found
 
-    def _insert_bend_table(self, drawing, view, steps):
-        """Native bend table: tags on the bend lines + table with Tag / Direction / Angle / Radius."""
-        
+    @staticmethod
+    def _cell(grid, row, col):
+        try:
+            return str(grid.Text(row, col)).strip()
+        except Exception:
+            return ""
 
-        outline = self._get(view, "GetOutline")
-        x = outline[2] + self.bend_table_gap_mm / 1000.0
-        y = outline[3]
+    def _insert_bend_table(self, drawing, view, steps):
+        """Native bend table: every bend gets a letter tag on the flat pattern (A, B, C...)
+        and the same tag is listed in the table (Tag / Direction / Angle / Inner Radius)."""
+        steps.append(f"is flat pattern view: {self._get(view, 'IsFlatPatternView')}")
+
+        width, height = self._sheet_size(drawing)
+        x = width - self.bend_table_right_margin_mm / 1000.0     # right edge of the table
+        y = self.bend_table_bottom_mm / 1000.0                   # bottom edge = just above the title block
 
         templates = [str(self.bend_table_template)] if self.bend_table_template else []
         templates += self._default_bend_templates() + [""]
 
         table = None
         for tpl in templates:
+            label = Path(tpl).name if tpl else "default"
             try:
-                table = view.InsertBendTable(False, x, y, BEND_TABLE_ANCHOR_TOP_LEFT,
-                                            BEND_TABLE_START_VALUE, tpl)
+                table = view.InsertBendTable(False, x, y, BEND_TABLE_ANCHOR_BOTTOM_RIGHT,
+                                             self.bend_table_start_value, tpl)
                 if table is not None:
-                    steps.append(f"bend table inserted (template: {Path(tpl).name if tpl else 'default'})")
+                    steps.append(f"bend table inserted (template: {label}, start tag: {self.bend_table_start_value})")
                     break
+                steps.append(f"bend table returned None ({label})")
             except Exception as exc:
-                steps.append(f"bend table failed ({Path(tpl).name if tpl else 'default'}): {exc}")
+                steps.append(f"bend table failed ({label}): {exc}")
         if table is None:
-            steps.append(f"bend table object: {type(table).__name__}")
+            steps.append("bend table NOT created")
+            return
+
+        steps.append(f"bend table object: {type(table).__name__}")
         try:
-            view.ShowSheetMetalBendNotes = False          # only now: tags stay, notes go
+            view.ShowSheetMetalBendNotes = False          # only tags stay on the flat pattern, no notes
         except Exception:
             pass
 
@@ -271,13 +464,13 @@ class SwDrawingExporter:
 
         try:
             cols = int(self._get(grid, "ColumnCount"))
-            headers = [str(grid.Text(0, c)).strip() for c in range(cols)]
-            if len(set(headers)) == 1 and cols > 1:
-                headers = [str(grid.Text(1, c)).strip() for c in range(cols)]
+            headers = [self._cell(grid, 0, c) for c in range(cols)]
+            if len(set(headers)) == 1 and cols > 1:           # row 0 is a merged title row
+                headers = [self._cell(grid, 1, c) for c in range(cols)]
             steps.append(f"bend table columns: {headers}")
 
             removed = []
-            for c in range(cols - 1, -1, -1):
+            for c in range(cols - 1, -1, -1):                 # from the last so indexes stay valid
                 if any(w in headers[c].lower() for w in self.bend_table_remove_words):
                     try:
                         grid.DeleteColumn(c)
@@ -288,126 +481,6 @@ class SwDrawingExporter:
             steps.append(f"bend table rows: {self._get(grid, 'RowCount')}")
         except Exception as exc:
             steps.append(f"bend table column cleanup failed: {exc}")
-
-    def _replace_sheet_texts(self, drawing, values):
-        """Inside Edit Sheet Format: replaces placeholders such as {PART_NAME} in the notes."""
-        if not self.text_replacements:
-            return 0
-        count = 0
-        view = self._get(drawing, "GetFirstView")      # in Edit Sheet Format the first view is the sheet format
-        note = self._get(view, "GetFirstNote")
-        for _ in range(10000):
-            if note is None:
-                break
-            try:
-                text = self._get(note, "GetText")
-                if text:
-                    new = str(text)
-                    for placeholder, field in self.text_replacements.items():
-                        new = new.replace(placeholder, str(values.get(field, "")))
-                    if new != text:
-                        note.SetText(new)
-                        count += 1
-            except Exception:
-                pass
-            note = self._get(note, "GetNext")
-        return count
-
-    def _apply_sheet_format(self, drawing, item, steps):
-        """Loads the sheet format, writes drawing properties and runs Edit Sheet Format."""
-        values = {
-            "PartName": item.get("name") or Path(item["path"]).stem,
-            "Quantity": item.get("quantity", 1),
-            "Thickness": item.get("thickness"),
-            "Material": item.get("material"),
-            "Configuration": item.get("configuration"),
-        }
-
-        # 1) sheet format file (.slddrt); without it the format inside the .drwdot is used
-        if self.sheet_format_path:
-            if not self.sheet_format_path.is_file():
-                steps.append(f"sheet format file not found: {self.sheet_format_path}")
-            else:
-                try:
-                    sheet = self._get(drawing, "GetCurrentSheet")
-                    sheet.SetTemplateName(str(self.sheet_format_path.resolve()))
-                    sheet.ReloadTemplate(True)
-                    steps.append(f"sheet format loaded: {self.sheet_format_path.name}")
-                except Exception as exc:
-                    steps.append(f"sheet format not loaded: {exc}")
-
-        # 2) drawing custom properties (title block can link to them: $PRP:"PartName")
-        try:
-            manager = drawing.Extension.CustomPropertyManager("")
-            for key, value in values.items():
-                if value not in (None, ""):
-                    manager.Add3(key, 30, str(value), 2)     # 30 = text, 2 = overwrite
-            steps.append("drawing properties written")
-        except Exception as exc:
-            steps.append(f"drawing properties skipped: {exc}")
-
-        # 3) Edit Sheet Format -> replace placeholders -> ALWAYS back to sheet
-        try:
-            drawing.EditTemplate()          # the return value is unreliable (None), so it is ignored
-            replaced = self._replace_sheet_texts(drawing, values)
-            steps.append(f"Edit Sheet Format: {replaced} text(s) replaced")
-        except Exception as exc:
-            steps.append(f"Edit Sheet Format failed: {exc}")
-        finally:
-            try:
-                drawing.EditSheet()         # harmless if not in template mode
-                steps.append("back to sheet (EditSheet)")
-            except Exception as exc:
-                steps.append(f"EditSheet failed: {exc}")
-
-    def _open_drawing(self, path):
-        errors, warnings = self._byref_i4(), self._byref_i4()
-        return self.sw_app.OpenDoc6(str(path), SW_DOC_DRAWING, SW_OPEN_SILENT, "", errors, warnings)
-
-    def _remove_existing_views(self, drawing, steps):
-        """Deletes everything that came from master.slddrw: bend tables, flat pattern and other views."""
-        nothing = VARIANT(pythoncom.VT_DISPATCH, None)
-
-        views = []
-        view = self._get(self._get(drawing, "GetFirstView"), "GetNextView")   # skip the sheet-format view
-        while view is not None:
-            views.append(view)
-            view = self._get(view, "GetNextView")
-        names = [str(self._get(v, "GetName2")) for v in views]
-        steps.append(f"master views found: {names}")
-
-        # 1) tables first (bend table, hole table...) - they belong to the views
-        tables_removed = 0
-        for v in views:
-            tables = self._get(v, "GetTableAnnotations")
-            for table in (tables or ()):
-                try:
-                    annotation = self._get(table, "GetAnnotation")
-                    drawing.ClearSelection2(True)
-                    if annotation is not None and annotation.Select3(False, nothing):
-                        drawing.Extension.DeleteSelection2(6)      # 2 = absorbed, 4 = children
-                        tables_removed += 1
-                except Exception as exc:
-                    steps.append(f"table delete failed: {exc}")
-        steps.append(f"tables removed: {tables_removed}")
-
-        # 2) then the views themselves
-        views_removed = 0
-        for name in names:
-            try:
-                drawing.ClearSelection2(True)
-                if drawing.Extension.SelectByID2(name, "DRAWINGVIEW", 0, 0, 0, False, 0, nothing, 0):
-                    drawing.Extension.DeleteSelection2(6)
-                    views_removed += 1
-                else:
-                    steps.append(f"could not select view: {name}")
-            except Exception as exc:
-                steps.append(f"view delete failed ({name}): {exc}")
-        try:
-            drawing.ClearSelection2(True)
-        except Exception:
-            pass
-        steps.append(f"old views removed: {views_removed}/{len(names)}")
 
     # ---------------- public ----------------
     def export_part(self, item, slddrw_path):
@@ -476,16 +549,22 @@ class SwDrawingExporter:
             if was_suppressed:
                 flat.SetSuppression2(SW_UNSUPPRESS, SW_THIS_CONFIGURATION, None)
                 steps.append("flat pattern unsuppressed")
+                try:
+                    model.ForceRebuild3(True)
+                except Exception:
+                    pass
+                steps.append(f"flat pattern suppressed after rebuild: {self._get(flat, 'IsSuppressed')}")
 
             shutil.copyfile(self.master_drawing, slddrw_path)
             steps.append(f"master copied: {self.master_drawing.name}")
             drawing = self._open_drawing(slddrw_path)
             if drawing is None:
                 return False, "could not open the copied master drawing", steps
+
             self._apply_sheet_format(drawing, item, steps)      # Edit Sheet Format -> back to sheet
             self._remove_existing_views(drawing, steps)
-            width, height = self._sheet_size(drawing)
 
+            width, height = self._sheet_size(drawing)
             active_cfg = configuration or self._get(
                 self._get(model.ConfigurationManager, "ActiveConfiguration"), "Name") or ""
             try:
@@ -493,23 +572,23 @@ class SwDrawingExporter:
             except Exception:
                 pass
             model_path = str(self._get(model, "GetPathName") or part_path)
+
             view, method = self._create_flat_view(drawing, model_path, active_cfg, width / 2, height / 2, steps)
             if view is None:
                 return False, "could not create the flat pattern view", steps
             steps.append(f"flat view created ({method})")
             steps.append(self._fit_view(drawing, view))
+
+            if self.add_dimensions:
+                self._add_overall_dimensions(drawing, view, steps)
+
             if self.insert_bend_table:
                 self._insert_bend_table(drawing, view, steps)
-            try:
-                steps.append(f"view: {self._get(view, 'GetName2')}, outline: {tuple(round(v, 4) for v in self._get(view, 'GetOutline'))}")
-            except Exception:
-                pass
 
             try:
                 drawing.ViewZoomtofit2()
             except Exception:
                 pass
-
             try:
                 drawing.ForceRebuild3(False)      # refresh linked title block fields
             except Exception:
