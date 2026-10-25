@@ -367,37 +367,66 @@ class SwDrawingExporter:
             points.append((xyz[0], xyz[1], vertex))
         return points
 
+    def _select_vertex(self, view, vertex, append, sel):
+        """Vertex.Select4 first; IView.SelectEntity as fallback (the vertex dispatch may not expose Select4)."""
+        try:
+            if vertex.Select4(append, sel):
+                return True, "Select4"
+        except Exception:
+            pass
+        try:
+            if view.SelectEntity(vertex, append):
+                return True, "SelectEntity"
+        except Exception:
+            pass
+        return False, None
+
     def _add_overall_dimensions(self, drawing, view, steps):
         """Length (horizontal) and width (vertical) of the flat pattern between its extreme corners."""
+        stage = "vertices"
         try:
-            points = self._vertex_points(view, self._view_vertices(view))
+            vertices = self._view_vertices(view)
+            points = self._vertex_points(view, vertices)
+            steps.append(f"dimension vertices: {len(points)}")
             if len(points) < 2:
                 steps.append("dimensions skipped: no vertices found in the flat pattern view")
                 return
             left, right = min(points, key=lambda t: t[0]), max(points, key=lambda t: t[0])
             bottom, top = min(points, key=lambda t: t[1]), max(points, key=lambda t: t[1])
 
+            stage = "outline"
             outline = self._get(view, "GetOutline")
             off = self.dimension_offset_mm / 1000.0
-            sel = drawing.SelectionManager.CreateSelectData()
-            sel.View = view
+
+            stage = "select data"
+            try:
+                sel = drawing.SelectionManager.CreateSelectData()
+                sel.View = view
+            except Exception as exc:
+                sel = VARIANT(pythoncom.VT_DISPATCH, None)
+                steps.append(f"select data not created ({exc}) - selecting without it")
 
             made = []
-            for label, a, b, func, px, py in (
+            for label, a_pt, b_pt, func, px, py in (
                 ("length", left, right, "AddHorizontalDimension2",
                  (outline[0] + outline[2]) / 2.0, outline[3] + off),
                 ("width", bottom, top, "AddVerticalDimension2",
                  outline[2] + off, (outline[1] + outline[3]) / 2.0),
             ):
+                stage = f"{label}: select"
                 drawing.ClearSelection2(True)
-                a[2].Select4(False, sel)
-                b[2].Select4(True, sel)
+                ok1, how1 = self._select_vertex(view, a_pt[2], False, sel)
+                ok2, how2 = self._select_vertex(view, b_pt[2], True, sel)
+                if not (ok1 and ok2):
+                    made.append(f"{label}: could not select the corners")
+                    continue
+                stage = f"{label}: {func}"
                 dim = getattr(drawing, func)(px, py, 0.0)
-                made.append(f"{label}: {'ok' if dim is not None else 'failed'}")
+                made.append(f"{label}: {'ok' if dim is not None else 'failed'} ({how1})")
             drawing.ClearSelection2(True)
             steps.append("dimensions -> " + ", ".join(made))
         except Exception as exc:
-            steps.append(f"dimensions failed: {exc}")
+            steps.append(f"dimensions failed at '{stage}': {exc}")
 
     # ---------------- bend table ----------------
     def _default_bend_templates(self):
@@ -423,8 +452,7 @@ class SwDrawingExporter:
         steps.append(f"is flat pattern view: {self._get(view, 'IsFlatPatternView')}")
 
         width, height = self._sheet_size(drawing)
-        x = width - self.bend_table_right_margin_mm / 1000.0     # right edge of the table
-        y = self.bend_table_bottom_mm / 1000.0                   # bottom edge = just above the title block
+        x, y = width / 2.0, height / 2.0       # inserted inside the sheet first, moved to the corner afterwards
 
         templates = [str(self.bend_table_template)] if self.bend_table_template else []
         templates += self._default_bend_templates() + [""]
@@ -447,9 +475,11 @@ class SwDrawingExporter:
 
         steps.append(f"bend table object: {type(table).__name__}")
         try:
-            view.ShowSheetMetalBendNotes = False          # only tags stay on the flat pattern, no notes
-        except Exception:
-            pass
+            # with a bend table present the bend notes of the flat pattern show the TAG (A, B, C...)
+            view.ShowSheetMetalBendNotes = True
+            steps.append(f"bend notes (tags) on view: {self._get(view, 'ShowSheetMetalBendNotes')}")
+        except Exception as exc:
+            steps.append(f"could not show bend tags: {exc}")
 
         grid = table
         try:
@@ -481,6 +511,35 @@ class SwDrawingExporter:
             steps.append(f"bend table rows: {self._get(grid, 'RowCount')}")
         except Exception as exc:
             steps.append(f"bend table column cleanup failed: {exc}")
+
+        self._place_bend_table(drawing, grid, steps)
+
+    def _place_bend_table(self, drawing, grid, steps):
+        """Moves the table to the bottom-right corner of the sheet, right above the title block."""
+        try:
+            width, height = self._sheet_size(drawing)
+            cols = int(self._get(grid, "ColumnCount"))
+            rows = int(self._get(grid, "RowCount"))
+            try:
+                table_w = sum(float(grid.GetColumnWidth(c)) for c in range(cols))
+                table_h = sum(float(grid.GetRowHeight(r)) for r in range(rows))
+            except Exception as exc:
+                table_w, table_h = 0.070, 0.007 * rows            # rough size when it cannot be read
+                steps.append(f"bend table size estimated ({exc})")
+
+            left = width - self.bend_table_right_margin_mm / 1000.0 - table_w
+            top = self.bend_table_bottom_mm / 1000.0 + table_h    # SetPosition2 = top-left corner
+
+            annotation = self._get(grid, "GetAnnotation")
+            before = self._get(annotation, "GetPosition")
+            annotation.SetPosition2(left, top, 0.0)
+            after = self._get(annotation, "GetPosition")
+            steps.append(
+                f"bend table size {table_w * 1000:.0f} x {table_h * 1000:.0f} mm, "
+                f"position {tuple(round(v * 1000, 1) for v in (before or ()))} -> "
+                f"{tuple(round(v * 1000, 1) for v in (after or ()))} mm")
+        except Exception as exc:
+            steps.append(f"bend table not moved: {exc}")
 
     # ---------------- public ----------------
     def export_part(self, item, slddrw_path):
