@@ -33,7 +33,7 @@ DEFAULT_LAYOUT = {
     "band_gap_mm": 2,
     "view_gap_mm": 12,             # gap between Top and Front view
     "dim_pad_mm": 20,              # room kept free around each view for its dimension lines
-    "common_scale": True,          # True = all views share one scale (like the reference), False = per group
+    "common_scale": False,          # True = all views share one scale (like the reference), False = per group
 }
 
 

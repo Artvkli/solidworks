@@ -64,8 +64,8 @@ DIMENSION_OFFSET_MM = 15              # distance of the dimension lines from the
 INSERT_BEND_TABLE = True
 BEND_TABLE_START_TAG = "A"             # "A" = letters, "1" = numbers
 BEND_TABLE_TEMPLATE_NAME = None        # e.g. "bend.sldbndtbt" in the input folder (columns: Tag, Direction, Angle, Inner Radius)
-BEND_TABLE_RIGHT_MARGIN_MM = 5        # distance of the table's right edge from the sheet's right edge
-BEND_TABLE_BOTTOM_MM = 50              # height of the title block's top edge above the sheet bottom
+BEND_TABLE_RIGHT_MARGIN_MM = 10        # distance of the table's right edge from the sheet's right edge
+BEND_TABLE_BOTTOM_MM = 66              # height of the title block's top edge above the sheet bottom
 # Columns whose header contains one of these words are deleted (only used when no custom template is given)
 BEND_TABLE_REMOVE_WORDS = ("factor", "allowance", "deduction", "length", "thickness")
 SLDDRW_LIMIT = None            # e.g. 1 = test on the first part only, None = all parts
