@@ -589,15 +589,38 @@ class SwDrawingExporter:
 
     # ---------------- bend dimensions ----------------
     def _view_edges(self, view):
+        """Return visible edge-like entities. Do not stop at the first non-edge entity type."""
         nothing = VARIANT(pythoncom.VT_DISPATCH, None)
-        for entity_type in (1, 2, 3, 4):
+        found = []
+        seen = set()
+        # SolidWorks swViewEntityType_e values: edge, face, vertex, silhouette edge.
+        for entity_type in (1, 4):
             try:
                 entities = view.GetVisibleEntities2(nothing, entity_type)
             except Exception:
                 continue
-            if entities and self._get(entities[0], "GetStartVertex") is not None:
-                return list(entities)
-        return []
+            if not entities:
+                continue
+            try:
+                seq = list(entities)
+            except Exception:
+                seq = [entities]
+            for entity in seq:
+                if entity is None:
+                    continue
+                try:
+                    curve = self._get(entity, "GetCurve")
+                    start = self._get(entity, "GetStartVertex")
+                    end = self._get(entity, "GetEndVertex")
+                    if curve is None or start is None or end is None:
+                        continue
+                    key = str(getattr(entity, "_oleobj_", id(entity)))
+                    if key not in seen:
+                        seen.add(key)
+                        found.append(entity)
+                except Exception:
+                    continue
+        return found
 
     def _make_mapper(self, view, steps):
         """model space -> view space. Uses SolidWorks' MathUtility; if that fails, the transform matrix."""
@@ -624,15 +647,34 @@ class SwDrawingExporter:
             raise RuntimeError("transform matrix not available")
         d = [float(v) for v in data]
         rows = [d[0:3], d[3:6], d[6:9]]
-        state = {"transpose": False, "k": d[12] or 1.0}
+        # SolidWorks MathTransform stores 9 rotation values, 3 translation values,
+        # then scale. Translation is retained here (view calibration removes the
+        # common offset, but it is important when composing a sketch transform).
+        trans = d[9:12] if len(d) >= 12 else [0.0, 0.0, 0.0]
+        state = {"transpose": False, "k": (d[12] if len(d) > 12 and d[12] else 1.0)}
+
+        def apply_transform(xyz, tr, transpose=False):
+            arr = self._get(tr, "ArrayData")
+            if not arr or len(arr) < 13:
+                raise RuntimeError("transform array data unavailable")
+            a = [float(v) for v in arr]
+            rr = [a[0:3], a[3:6], a[6:9]]
+            if transpose:
+                rr = [[rr[j][i] for j in range(3)] for i in range(3)]
+            tt = a[9:12] if len(a) >= 12 else [0.0, 0.0, 0.0]
+            kk = a[12] if len(a) > 12 and a[12] else 1.0
+            x, y, z = xyz
+            return tuple(kk * sum(rr[i][j] * (x, y, z)[j] for j in range(3)) + tt[i] for i in range(3))
 
         def mat_map(xyz, via=None):
+            # If the bend segment is expressed in sketch coordinates, first apply
+            # the supplied sketch-to-model transform, then model-to-view.
             if via is not None:
-                raise RuntimeError("sketch transform needs MathUtility")
+                xyz = apply_transform(xyz, via, state["transpose"])
             r = rows if not state["transpose"] else [[rows[j][i] for j in range(3)] for i in range(3)]
             x, y, z = xyz
-            return (state["k"] * (r[0][0] * x + r[0][1] * y + r[0][2] * z),
-                    state["k"] * (r[1][0] * x + r[1][1] * y + r[1][2] * z))
+            return (state["k"] * (r[0][0] * x + r[0][1] * y + r[0][2] * z + trans[0]),
+                    state["k"] * (r[1][0] * x + r[1][1] * y + r[1][2] * z + trans[1]))
         mat_map.state = state
         return mat_map, "matrix"
 
@@ -701,8 +743,10 @@ class SwDrawingExporter:
             tol = 0.02 * max(vb[2] - vb[0], vb[3] - vb[1])
 
             stage = "edges"
+            visible_edges = self._view_edges(view)
+            steps.append(f"visible edge-like entities: {len(visible_edges)}")
             edges = []
-            for e in self._view_edges(view):
+            for e in visible_edges:
                 curve = self._get(e, "GetCurve")
                 if curve is not None and self._get(curve, "IsLine") is False:
                     continue
