@@ -24,12 +24,16 @@ SCALES = (10, 5, 4, 2, 1) + tuple(1.0 / n for n in (
 INVALID_FILENAME = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 
 DEFAULT_LAYOUT = {
-    "width_ratio": 0.68,        # widest view = 68% of the sheet width
-    "center_x_ratio": 0.51,     # horizontal center of the views (fraction of sheet width)
-    "top_ratio": 0.90,          # top edge of the first view (fraction of sheet height)
-    "bottom_ratio": 0.355,      # bottom edge of the flat pattern (just above the bend table)
-    "gap_top_front_mm": 12,     # gap between Top and Front view
-    "gap_front_flat_mm": 22,    # gap between Front view and Flat pattern
+    "margin_mm": 10,               # sheet border inset
+    "side_pad_mm": 5,              # free space between the border and the views (left / right / top)
+    "top_pad_mm": 5,
+    "table_gap_mm": 0,             # gap between the title block and the bend table (0 = attached)
+    "table_clearance_mm": 9,       # free space between the bend table and the flat pattern area
+    "folded_band_ratio": 0.38,     # top views take the upper 38% of the free area, flat pattern the rest
+    "band_gap_mm": 2,
+    "view_gap_mm": 12,             # gap between Top and Front view
+    "dim_pad_mm": 20,              # room kept free around each view for its dimension lines
+    "common_scale": True,          # True = all views share one scale (like the reference), False = per group
 }
 
 
@@ -44,7 +48,7 @@ class SwDrawingExporter:
                  bend_table_right_margin_mm=10, bend_table_bottom_mm=66,
                  bend_table_remove_words=(), bend_table_start_value="A",
                  add_dimensions=True, dimension_offset_mm=15,
-                 add_qty_note=True, qty_note_x_mm=35, qty_note_y_mm=86):
+                 add_qty_note=True, qty_note_x_mm=None, qty_note_y_mm=None):
         self.sw_app = sw_app
         self.assembly_path = Path(assembly_path).resolve() if assembly_path else None
         self.reconnect = reconnect
@@ -338,39 +342,97 @@ class SwDrawingExporter:
             view.Position = VARIANT(pythoncom.VT_ARRAY | pythoncom.VT_R8,
                                     (pos[0] + target_cx - cx, pos[1] + target_cy - cy))
 
-    def _layout_views(self, drawing, views, steps):
-        """views = [(name, view), ...] from top to bottom. One common scale, stacked like the reference drawing."""
+    @staticmethod
+    def _fit_scale(limit):
+        return next((v for v in SCALES if v <= limit * 1.001), SCALES[-1])
+
+    @staticmethod
+    def _scale_text(scale):
+        return f"1:{1 / scale:.0f}" if scale < 1 else f"{scale:g}:1"
+
+    def _size_at_unit_scale(self, view):
+        o = self._get(view, "GetOutline")
+        sc = float(self._get(view, "ScaleDecimal"))
+        return (o[2] - o[0]) / sc, (o[3] - o[1]) / sc
+
+    def _layout_views(self, drawing, folded, flat_view, table_top, steps):
+        """Same page logic as the PDF drawing: the bend table sits above the title block, the free area above
+        it is split into a top band (folded views) and the flat pattern area; scales are fitted to the areas."""
         width, height = self._sheet_size(drawing)
         lay = self.layout
-        steps.append(f"sheet size: {width * 1000:.0f} x {height * 1000:.0f} mm")
+        mm = 0.001
+        m, pad, dim = lay["margin_mm"] * mm, lay["side_pad_mm"] * mm, lay["dim_pad_mm"] * mm
+        vgap = lay["view_gap_mm"] * mm
+        left, right = m + pad, width - m - pad
+        low = table_top + lay["table_clearance_mm"] * mm
+        high = height - m - lay["top_pad_mm"] * mm
         try:
-            sizes = []
-            for _, v in views:
-                o = self._get(v, "GetOutline")
-                sc = float(self._get(v, "ScaleDecimal"))
-                sizes.append(((o[2] - o[0]) / sc, (o[3] - o[1]) / sc))      # size at scale 1:1
+            if folded:
+                band = (high - low) * lay["folded_band_ratio"]
+                folded_box = (left, high - band, right, high)
+                flat_box = (left, low, right, high - band - lay["band_gap_mm"] * mm)
+            else:
+                folded_box, flat_box = None, (left, low, right, high)
 
-            gaps = [lay["gap_top_front_mm"] / 1000.0, lay["gap_front_flat_mm"] / 1000.0]
-            gaps = gaps[len(gaps) - (len(views) - 1):] if len(views) > 1 else []
-            area_h = (lay["top_ratio"] - lay["bottom_ratio"]) * height - sum(gaps)
-            max_w = lay["width_ratio"] * width
+            def inner(box):                      # keep room for the dimension lines
+                return (box[0] + dim, box[1], box[2] - dim, box[3] - dim)
 
-            limit = min(max_w / max(w for w, _ in sizes), area_h / sum(h for _, h in sizes))
-            chosen = next((s for s in SCALES if s <= limit * 1.001), SCALES[-1])
-            for _, v in views:
-                v.ScaleDecimal = chosen
+            f_in, b_in = (inner(folded_box) if folded_box else None), inner(flat_box)
+            steps.append(f"sheet {width * 1000:.0f} x {height * 1000:.0f} mm | table top {table_top * 1000:.0f} mm | "
+                         f"flat area {flat_box[1] * 1000:.0f}-{flat_box[3] * 1000:.0f} mm"
+                         + (f" | folded area {folded_box[1] * 1000:.0f}-{folded_box[3] * 1000:.0f} mm" if folded_box else ""))
 
-            cursor = height * lay["top_ratio"]
-            for i, (name, v) in enumerate(views):
-                o = self._get(v, "GetOutline")
-                h = o[3] - o[1]
-                self._move_view(v, width * lay["center_x_ratio"], cursor - h / 2.0)
-                cursor -= h + (gaps[i] if i < len(gaps) else 0)
+            limits = {}
+            if folded:
+                sizes = [self._size_at_unit_scale(v) for _, v in folded]
+                limits["folded"] = min((f_in[2] - f_in[0]) / max(w for w, _ in sizes),
+                                       (f_in[3] - f_in[1] - vgap * (len(folded) - 1)) / sum(h for _, h in sizes))
+            fw, fh = self._size_at_unit_scale(flat_view)
+            limits["flat"] = min((b_in[2] - b_in[0]) / fw, (b_in[3] - b_in[1]) / fh)
 
-            scale_txt = f"1:{1 / chosen:.0f}" if chosen < 1 else f"{chosen:g}:1"
-            steps.append(f"layout: {[n for n, _ in views]} at scale {scale_txt}")
+            if lay["common_scale"]:
+                common = self._fit_scale(min(limits.values()))
+                scales = {k: common for k in limits}
+            else:
+                scales = {k: self._fit_scale(v) for k, v in limits.items()}
+
+            for _, v in folded:
+                v.ScaleDecimal = scales["folded"]
+            flat_view.ScaleDecimal = scales["flat"]
+
+            if folded:
+                heights = []
+                for _, v in folded:
+                    o = self._get(v, "GetOutline")
+                    heights.append(o[3] - o[1])
+                total = sum(heights) + vgap * (len(folded) - 1)
+                cursor = (f_in[1] + f_in[3]) / 2.0 + total / 2.0
+                for (_, v), h in zip(folded, heights):
+                    self._move_view(v, (f_in[0] + f_in[2]) / 2.0, cursor - h / 2.0)
+                    cursor -= h + vgap
+            self._move_view(flat_view, (b_in[0] + b_in[2]) / 2.0, (b_in[1] + b_in[3]) / 2.0)
+
+            txt = ", ".join(f"{k} {self._scale_text(v)}" for k, v in scales.items())
+            steps.append(f"layout scales: {txt}")
+            return scales["flat"]
         except Exception as exc:
             steps.append(f"layout failed: {exc}")
+            return None
+
+    def _set_sheet_scale(self, drawing, scale, steps):
+        """Title block 'SCALE' field = scale of the flat pattern (as in the PDF version)."""
+        text = self._scale_text(scale)
+        num, den = (1.0, float(round(1 / scale))) if scale < 1 else (float(round(scale)), 1.0)
+        try:
+            sheet = self._get(drawing, "GetCurrentSheet")
+            sheet.SetScale(num, den, False, False)      # False, False = do not rescale the views
+            steps.append(f"sheet scale set to {text}")
+        except Exception as exc:
+            steps.append(f"sheet scale not set ({exc})")
+        try:
+            drawing.Extension.CustomPropertyManager("").Add3("Scale", 30, text, 2)
+        except Exception:
+            pass
 
     # ---------------- overall dimensions ----------------
     def _view_vertices(self, view):
@@ -468,12 +530,19 @@ class SwDrawingExporter:
             steps.append(f"dimensions {label} failed at '{stage}': {exc}")
 
     # ---------------- QTY note ----------------
-    def _add_qty_note(self, drawing, item, steps):
+    def _add_qty_note(self, drawing, item, steps, table_bottom=None, row_h=None):
+        qty = item.get("quantity", 1)
         try:
-            note = drawing.InsertNote(f"QTY={item.get('quantity', 1)}")
+            x = (self.qty_note_x_mm if self.qty_note_x_mm is not None else self.layout["margin_mm"] + 12) / 1000.0
+            if self.qty_note_y_mm is not None:
+                y = self.qty_note_y_mm / 1000.0
+            else:
+                base = table_bottom if table_bottom is not None else self.bend_table_bottom_mm / 1000.0
+                y = base + 1.2 * (row_h or 0.007)
+            note = drawing.InsertNote(f"QTY={qty}")
             annotation = self._get(note, "GetAnnotation")
-            annotation.SetPosition2(self.qty_note_x_mm / 1000.0, self.qty_note_y_mm / 1000.0, 0.0)
-            steps.append(f"QTY note added: QTY={item.get('quantity', 1)}")
+            annotation.SetPosition2(x, y, 0.0)
+            steps.append(f"QTY note added: QTY={qty}")
         except Exception as exc:
             steps.append(f"QTY note failed: {exc}")
 
@@ -589,7 +658,7 @@ class SwDrawingExporter:
         table = self._insert_table_once(view, width * 0.1, height * 0.5, steps)   # inside the sheet first
         if table is None:
             steps.append("bend table NOT created")
-            return
+            return None
         try:
             # with a bend table present the bend notes of the flat pattern show the TAG (A, B, C...)
             view.ShowSheetMetalBendNotes = True
@@ -602,7 +671,9 @@ class SwDrawingExporter:
 
         table_w, table_h = self._table_size(grid, steps)
         left = width - self.bend_table_right_margin_mm / 1000.0 - table_w
-        top = self.bend_table_bottom_mm / 1000.0 + table_h
+        bottom = (self.bend_table_bottom_mm + self.layout["table_gap_mm"]) / 1000.0
+        top = bottom + table_h
+        rows = max(int(self._get(grid, "RowCount") or 1), 1)
         steps.append(f"bend table size {table_w * 1000:.0f} x {table_h * 1000:.0f} mm")
 
         if not self._move_table(grid, left, top, steps):
@@ -616,6 +687,7 @@ class SwDrawingExporter:
                     self._move_table(grid, left, top, steps)
             else:
                 steps.append("bend table could not be moved or deleted - check its position manually")
+        return bottom, top, table_h / rows
 
     # ---------------- public ----------------
     def export_part(self, item, slddrw_path):
@@ -727,7 +799,19 @@ class SwDrawingExporter:
                 steps.append(f"folded views: {[n for n, _ in views]}")
             views.append(("flat", flat_view))
 
-            self._layout_views(drawing, views, steps)
+            # ---- bend table first: its top edge defines the free area for the views ----
+            table_info = None
+            table_top = (self.bend_table_bottom_mm + self.layout["table_gap_mm"]) / 1000.0
+            if self.insert_bend_table:
+                table_info = self._insert_bend_table(drawing, flat_view, steps)
+                if table_info:
+                    table_top = table_info[1]
+
+            # ---- views fitted into the A4 areas ----
+            folded = [(n, v) for n, v in views if n != "flat"]
+            flat_scale = self._layout_views(drawing, folded, flat_view, table_top, steps)
+            if flat_scale:
+                self._set_sheet_scale(drawing, flat_scale, steps)
 
             # ---- dimensions ----
             if self.add_dimensions:
@@ -740,10 +824,9 @@ class SwDrawingExporter:
                         self._add_overall_dimensions(drawing, v, steps, "flat", True, True, "left")
 
             if self.add_qty_note:
-                self._add_qty_note(drawing, item, steps)
-
-            if self.insert_bend_table:
-                self._insert_bend_table(drawing, flat_view, steps)
+                self._add_qty_note(drawing, item, steps,
+                                   table_bottom=table_info[0] if table_info else None,
+                                   row_h=table_info[2] if table_info else None)
 
             try:
                 drawing.ForceRebuild3(False)      # refresh linked title block fields
