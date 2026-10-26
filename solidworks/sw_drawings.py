@@ -87,6 +87,8 @@ class SwDrawingExporter:
             return default
         try:
             value = getattr(obj, name)
+            if hasattr(value, "_oleobj_"):      # a COM object (view, sheet, annotation...) must NOT be called
+                return value
             return value() if callable(value) else value
         except Exception:
             return default
@@ -164,6 +166,17 @@ class SwDrawingExporter:
                 return current
             current = self._get(current, "GetNextFeature")
         return None
+
+    def _describe_flat(self, flat):
+        return (f"flat feature: {self._get(flat, 'Name')} ({self._get(flat, 'GetTypeName2')}), "
+                f"suppressed={self._get(flat, 'IsSuppressed')}")
+
+    def _flat_error_code(self, flat):
+        try:
+            warning = VARIANT(pythoncom.VT_BYREF | pythoncom.VT_BOOL, False)
+            return f"flat feature error code: {flat.GetErrorCode2(warning)} (warning={warning.value})"
+        except Exception as exc:
+            return f"flat feature error code unavailable ({exc})"
 
     def _sheet_size(self, drawing):
         sheet = self._get(drawing, "GetCurrentSheet")
@@ -622,10 +635,25 @@ class SwDrawingExporter:
             steps.append(f"bend table size estimated ({exc})")
             return 0.070, 0.0072 * max(rows, 1)
 
-    def _move_table(self, grid, left, top, steps):
+    def _annotation_of(self, grid, view=None):
+        annotation = self._get(grid, "GetAnnotation")
+        if annotation is not None:
+            return annotation
+        if view is not None:                                  # fallback: the tables of the view
+            tables = self._get(view, "GetTableAnnotations")
+            for table in reversed(list(tables or ())):
+                annotation = self._get(table, "GetAnnotation")
+                if annotation is not None:
+                    return annotation
+        return None
+
+    def _move_table(self, grid, left, top, steps, view=None):
         """SetPosition2 = top-left corner. Returns True when the table really is at the target."""
         try:
-            annotation = self._get(grid, "GetAnnotation")
+            annotation = self._annotation_of(grid, view)
+            if annotation is None:
+                steps.append("bend table: annotation object not found")
+                return False
             before = self._get(annotation, "GetPosition")
             annotation.SetPosition2(left, top, 0.0)
             after = self._get(annotation, "GetPosition")
@@ -637,10 +665,10 @@ class SwDrawingExporter:
             steps.append(f"bend table not moved: {exc}")
             return False
 
-    def _delete_table(self, drawing, grid):
+    def _delete_table(self, drawing, grid, view=None):
         try:
             nothing = VARIANT(pythoncom.VT_DISPATCH, None)
-            annotation = self._get(grid, "GetAnnotation")
+            annotation = self._annotation_of(grid, view)
             drawing.ClearSelection2(True)
             if annotation is not None and annotation.Select3(False, nothing):
                 drawing.Extension.DeleteSelection2(6)
@@ -676,15 +704,15 @@ class SwDrawingExporter:
         rows = max(int(self._get(grid, "RowCount") or 1), 1)
         steps.append(f"bend table size {table_w * 1000:.0f} x {table_h * 1000:.0f} mm")
 
-        if not self._move_table(grid, left, top, steps):
+        if not self._move_table(grid, left, top, steps, view):
             # moving did not work: delete it and insert again directly at the final position
-            if self._delete_table(drawing, grid):
+            if self._delete_table(drawing, grid, view):
                 steps.append("bend table re-inserted at the final position")
                 table = self._insert_table_once(view, left, top, steps)
                 if table is not None:
                     grid = self._table_grid(table, steps)
                     self._clean_columns(grid, steps)
-                    self._move_table(grid, left, top, steps)
+                    self._move_table(grid, left, top, steps, view)
             else:
                 steps.append("bend table could not be moved or deleted - check its position manually")
         return bottom, top, table_h / rows
@@ -752,6 +780,7 @@ class SwDrawingExporter:
             flat = self._find_flat_pattern(model)
             if flat is None:
                 return False, "Flat-Pattern feature not found", steps
+            steps.append(self._describe_flat(flat))
 
             shutil.copyfile(self.master_drawing, slddrw_path)
             steps.append(f"master copied: {self.master_drawing.name}")
@@ -785,6 +814,8 @@ class SwDrawingExporter:
                 flat_view, method = self._create_flat_view(drawing, model_path, active_cfg,
                                                            width / 2, height / 3, steps, rounds=2)
             if flat_view is None:
+                steps.append(self._describe_flat(flat))
+                steps.append(self._flat_error_code(flat))
                 return False, "could not create the flat pattern view", steps
             steps.append(f"flat view created ({method})")
 
