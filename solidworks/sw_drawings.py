@@ -416,8 +416,6 @@ class SwDrawingExporter:
             else:
                 folded_box, flat_box = None, (left, low, right, high)
 
-            # keep room only on the sides where dimension lines are drawn:
-            #   Top/Front: above + right      Flat pattern: above + left
             f_in = (folded_box[0], folded_box[1], folded_box[2] - dim, folded_box[3] - dim) if folded_box else None
             bend_pad = lay.get("bend_dim_pad_mm", 18) * mm if self.add_bend_dimensions else 0.0
             b_in = (flat_box[0] + dim, flat_box[1] + bend_pad, flat_box[2], flat_box[3] - dim)
@@ -589,11 +587,7 @@ class SwDrawingExporter:
 
     # ---------------- bend dimensions ----------------
     def _view_edges(self, view, steps=None):
-        """Return visible edge entities, tolerating pywin32 SAFEARRAY/tuple variants.
-
-        swViewEntityType_e: Edge=1, SilhouetteEdge=3. Some SolidWorks versions
-        return a tuple/SAFEARRAY wrapper, so don't assume entities[0] is the edge.
-        """
+        """Return visible edge entities, tolerating pywin32 SAFEARRAY/tuple variants."""
         nothing = VARIANT(pythoncom.VT_DISPATCH, None)
         found = []
         diagnostics = []
@@ -601,7 +595,6 @@ class SwDrawingExporter:
         def as_items(value):
             if value is None:
                 return []
-            # Some COM wrappers return (SAFEARRAY, status) instead of the array.
             if isinstance(value, tuple) and len(value) == 2 and isinstance(value[1], (bool, int)):
                 value = value[0]
             try:
@@ -619,12 +612,10 @@ class SwDrawingExporter:
                     return True
             except Exception:
                 pass
-            # Fallback for wrappers exposing only curve/start/end point methods.
             return (self._get(obj, "GetCurve") is not None and
                     (self._get(obj, "GetStartPoint2") is not None or
                      self._get(obj, "GetEndPoint2") is not None))
 
-        # Edge and silhouette-edge collections are the only relevant types here.
         for entity_type in (1, 3):
             try:
                 raw = view.GetVisibleEntities2(nothing, entity_type)
@@ -641,11 +632,10 @@ class SwDrawingExporter:
         return found
 
     def _make_mapper(self, view, steps):
-        """model space -> view space. Uses SolidWorks' MathUtility; if that fails, the transform matrix."""
         transform = self._get(view, "ModelToViewTransform")
         if transform is None:
             raise RuntimeError("ModelToViewTransform not available")
-        math_util = self._get(self.sw_app, "GetMathUtility")        # an object, not a function call
+        math_util = self._get(self.sw_app, "GetMathUtility")
         if math_util is not None:
             def com_map(xyz, via=None):
                 mp = math_util.CreatePoint(VARIANT(pythoncom.VT_ARRAY | pythoncom.VT_R8,
@@ -668,12 +658,6 @@ class SwDrawingExporter:
         state = {"transpose": False, "k": d[12] or 1.0}
 
         def apply_transform(xyz, xform, transpose=None, scale_override=None):
-            """Apply a SolidWorks MathTransform matrix, including translation.
-
-            The same ArrayData orientation selected from ModelToViewTransform is used
-            for chained sketch transforms as well; mixing conventions here can move
-            bend segments outside the drawing-view bounds.
-            """
             if xform is None:
                 return tuple(float(v) for v in xyz)
             arr = self._get(xform, "ArrayData")
@@ -691,9 +675,6 @@ class SwDrawingExporter:
                     sc * (rr[2][0]*x + rr[2][1]*y + rr[2][2]*z) + a[11])
 
         def mat_map(xyz, via=None):
-            # Bend-line endpoints may be in sketch space. Convert sketch -> model
-            # first, then model -> view. Previously this path always raised and
-            # caused every bend line to be discarded when MathUtility was unavailable.
             model_xyz = apply_transform(xyz, via) if via is not None else tuple(float(v) for v in xyz)
             x, y, z = model_xyz
             r = rows if not state["transpose"] else [[rows[j][i] for j in range(3)] for i in range(3)]
@@ -704,8 +685,6 @@ class SwDrawingExporter:
         return mat_map, "matrix"
 
     def _view_mapper(self, view, steps, verbose=False):
-        """Function xyz -> (x, y) in SHEET coordinates, calibrated against the view's outline.
-        .vb = bounding box of the view's vertices in sheet coordinates."""
         to_view, kind = self._make_mapper(view, steps)
         points = [p for p in (self._get(v, "GetPoint") for v in self._view_vertices(view)) if p]
         if len(points) < 2:
@@ -717,7 +696,7 @@ class SwDrawingExporter:
             xy = [to_view(p) for p in points]
             return (min(x for x, _ in xy), min(y for _, y in xy), max(x for x, _ in xy), max(y for _, y in xy))
 
-        if kind == "matrix":                         # choose the matrix convention and the scale by the outline
+        if kind == "matrix":
             state, best = to_view.state, None
             for transpose in (False, True):
                 state["transpose"], state["k"] = transpose, 1.0
@@ -751,7 +730,7 @@ class SwDrawingExporter:
 
     def _add_bend_dimensions(self, drawing, view, scale, limit_bottom, steps):
         """One dimension per bend: from the bend line to the nearest outer edge of the flat pattern.
-        Sorted by value (largest first by default) and stacked on separate levels so numbers never overlap."""
+        Sorted and filtered to prevent duplicate or opposing bend-to-bend dimensions."""
         stage = "bend lines"
         try:
             lines = list(self._get(view, "GetBendLines") or ())
@@ -760,7 +739,6 @@ class SwDrawingExporter:
                 return
             scale = float(scale or self._get(view, "ScaleDecimal"))
 
-            # ---- geometry in sheet coordinates ----
             stage = "geometry"
             to_sheet = self._view_mapper(view, steps, verbose=True)
             vb = to_sheet.vb
@@ -778,8 +756,6 @@ class SwDrawingExporter:
                 ev = self._get(e, "GetEndVertex")
                 p = self._get(sv, "GetPoint") if sv is not None else None
                 q = self._get(ev, "GetPoint") if ev is not None else None
-                # Point2 endpoints are a fallback for edge wrappers that do not
-                # expose IVertex objects consistently through pywin32.
                 if p is None or q is None:
                     p = self._get(e, "GetStartPoint2")
                     q = self._get(e, "GetEndPoint2")
@@ -798,7 +774,7 @@ class SwDrawingExporter:
             for i, seg in enumerate(lines):
                 pts = self._segment_xyz(seg)
                 candidates = [[to_sheet(pt) for pt in pts]]
-                try:                                                    # sketch space -> model space
+                try:
                     sketch = self._get(seg, "GetSketch")
                     model_to_sketch = self._get(sketch, "ModelToSketchTransform") if sketch is not None else None
                     inv = self._get(model_to_sketch, "Inverse") if model_to_sketch is not None else None
@@ -806,12 +782,8 @@ class SwDrawingExporter:
                         candidates.append([to_sheet(pt, via=inv) for pt in pts])
                 except Exception as exc:
                     steps.append(f"bend line {i}: sketch transform fallback failed ({exc})")
+                
                 found = None
-                # Bend-line endpoints may extend a little beyond the model-vertex
-                # bbox returned by GetVertices (for example, where a bend terminates
-                # at the sheet boundary). Requiring BOTH endpoints to be inside that
-                # bbox incorrectly rejects valid lines. Prefer candidates whose
-                # midpoint is near the view bbox and whose segment overlaps it.
                 view_w = max(vb[2] - vb[0], 1e-9)
                 view_h = max(vb[3] - vb[1], 1e-9)
                 endpoint_margin = max(tol, 0.15 * max(view_w, view_h))
@@ -824,36 +796,17 @@ class SwDrawingExporter:
                                         min(x1, x2) <= vb[2] + endpoint_margin and
                                         max(y1, y2) >= vb[1] - endpoint_margin and
                                         min(y1, y2) <= vb[3] + endpoint_margin)
-                    # Avoid accepting wildly transformed or degenerate geometry.
                     seg_len = math.hypot(x2 - x1, y2 - y1)
                     plausible_len = seg_len <= 1.5 * math.hypot(view_w, view_h) and seg_len > 1e-7
                     if midpoint_near and segment_overlaps and plausible_len:
                         found = cand
-                        if k > 0:
-                            steps.append(f"bend line {i}: accepted sketch-to-model candidate")
-                        else:
-                            steps.append(f"bend line {i}: accepted near-view candidate (endpoint margin {endpoint_margin:.6f} m)")
                         break
-                if found is None:
-                    # Keep a useful diagnostic: distinguishes a coordinate-space problem
-                    # from a genuinely missing/invalid bend segment.
-                    try:
-                        raw_box = (min(p[0] for p in pts), min(p[1] for p in pts),
-                                   max(p[0] for p in pts), max(p[1] for p in pts))
-                        cand_boxes = []
-                        for cand in candidates:
-                            cand_boxes.append((round(min(p[0] for p in cand), 6),
-                                               round(min(p[1] for p in cand), 6),
-                                               round(max(p[0] for p in cand), 6),
-                                               round(max(p[1] for p in cand), 6)))
-                        steps.append(f"bend line {i}: outside view bounds; raw={tuple(round(v,6) for v in raw_box)}, candidates={cand_boxes}, view={tuple(round(v,6) for v in vb)}")
-                    except Exception:
-                        steps.append(f"bend line {i}: position does not match the view - skipped")
-                    continue
-                bends.append((seg, found))
+                if found is not None:
+                    bends.append((seg, found))
 
             stage = "distances"
             items = []
+            seen_dimensions = set()  # جلوگیری از ایجاد اندازه‌های تکراری
             for seg, (A, B) in bends:
                 dx, dy = B[0] - A[0], B[1] - A[1]
                 length = math.hypot(dx, dy)
@@ -862,39 +815,31 @@ class SwDrawingExporter:
                 ux, uy = dx / length, dy / length
                 nx, ny = -uy, ux
                 s0 = nx * A[0] + ny * A[1]
-                # Only compare edges whose projection along the bend direction
-                # overlaps the bend segment. Otherwise a distant, unrelated edge
-                # (or another bend line) can be selected and produce dimensions
-                # such as 2064 mm instead of the edge setback.
                 bend_t0 = min(A[0] * ux + A[1] * uy, B[0] * ux + B[1] * uy)
                 bend_t1 = max(A[0] * ux + A[1] * uy, B[0] * ux + B[1] * uy)
                 span_tol = max(0.001, 0.01 * length)
                 pos_candidates = []
                 neg_candidates = []
-                # Define the actual outside boundary from the flat-pattern view's
-                # vertex bounding box. Bend lines and inner edges may also be parallel,
-                # so parallelism alone is not enough to qualify an edge as the sheet edge.
+                
                 corners = ((vb[0], vb[1]), (vb[0], vb[3]),
                            (vb[2], vb[1]), (vb[2], vb[3]))
                 normal_limits = [nx * x + ny * y for x, y in corners]
                 n_min, n_max = min(normal_limits), max(normal_limits)
                 boundary_tol = max(0.0015, 0.02 * max(vb[2] - vb[0], vb[3] - vb[1]))
+
                 for p, q, e in edges:
                     ex, ey = q[0] - p[0], q[1] - p[1]
                     le = math.hypot(ex, ey)
                     if le < 1e-6 or abs(ux * ey - uy * ex) / le > 0.01:
-                        continue  # only edges parallel to the bend line
+                        continue
                     edge_t0 = min(p[0] * ux + p[1] * uy, q[0] * ux + q[1] * uy)
                     edge_t1 = max(p[0] * ux + p[1] * uy, q[0] * ux + q[1] * uy)
                     if edge_t1 < bend_t0 - span_tol or edge_t0 > bend_t1 + span_tol:
-                        continue  # edge does not lie alongside this bend segment
+                        continue
                     edge_s = nx * p[0] + ny * p[1]
                     delta = edge_s - s0
                     if abs(delta) < 1e-4:
-                        continue  # the bend line itself
-                    # Keep only edges that lie on the outer silhouette side of the
-                    # view bbox. This excludes the other parallel bend line and inner
-                    # parallel edges, which caused incorrect bend-to-bend dimensions.
+                        continue
                     at_outer_boundary = (abs(edge_s - n_min) <= boundary_tol or
                                          abs(edge_s - n_max) <= boundary_tol)
                     if not at_outer_boundary:
@@ -904,28 +849,30 @@ class SwDrawingExporter:
                     else:
                         neg_candidates.append((-delta, e, -1.0))
 
-                # Each side now contains only parallel edges on the outer silhouette.
-                # Select the nearest valid outer side to this bend line.
                 pos = min(pos_candidates, key=lambda o: o[0]) if pos_candidates else None
                 neg = min(neg_candidates, key=lambda o: o[0]) if neg_candidates else None
                 options = [o for o in (pos, neg) if o]
                 if not options:
-                    steps.append("bend line has no overlapping outer-edge candidate - skipped")
                     continue
                 dist, edge, sign = min(options, key=lambda o: o[0])
+                
+                # فیلتر مقادیر تکراری بر اساس رند کردن فاصله
+                rounded_val = round(dist / scale * 1000.0, 1)
+                mid_coord = round((A[0] + B[0]) / 2.0, 4) if abs(nx) >= abs(ny) else round((A[1] + B[1]) / 2.0, 4)
+                dim_signature = (rounded_val, mid_coord)
+                if dim_signature in seen_dimensions:
+                    continue
+                seen_dimensions.add(dim_signature)
+
                 tx, ty = A[0] + sign * dist * nx, A[1] + sign * dist * ny
                 if abs(nx) >= abs(ny):
                     group, lo, hi = "h", min(A[0], tx), max(A[0], tx)
                 else:
                     group, lo, hi = "v", min(A[1], ty), max(A[1], ty)
                 items.append({"seg": seg, "edge": edge, "group": group, "lo": lo, "hi": hi,
-                              "mid": (lo + hi) / 2.0, "value": dist / scale * 1000.0})
+                              "mid": (lo + hi) / 2.0, "value": rounded_val})
 
-            # ---- order + levels (no overlapping numbers) ----
             stage = "levels"
-            # The supplied FlatPatternView logic places the smallest dimension nearest the
-            # geometry and progressively larger dimensions farther out, reducing visual clutter.
-            # "largest_first" retains the requested value priority for the outer rows.
             items.sort(key=lambda it: it["value"], reverse=(self.bend_dim_order == "smallest_first"))
             tw = self.bend_dim_text_width_mm / 1000.0
             gap = 0.001
@@ -939,7 +886,6 @@ class SwDrawingExporter:
                     it["level"] = level
                     placed.append((level, lo, hi))
 
-            # ---- create the dimensions ----
             stage = "dimensions"
             start = self.bend_dim_offset_mm / 1000.0
             step = self.bend_dim_step_mm / 1000.0
@@ -952,12 +898,12 @@ class SwDrawingExporter:
 
             created, too_low = 0, False
             for it in items:
-                if it["group"] == "h":                       # measured along x -> stacked BELOW the view
+                if it["group"] == "h":
                     px, py = it["mid"], outline[1] - start - it["level"] * step
                     too_low = too_low or py < limit_bottom
-                else:                                        # measured along y -> stacked at the RIGHT
+                else:
                     px, py = outline[2] + start + it["level"] * step, it["mid"]
-                    if px > width - self.layout["margin_mm"] / 1000.0:       # no room: use the left side
+                    if px > width - self.layout["margin_mm"] / 1000.0:
                         px = outline[0] - start - 0.010 - it["level"] * step
                 drawing.ClearSelection2(True)
                 ok1, _ = self._select_vertex(view, it["seg"], False, sel)
@@ -1040,7 +986,7 @@ class SwDrawingExporter:
         try:
             cols = int(self._get(grid, "ColumnCount"))
             headers = [self._cell(grid, 0, c) for c in range(cols)]
-            if len(set(headers)) == 1 and cols > 1:           # row 0 is a merged title row
+            if len(set(headers)) == 1 and cols > 1:
                 headers = [self._cell(grid, 1, c) for c in range(cols)]
             steps.append(f"bend table columns: {headers}")
             removed = []
@@ -1070,7 +1016,7 @@ class SwDrawingExporter:
         annotation = self._get(grid, "GetAnnotation")
         if annotation is not None:
             return annotation
-        if view is not None:                                  # fallback: the tables of the view
+        if view is not None:
             tables = self._get(view, "GetTableAnnotations")
             for table in reversed(list(tables or ())):
                 annotation = self._get(table, "GetAnnotation")
@@ -1079,7 +1025,6 @@ class SwDrawingExporter:
         return None
 
     def _move_table(self, grid, left, top, steps, view=None):
-        """SetPosition2 = top-left corner. Returns True when the table really is at the target."""
         try:
             annotation = self._annotation_of(grid, view)
             if annotation is None:
@@ -1109,17 +1054,12 @@ class SwDrawingExporter:
         return False
 
     def _insert_bend_table(self, drawing, view, steps):
-        """Native bend table: every bend gets a letter tag on the flat pattern (A, B, C...)
-        and the same tag is listed in the table (Tag / Direction / Angle / Inner Radius).
-        The table ends up in the bottom-right corner, right above the title block."""
         width, height = self._sheet_size(drawing)
-
-        table = self._insert_table_once(view, width * 0.1, height * 0.5, steps)   # inside the sheet first
+        table = self._insert_table_once(view, width * 0.1, height * 0.5, steps)
         if table is None:
             steps.append("bend table NOT created")
             return None
         try:
-            # with a bend table present the bend notes of the flat pattern show the TAG (A, B, C...)
             view.ShowSheetMetalBendNotes = True
             steps.append(f"bend notes (tags) on view: {self._get(view, 'ShowSheetMetalBendNotes')}")
         except Exception as exc:
@@ -1136,7 +1076,6 @@ class SwDrawingExporter:
         steps.append(f"bend table size {table_w * 1000:.0f} x {table_h * 1000:.0f} mm")
 
         if not self._move_table(grid, left, top, steps, view):
-            # moving did not work: delete it and insert again directly at the final position
             if self._delete_table(drawing, grid, view):
                 steps.append("bend table re-inserted at the final position")
                 table = self._insert_table_once(view, left, top, steps)
@@ -1150,7 +1089,6 @@ class SwDrawingExporter:
 
     # ---------------- public ----------------
     def export_part(self, item, slddrw_path):
-        """Returns (ok, message, steps)."""
         ok, message, steps = self._export_once(item, slddrw_path)
         if not ok and self._is_connection_error(message):
             steps.append("connection lost -> reconnecting and retrying once")
@@ -1160,7 +1098,7 @@ class SwDrawingExporter:
                 steps += steps2
         if not ok:
             try:
-                Path(slddrw_path).unlink(missing_ok=True)   # do not leave a master copy without views
+                Path(slddrw_path).unlink(missing_ok=True)
             except Exception:
                 pass
         return ok, message, steps
@@ -1219,7 +1157,7 @@ class SwDrawingExporter:
             if drawing is None:
                 return False, "could not open the copied master drawing", steps
 
-            self._apply_sheet_format(drawing, item, steps)      # Edit Sheet Format -> back to sheet
+            self._apply_sheet_format(drawing, item, steps)
             self._remove_existing_views(drawing, steps)
 
             width, height = self._sheet_size(drawing)
@@ -1235,7 +1173,7 @@ class SwDrawingExporter:
             flat_view, method = self._create_flat_view(drawing, model_path, active_cfg,
                                                        width / 2, height / 3, steps, rounds=1)
             if flat_view is None and bool(self._get(flat, "IsSuppressed", False)):
-                try:                                              # second chance: unsuppress the flat pattern
+                try:
                     flat.SetSuppression2(SW_UNSUPPRESS, SW_THIS_CONFIGURATION, None)
                     unsuppressed_by_us = True
                     model.ForceRebuild3(True)
@@ -1261,7 +1199,6 @@ class SwDrawingExporter:
                 steps.append(f"folded views: {[n for n, _ in views]}")
             views.append(("flat", flat_view))
 
-            # ---- bend table first: its top edge defines the free area for the views ----
             table_info = None
             table_top = (self.bend_table_bottom_mm + self.layout["table_gap_mm"]) / 1000.0
             if self.insert_bend_table:
@@ -1269,19 +1206,16 @@ class SwDrawingExporter:
                 if table_info:
                     table_top = table_info[1]
 
-            # ---- views fitted into the A4 areas ----
             folded = [(n, v) for n, v in views if n != "flat"]
             flat_scale = self._layout_views(drawing, folded, flat_view, table_top, steps)
             if flat_scale:
                 self._set_sheet_scale(drawing, flat_scale, steps)
 
-            # ---- dimensions ----
             if self.add_dimensions:
                 for name, v in views:
                     if name == "top":
                         self._add_overall_dimensions(drawing, v, steps, "top", True, True, "right")
                     elif name == "front":
-                        # Front view also receives both overall dimensions (horizontal + vertical).
                         self._add_overall_dimensions(drawing, v, steps, "front", True, True, "right")
                     else:
                         self._add_overall_dimensions(drawing, v, steps, "flat", True, True, "left")
@@ -1295,7 +1229,7 @@ class SwDrawingExporter:
                                    row_h=table_info[2] if table_info else None)
 
             try:
-                drawing.ForceRebuild3(False)      # refresh linked title block fields
+                drawing.ForceRebuild3(False)
             except Exception:
                 pass
 
@@ -1308,7 +1242,6 @@ class SwDrawingExporter:
         except Exception as exc:
             return False, f"{type(exc).__name__}: {exc}", steps
         finally:
-            # close the drawing first, then restore and close the part
             self._close_doc(drawing)
             if flat is not None and unsuppressed_by_us:
                 try:
