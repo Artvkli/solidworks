@@ -750,150 +750,86 @@ class SwDrawingExporter:
         return points
 
     def _add_bend_dimensions(self, drawing, view, scale, limit_bottom, steps):
-        """One dimension per bend: from the bend line to the nearest outer edge of the flat pattern.
-        Sorted by value (largest first by default) and stacked on separate levels so numbers never overlap."""
+        """One dimension per bend tag: bend line -> OUTERMOST parallel edge (the nearer of the two outer
+        boundaries). The bend line's position is not needed - only its direction. The real distance is
+        read from SolidWorks itself, so the value is always correct."""
         stage = "bend lines"
         try:
             lines = list(self._get(view, "GetBendLines") or ())
             steps.append(f"bend lines in the flat pattern view: {len(lines)}")
             if not lines:
                 return
-            scale = float(scale or self._get(view, "ScaleDecimal"))
 
-            # ---- geometry in sheet coordinates ----
             stage = "geometry"
             to_sheet = self._view_mapper(view, steps, verbose=True)
-            vb = to_sheet.vb
             outline = self._get(view, "GetOutline")
-            tol = 0.02 * max(vb[2] - vb[0], vb[3] - vb[1])
 
+            # ---- straight edges, split by direction on the sheet ----
             stage = "edges"
-            edges = []
+            edges_v, edges_h = [], []            # (position, length, edge)
             for e in self._view_edges(view, steps):
                 curve = self._get(e, "GetCurve")
-                is_line = self._get(curve, "IsLine") if curve is not None else None
-                if is_line is False:
+                if curve is not None and self._get(curve, "IsLine") is False:
                     continue
-                sv = self._get(e, "GetStartVertex")
-                ev = self._get(e, "GetEndVertex")
+                sv, ev = self._get(e, "GetStartVertex"), self._get(e, "GetEndVertex")
                 p = self._get(sv, "GetPoint") if sv is not None else None
                 q = self._get(ev, "GetPoint") if ev is not None else None
-                # Point2 endpoints are a fallback for edge wrappers that do not
-                # expose IVertex objects consistently through pywin32.
                 if p is None or q is None:
-                    p = self._get(e, "GetStartPoint2")
-                    q = self._get(e, "GetEndPoint2")
+                    p, q = self._get(e, "GetStartPoint2"), self._get(e, "GetEndPoint2")
                 if p is None or q is None:
                     continue
                 try:
-                    p = tuple(float(p[i]) for i in range(3))
-                    q = tuple(float(q[i]) for i in range(3))
-                    edges.append((to_sheet(p), to_sheet(q), e))
+                    (x1, y1) = to_sheet(tuple(float(p[i]) for i in range(3)))
+                    (x2, y2) = to_sheet(tuple(float(q[i]) for i in range(3)))
                 except Exception:
                     continue
-            steps.append(f"straight edges used: {len(edges)}")
+                le = math.hypot(x2 - x1, y2 - y1)
+                if le < 1e-6:
+                    continue
+                if abs(x2 - x1) <= 0.01 * le:
+                    edges_v.append(((x1 + x2) / 2.0, le, e))
+                elif abs(y2 - y1) <= 0.01 * le:
+                    edges_h.append(((y1 + y2) / 2.0, le, e))
+            steps.append(f"straight edges: {len(edges_v)} vertical, {len(edges_h)} horizontal")
 
-            stage = "bend line positions"
-            bends = []
-            view_w = max(vb[2] - vb[0], 1e-9)
-            view_h = max(vb[3] - vb[1], 1e-9)
-            margin = 0.03 * max(view_w, view_h)       # tight: a bend line lies INSIDE the flat pattern
+            def outer_edges(items):
+                """The two outermost parallel edges (min and max position); the longest one at each extreme."""
+                if not items:
+                    return []
+                tol = 1e-4
+                lo, hi = min(i[0] for i in items), max(i[0] for i in items)
+                result = []
+                for target in ((lo,) if abs(hi - lo) <= tol else (lo, hi)):
+                    group = [i for i in items if abs(i[0] - target) <= tol]
+                    result.append(max(group, key=lambda i: i[1]))
+                return result
 
-            def inside(cand):
-                return all(vb[0] - margin <= x <= vb[2] + margin and
-                           vb[1] - margin <= y <= vb[3] + margin for x, y in cand)
+            outer = {"vertical": outer_edges(edges_v), "horizontal": outer_edges(edges_h)}
 
-            for i, seg in enumerate(lines):
+            def bend_direction(seg):
+                """'vertical' / 'horizontal' on the sheet (only the direction is used, not the position)."""
                 pts = self._segment_xyz(seg)
-                candidates = []
-                try:                                   # sketch space -> model space FIRST
+                tries = []
+                try:
                     sketch = self._get(seg, "GetSketch")
                     m2s = self._get(sketch, "ModelToSketchTransform") if sketch is not None else None
                     inv = self._get(m2s, "Inverse") if m2s is not None else None
                     if inv is not None:
-                        candidates.append(("sketch->model", [to_sheet(pt, via=inv) for pt in pts]))
-                except Exception as exc:
-                    steps.append(f"bend line {i}: sketch transform failed ({exc})")
-                try:
-                    candidates.append(("model", [to_sheet(pt) for pt in pts]))
+                        tries.append(lambda: [to_sheet(pt, via=inv) for pt in pts])
                 except Exception:
                     pass
+                tries.append(lambda: [to_sheet(pt) for pt in pts])
+                for t in tries:
+                    try:
+                        (x1, y1), (x2, y2) = t()
+                        dx, dy = x2 - x1, y2 - y1
+                        if math.hypot(dx, dy) > 1e-7:
+                            return "vertical" if abs(dy) >= abs(dx) else "horizontal"
+                    except Exception:
+                        continue
+                return None
 
-                found = None
-                for label, cand in candidates:
-                    (x1, y1), (x2, y2) = cand
-                    if inside(cand) and math.hypot(x2 - x1, y2 - y1) > 1e-7:
-                        found = cand
-                        steps.append(f"bend line {i}: using {label} coordinates")
-                        break
-                if found is None:
-                    steps.append(f"bend line {i}: not inside the view - skipped "
-                                 f"(candidates={[[tuple(round(v, 5) for v in p) for p in c] for _, c in candidates]}, "
-                                 f"view={tuple(round(v, 5) for v in vb)})")
-                    continue
-                bends.append((seg, found))
-
-            stage = "distances"
-            items = []
-            for seg, (A, B) in bends:
-                dx, dy = B[0] - A[0], B[1] - A[1]
-                length = math.hypot(dx, dy)
-                if length < 1e-6:
-                    continue
-                ux, uy = dx / length, dy / length
-                nx, ny = -uy, ux
-                s0 = nx * A[0] + ny * A[1]
-                pos = neg = None
-                ta, tb = sorted((ux * A[0] + uy * A[1], ux * B[0] + uy * B[1]))
-                pos = neg = None
-                for p, q, e in edges:
-                    le = math.hypot(q[0] - p[0], q[1] - p[1])
-                    if le < 1e-6 or abs(ux * (q[1] - p[1]) - uy * (q[0] - p[0])) / le > 0.01:
-                        continue                                        # not parallel to the bend line
-                    tp, tq = sorted((ux * p[0] + uy * p[1], ux * q[0] + uy * q[1]))
-                    if min(tq, tb) - max(tp, ta) <= 0:
-                        continue                                        # does not face the bend line
-                    delta = nx * p[0] + ny * p[1] - s0
-                    if abs(delta) < 1e-4:
-                        continue                                        # the bend line's own edge
-                    if delta > 0 and (pos is None or delta > pos[0]):   # outermost edge on each side
-                        pos = (delta, e, 1.0)
-                    if delta < 0 and (neg is None or -delta > neg[0]):
-                        neg = (-delta, e, -1.0)
-                    
-                options = [o for o in (pos, neg) if o]
-                if not options:
-                    steps.append("a bend line has no parallel edge - skipped")
-                    continue
-                    # of the two outer boundaries (one per side), use the nearer one
-                dist, edge, sign = min(options, key=lambda o: o[0])
-                tx, ty = A[0] + sign * dist * nx, A[1] + sign * dist * ny
-                if abs(nx) >= abs(ny):
-                    group, lo, hi = "h", min(A[0], tx), max(A[0], tx)
-                else:
-                    group, lo, hi = "v", min(A[1], ty), max(A[1], ty)
-                items.append({"seg": seg, "edge": edge, "group": group, "lo": lo, "hi": hi,
-                              "mid": (lo + hi) / 2.0, "value": dist / scale * 1000.0})
-
-            # ---- order + levels (no overlapping numbers) ----
-            stage = "levels"
-            # The supplied FlatPatternView logic places the smallest dimension nearest the
-            # geometry and progressively larger dimensions farther out, reducing visual clutter.
-            # "largest_first" retains the requested value priority for the outer rows.
-            items.sort(key=lambda it: it["value"], reverse=(self.bend_dim_order == "smallest_first"))
-            tw = self.bend_dim_text_width_mm / 1000.0
-            gap = 0.001
-            for group in ("h", "v"):
-                placed = []
-                for it in (i for i in items if i["group"] == group):
-                    lo, hi = min(it["lo"], it["mid"] - tw / 2.0), max(it["hi"], it["mid"] + tw / 2.0)
-                    level = 0
-                    while any(l == level and lo < h2 + gap and hi > l2 - gap for l, l2, h2 in placed):
-                        level += 1
-                    it["level"] = level
-                    placed.append((level, lo, hi))
-
-            # ---- create the dimensions ----
+            # ---- create one dimension per bend ----
             stage = "dimensions"
             start = self.bend_dim_offset_mm / 1000.0
             step = self.bend_dim_step_mm / 1000.0
@@ -904,36 +840,77 @@ class SwDrawingExporter:
             except Exception:
                 sel = VARIANT(pythoncom.VT_DISPATCH, None)
 
-            created, too_low, real = 0, False, []
-            for it in items:
-                if it["group"] == "h":                       # measured along x -> stacked BELOW the view
-                    px, py = it["mid"], outline[1] - start - it["level"] * step
-                    too_low = too_low or py < limit_bottom
-                else:                                        # measured along y -> stacked at the RIGHT
-                    px, py = outline[2] + start + it["level"] * step, it["mid"]
-                    if px > width - self.layout["margin_mm"] / 1000.0:       # no room: use the left side
-                        px = outline[0] - start - 0.010 - it["level"] * step
+            levels = {"vertical": 0, "horizontal": 0}
+            center_x = (outline[0] + outline[2]) / 2.0
+            center_y = (outline[1] + outline[3]) / 2.0
+            kept, too_low = [], False
+
+            for i, seg in enumerate(lines):
+                orient = bend_direction(seg)
+                if orient is None or not outer[orient]:
+                    steps.append(f"bend {i}: direction/outer edges not found - skipped")
+                    continue
+                level = levels[orient]
+                best = None                                   # (value, dim)
+                tried = []
+                for pos, _, edge in outer[orient]:
+                    if orient == "vertical":                  # measured along x -> text BELOW the view
+                        px = pos + (0.010 if pos < center_x else -0.010)
+                        py = outline[1] - start - level * step
+                    else:                                     # measured along y -> text at the RIGHT
+                        px = outline[2] + start + level * step
+                        if px > width - self.layout["margin_mm"] / 1000.0:
+                            px = outline[0] - start - 0.010 - level * step
+                        py = pos + (0.010 if pos < center_y else -0.010)
+                    drawing.ClearSelection2(True)
+                    ok1, _ = self._select_vertex(view, seg, False, sel)
+                    ok2, _ = self._select_vertex(view, edge, True, sel)
+                    dim = drawing.AddDimension2(px, py, 0.0) if (ok1 and ok2) else None
+                    if dim is None:
+                        tried.append(None)
+                        continue
+                    val = self._dim_value_mm(dim)
+                    tried.append(val)
+                    if best is None:
+                        best = (val, dim, py)
+                    elif val is not None and (best[0] is None or val < best[0]):
+                        self._delete_dimension(drawing, best[1])
+                        best = (val, dim, py)
+                    else:
+                        self._delete_dimension(drawing, dim)
                 drawing.ClearSelection2(True)
-                ok1, _ = self._select_vertex(view, it["seg"], False, sel)
-                ok2, _ = self._select_vertex(view, it["edge"], True, sel)
-                if ok1 and ok2:
-                    dim = drawing.AddDimension2(px, py, 0.0)
-                    if dim is not None:
-                        created += 1
-                        try:
-                            real.append(round(dim.GetDimension2(0).SystemValue * 1000.0, 2))
-                        except Exception:
-                            pass
-            drawing.ClearSelection2(True)
-            levels = {g: 1 + max([i["level"] for i in items if i["group"] == g] or [-1]) for g in ("h", "v")}
-            steps.append(f"bend dimensions: {created}/{len(items)} created, values "
-                         f"{[round(i['value'], 2) for i in items]}, levels {levels}"
-                         f"actual {real}")
+                if best is None:
+                    steps.append(f"bend {i} ({orient}): no dimension created, tried={tried}")
+                    continue
+                levels[orient] += 1
+                kept.append(best[0])
+                too_low = too_low or (orient == "vertical" and best[2] is not None and
+                                      outline[1] - start - level * step < limit_bottom)
+                steps.append(f"bend {i} ({orient}): candidates {tried} -> kept {best[0]}")
+
+            steps.append(f"bend dimensions: {len(kept)}/{len(lines)} created, actual {kept}")
             if too_low:
                 steps.append("warning: bend dimensions reach the bend table area - raise bend_dim_pad_mm")
         except Exception as exc:
             steps.append(f"bend dimensions failed at '{stage}': {exc}")
+    def _delete_dimension(self, drawing, dim):
+        try:
+            nothing = VARIANT(pythoncom.VT_DISPATCH, None)
+            annotation = self._get(dim, "GetAnnotation")
+            drawing.ClearSelection2(True)
+            if annotation is not None and annotation.Select3(False, nothing):
+                drawing.Extension.DeleteSelection2(6)
+                return True
+        except Exception:
+            pass
+        return False
 
+    @staticmethod
+    def _dim_value_mm(dim):
+        try:
+            return round(dim.GetDimension2(0).SystemValue * 1000.0, 2)
+        except Exception:
+            return None
     # ---------------- QTY note ----------------
     def _add_qty_note(self, drawing, item, steps, table_bottom=None, row_h=None):
         qty = item.get("quantity", 1)
