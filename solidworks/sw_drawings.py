@@ -53,7 +53,7 @@ class SwDrawingExporter:
                  bend_table_remove_words=(), bend_table_start_value="A",
                  add_dimensions=True, dimension_offset_mm=15,
                  add_qty_note=True, qty_note_x_mm=None, qty_note_y_mm=None,
-                 add_bend_dimensions=True, bend_dim_offset_mm=8, bend_dim_step_mm=7,
+                 add_bend_dimensions=False, bend_dim_offset_mm=8, bend_dim_step_mm=7,
                  bend_dim_text_width_mm=14, bend_dim_order="largest_first"):
         self.sw_app = sw_app
         self.assembly_path = Path(assembly_path).resolve() if assembly_path else None
@@ -871,6 +871,14 @@ class SwDrawingExporter:
                 span_tol = max(0.001, 0.01 * length)
                 pos_candidates = []
                 neg_candidates = []
+                # Define the actual outside boundary from the flat-pattern view's
+                # vertex bounding box. Bend lines and inner edges may also be parallel,
+                # so parallelism alone is not enough to qualify an edge as the sheet edge.
+                corners = ((vb[0], vb[1]), (vb[0], vb[3]),
+                           (vb[2], vb[1]), (vb[2], vb[3]))
+                normal_limits = [nx * x + ny * y for x, y in corners]
+                n_min, n_max = min(normal_limits), max(normal_limits)
+                boundary_tol = max(0.0015, 0.02 * max(vb[2] - vb[0], vb[3] - vb[1]))
                 for p, q, e in edges:
                     ex, ey = q[0] - p[0], q[1] - p[1]
                     le = math.hypot(ex, ey)
@@ -879,27 +887,27 @@ class SwDrawingExporter:
                     edge_t0 = min(p[0] * ux + p[1] * uy, q[0] * ux + q[1] * uy)
                     edge_t1 = max(p[0] * ux + p[1] * uy, q[0] * ux + q[1] * uy)
                     if edge_t1 < bend_t0 - span_tol or edge_t0 > bend_t1 + span_tol:
-                        continue  # edge does not overlap this bend along its length
+                        continue  # edge does not lie alongside this bend segment
                     edge_s = nx * p[0] + ny * p[1]
                     delta = edge_s - s0
                     if abs(delta) < 1e-4:
                         continue  # the bend line itself
-                    # For edges alongside this bend, the outer silhouette is the
-                    # farthest parallel edge on each normal side. First take that
-                    # extreme on each side (not the nearest parallel line, which may
-                    # be another bend); then compare the two outer sides.
+                    # Keep only edges that lie on the outer silhouette side of the
+                    # view bbox. This excludes the other parallel bend line and inner
+                    # parallel edges, which caused incorrect bend-to-bend dimensions.
+                    at_outer_boundary = (abs(edge_s - n_min) <= boundary_tol or
+                                         abs(edge_s - n_max) <= boundary_tol)
+                    if not at_outer_boundary:
+                        continue
                     if delta > 0:
                         pos_candidates.append((delta, e, 1.0))
                     else:
                         neg_candidates.append((-delta, e, -1.0))
 
-                pos = max(pos_candidates, key=lambda o: o[0]) if pos_candidates else None
-                neg = max(neg_candidates, key=lambda o: o[0]) if neg_candidates else None
-                if pos or neg:
-                    steps.append(
-                        f"bend edge candidates: +side={round(pos[0]*1000,2) if pos else None} mm, "
-                        f"-side={round(neg[0]*1000,2) if neg else None} mm (sheet coordinates)"
-                    )
+                # Each side now contains only parallel edges on the outer silhouette.
+                # Select the nearest valid outer side to this bend line.
+                pos = min(pos_candidates, key=lambda o: o[0]) if pos_candidates else None
+                neg = min(neg_candidates, key=lambda o: o[0]) if neg_candidates else None
                 options = [o for o in (pos, neg) if o]
                 if not options:
                     steps.append("bend line has no overlapping outer-edge candidate - skipped")

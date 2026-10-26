@@ -57,7 +57,7 @@ LAYOUT = {
 }
 
 # Bend dimensions: bend line -> nearest parallel outer edge.
-ADD_BEND_DIMENSIONS = True
+ADD_BEND_DIMENSIONS = False
 BEND_DIM_ORDER = "largest_first"  # largest dimensions are placed farther outward
 BEND_DIM_OFFSET_MM = 8
 BEND_DIM_STEP_MM = 7
