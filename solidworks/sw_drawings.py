@@ -93,12 +93,11 @@ class SwDrawingExporter:
 
     @staticmethod
     def _get(obj, name, default=None):
-        """Reads a property or calls a no-argument method (pywin32 exposes both styles)."""
         if obj is None:
             return default
         try:
             value = getattr(obj, name)
-            if hasattr(value, "_oleobj_"):      # a COM object (view, sheet, annotation...) must NOT be called
+            if hasattr(value, "_oleobj_"):
                 return value
             return value() if callable(value) else value
         except Exception:
@@ -191,7 +190,7 @@ class SwDrawingExporter:
 
     def _sheet_size(self, drawing):
         sheet = self._get(drawing, "GetCurrentSheet")
-        try:                                              # ISheet.GetSize(ref w, ref h)
+        try:
             w = VARIANT(pythoncom.VT_BYREF | pythoncom.VT_R8, 0.0)
             h = VARIANT(pythoncom.VT_BYREF | pythoncom.VT_R8, 0.0)
             sheet.GetSize(w, h)
@@ -209,11 +208,10 @@ class SwDrawingExporter:
 
     # ---------------- sheet format ----------------
     def _replace_sheet_texts(self, drawing, values):
-        """Inside Edit Sheet Format: replaces placeholders such as {PART_NAME} in the notes."""
         if not self.text_replacements:
             return 0
         count = 0
-        view = self._get(drawing, "GetFirstView")      # in Edit Sheet Format the first view is the sheet format
+        view = self._get(drawing, "GetFirstView")
         note = self._get(view, "GetFirstNote")
         for _ in range(10000):
             if note is None:
@@ -257,31 +255,30 @@ class SwDrawingExporter:
             manager = drawing.Extension.CustomPropertyManager("")
             for key, value in values.items():
                 if value not in (None, ""):
-                    manager.Add3(key, 30, str(value), 2)     # 30 = text, 2 = overwrite
+                    manager.Add3(key, 30, str(value), 2)
             steps.append("drawing properties written")
         except Exception as exc:
             steps.append(f"drawing properties skipped: {exc}")
 
         try:
-            drawing.EditTemplate()          # return value is unreliable (None) -> ignored
+            drawing.EditTemplate()
             replaced = self._replace_sheet_texts(drawing, values)
             steps.append(f"Edit Sheet Format: {replaced} text(s) replaced")
         except Exception as exc:
             steps.append(f"Edit Sheet Format failed: {exc}")
         finally:
             try:
-                drawing.EditSheet()         # always leave Edit Sheet Format
+                drawing.EditSheet()
                 steps.append("back to sheet (EditSheet)")
             except Exception as exc:
                 steps.append(f"EditSheet failed: {exc}")
 
     # ---------------- master cleanup ----------------
     def _remove_existing_views(self, drawing, steps):
-        """Deletes everything that came from master.slddrw: bend tables, flat pattern and other views."""
         nothing = VARIANT(pythoncom.VT_DISPATCH, None)
 
         views = []
-        view = self._get(self._get(drawing, "GetFirstView"), "GetNextView")   # skip the sheet-format view
+        view = self._get(self._get(drawing, "GetFirstView"), "GetNextView")
         while view is not None:
             views.append(view)
             view = self._get(view, "GetNextView")
@@ -358,7 +355,7 @@ class SwDrawingExporter:
         return None
 
     def _move_view(self, view, target_cx, target_cy):
-        for _ in range(2):                      # second pass removes small drift
+        for _ in range(2):
             outline = self._get(view, "GetOutline")
             cx = (outline[0] + outline[2]) / 2.0
             cy = (outline[1] + outline[3]) / 2.0
@@ -367,11 +364,10 @@ class SwDrawingExporter:
                                     (pos[0] + target_cx - cx, pos[1] + target_cy - cy))
 
     def _fit_scale(self, limit):
-        """Largest scale that still fits (limit = max scale factor allowed by the free area)."""
         if self.layout.get("scale_mode", "fine") == "fine":
             if limit >= 1:
                 return next(v for v in (10, 5, 4, 2, 1) if v <= limit * 1.001)
-            return 1.0 / max(1, math.ceil(1.0 / limit - 1e-9))        # 1:n, n = smallest whole number that fits
+            return 1.0 / max(1, math.ceil(1.0 / limit - 1e-9))
         return next((v for v in SCALES if v <= limit * 1.001), SCALES[-1])
 
     @staticmethod
@@ -379,14 +375,12 @@ class SwDrawingExporter:
         return f"1:{1 / scale:.0f}" if scale < 1 else f"{scale:g}:1"
 
     def _size_at_unit_scale(self, view):
-        """Sets a known scale first and measures at it, so a wrong ScaleDecimal reading cannot distort the fit."""
         probe = 0.05
         view.ScaleDecimal = probe
         o = self._get(view, "GetOutline")
         return (o[2] - o[0]) / probe, (o[3] - o[1]) / probe
 
     def _settle_scale(self, view, scale, box_w, box_h):
-        """Applies the scale and checks the REAL outline; steps down until the view fits the box."""
         w = h = 0.0
         for _ in range(8):
             view.ScaleDecimal = scale
@@ -398,8 +392,6 @@ class SwDrawingExporter:
         return scale, (w, h)
 
     def _layout_views(self, drawing, folded, flat_view, table_top, steps):
-        """Same page logic as the PDF drawing: the bend table sits above the title block, the free area above
-        it is split into a top band (folded views) and the flat pattern area; scales are fitted to the areas."""
         width, height = self._sheet_size(drawing)
         lay = self.layout
         mm = 0.001
@@ -479,12 +471,11 @@ class SwDrawingExporter:
             return None
 
     def _set_sheet_scale(self, drawing, scale, steps):
-        """Title block 'SCALE' field = scale of the flat pattern (as in the PDF version)."""
         text = self._scale_text(scale)
         num, den = (1.0, float(round(1 / scale))) if scale < 1 else (float(round(scale)), 1.0)
         try:
             sheet = self._get(drawing, "GetCurrentSheet")
-            sheet.SetScale(num, den, False, False)      # False, False = do not rescale the views
+            sheet.SetScale(num, den, False, False)
             steps.append(f"sheet scale set to {text}")
         except Exception as exc:
             steps.append(f"sheet scale not set ({exc})")
@@ -495,7 +486,6 @@ class SwDrawingExporter:
 
     # ---------------- overall dimensions ----------------
     def _view_vertices(self, view):
-        """Visible vertices of a view (the entity type is detected, so no enum value is assumed)."""
         nothing = VARIANT(pythoncom.VT_DISPATCH, None)
         for entity_type in (2, 1, 3, 4):
             try:
@@ -507,7 +497,6 @@ class SwDrawingExporter:
         return []
 
     def _vertex_points(self, view, vertices, steps):
-        """[(x, y, vertex)] in sheet coordinates, used only to find the extreme corners."""
         try:
             to_sheet = self._view_mapper(view, steps)
         except Exception as exc:
@@ -527,7 +516,6 @@ class SwDrawingExporter:
         return points
 
     def _select_vertex(self, view, vertex, append, sel):
-        """Vertex.Select4 first; IView.SelectEntity as fallback."""
         try:
             if vertex.Select4(append, sel):
                 return True, "Select4"
@@ -541,7 +529,6 @@ class SwDrawingExporter:
         return False, None
 
     def _add_overall_dimensions(self, drawing, view, steps, label, length=True, width=True, width_side="right"):
-        """Length (horizontal, above the view) and/or width (vertical, left or right of the view)."""
         stage = "vertices"
         try:
             points = self._vertex_points(view, self._view_vertices(view), steps)
@@ -587,7 +574,6 @@ class SwDrawingExporter:
 
     # ---------------- bend dimensions ----------------
     def _view_edges(self, view, steps=None):
-        """Return visible edge entities, tolerating pywin32 SAFEARRAY/tuple variants."""
         nothing = VARIANT(pythoncom.VT_DISPATCH, None)
         found = []
         diagnostics = []
@@ -729,8 +715,7 @@ class SwDrawingExporter:
         return points
 
     def _add_bend_dimensions(self, drawing, view, scale, limit_bottom, steps):
-        """One dimension per bend: from the bend line to the nearest outer edge of the flat pattern.
-        Sorted and filtered to prevent duplicate or opposing bend-to-bend dimensions."""
+        """One dimension per bend to the nearest outer edge of the flat pattern view."""
         stage = "bend lines"
         try:
             lines = list(self._get(view, "GetBendLines") or ())
@@ -743,7 +728,6 @@ class SwDrawingExporter:
             to_sheet = self._view_mapper(view, steps, verbose=True)
             vb = to_sheet.vb
             outline = self._get(view, "GetOutline")
-            tol = 0.02 * max(vb[2] - vb[0], vb[3] - vb[1])
 
             stage = "edges"
             edges = []
@@ -773,40 +757,13 @@ class SwDrawingExporter:
             bends = []
             for i, seg in enumerate(lines):
                 pts = self._segment_xyz(seg)
-                candidates = [[to_sheet(pt) for pt in pts]]
-                try:
-                    sketch = self._get(seg, "GetSketch")
-                    model_to_sketch = self._get(sketch, "ModelToSketchTransform") if sketch is not None else None
-                    inv = self._get(model_to_sketch, "Inverse") if model_to_sketch is not None else None
-                    if inv is not None:
-                        candidates.append([to_sheet(pt, via=inv) for pt in pts])
-                except Exception as exc:
-                    steps.append(f"bend line {i}: sketch transform fallback failed ({exc})")
-                
-                found = None
-                view_w = max(vb[2] - vb[0], 1e-9)
-                view_h = max(vb[3] - vb[1], 1e-9)
-                endpoint_margin = max(tol, 0.15 * max(view_w, view_h))
-                for k, cand in enumerate(candidates):
-                    (x1, y1), (x2, y2) = cand
-                    mx, my = (x1 + x2) / 2.0, (y1 + y2) / 2.0
-                    midpoint_near = (vb[0] - endpoint_margin <= mx <= vb[2] + endpoint_margin and
-                                     vb[1] - endpoint_margin <= my <= vb[3] + endpoint_margin)
-                    segment_overlaps = (max(x1, x2) >= vb[0] - endpoint_margin and
-                                        min(x1, x2) <= vb[2] + endpoint_margin and
-                                        max(y1, y2) >= vb[1] - endpoint_margin and
-                                        min(y1, y2) <= vb[3] + endpoint_margin)
-                    seg_len = math.hypot(x2 - x1, y2 - y1)
-                    plausible_len = seg_len <= 1.5 * math.hypot(view_w, view_h) and seg_len > 1e-7
-                    if midpoint_near and segment_overlaps and plausible_len:
-                        found = cand
-                        break
-                if found is not None:
-                    bends.append((seg, found))
+                cand = [to_sheet(pt) for pt in pts]
+                bends.append((seg, cand))
 
             stage = "distances"
             items = []
-            seen_dimensions = set()  # جلوگیری از ایجاد اندازه‌های تکراری
+            seen_values = set()
+
             for seg, (A, B) in bends:
                 dx, dy = B[0] - A[0], B[1] - A[1]
                 length = math.hypot(dx, dy)
@@ -815,62 +772,44 @@ class SwDrawingExporter:
                 ux, uy = dx / length, dy / length
                 nx, ny = -uy, ux
                 s0 = nx * A[0] + ny * A[1]
-                bend_t0 = min(A[0] * ux + A[1] * uy, B[0] * ux + B[1] * uy)
-                bend_t1 = max(A[0] * ux + A[1] * uy, B[0] * ux + B[1] * uy)
-                span_tol = max(0.001, 0.01 * length)
-                pos_candidates = []
-                neg_candidates = []
                 
-                corners = ((vb[0], vb[1]), (vb[0], vb[3]),
-                           (vb[2], vb[1]), (vb[2], vb[3]))
-                normal_limits = [nx * x + ny * y for x, y in corners]
-                n_min, n_max = min(normal_limits), max(normal_limits)
-                boundary_tol = max(0.0015, 0.02 * max(vb[2] - vb[0], vb[3] - vb[1]))
-
+                # پیدا کردن نزدیک‌ترین لبه موازی خارجی
+                candidates = []
                 for p, q, e in edges:
                     ex, ey = q[0] - p[0], q[1] - p[1]
                     le = math.hypot(ex, ey)
-                    if le < 1e-6 or abs(ux * ey - uy * ex) / le > 0.01:
-                        continue
-                    edge_t0 = min(p[0] * ux + p[1] * uy, q[0] * ux + q[1] * uy)
-                    edge_t1 = max(p[0] * ux + p[1] * uy, q[0] * ux + q[1] * uy)
-                    if edge_t1 < bend_t0 - span_tol or edge_t0 > bend_t1 + span_tol:
-                        continue
+                    if le < 1e-6 or abs(ux * ey - uy * ex) / le > 0.05:
+                        continue  # فقط لبه‌های موازی
+                    
                     edge_s = nx * p[0] + ny * p[1]
-                    delta = edge_s - s0
-                    if abs(delta) < 1e-4:
-                        continue
-                    at_outer_boundary = (abs(edge_s - n_min) <= boundary_tol or
-                                         abs(edge_s - n_max) <= boundary_tol)
-                    if not at_outer_boundary:
-                        continue
-                    if delta > 0:
-                        pos_candidates.append((delta, e, 1.0))
-                    else:
-                        neg_candidates.append((-delta, e, -1.0))
+                    delta = abs(edge_s - s0)
+                    if delta < 1e-4:
+                        continue  # خود خط خم
+                    
+                    candidates.append((delta, e, edge_s - s0))
 
-                pos = min(pos_candidates, key=lambda o: o[0]) if pos_candidates else None
-                neg = min(neg_candidates, key=lambda o: o[0]) if neg_candidates else None
-                options = [o for o in (pos, neg) if o]
-                if not options:
+                if not candidates:
                     continue
-                dist, edge, sign = min(options, key=lambda o: o[0])
-                
-                # فیلتر مقادیر تکراری بر اساس رند کردن فاصله
-                rounded_val = round(dist / scale * 1000.0, 1)
-                mid_coord = round((A[0] + B[0]) / 2.0, 4) if abs(nx) >= abs(ny) else round((A[1] + B[1]) / 2.0, 4)
-                dim_signature = (rounded_val, mid_coord)
-                if dim_signature in seen_dimensions:
-                    continue
-                seen_dimensions.add(dim_signature)
 
+                # انتخاب نزدیک‌ترین لبه واقعی
+                dist, edge, sign_delta = min(candidates, key=lambda o: o[0])
+                val_mm = round(dist / scale * 1000.0, 1)
+
+                # حذف مقادیر تکراری اندازه‌گذاری
+                if val_mm in seen_values:
+                    continue
+                seen_values.add(val_mm)
+
+                sign = 1.0 if sign_delta > 0 else -1.0
                 tx, ty = A[0] + sign * dist * nx, A[1] + sign * dist * ny
+
                 if abs(nx) >= abs(ny):
                     group, lo, hi = "h", min(A[0], tx), max(A[0], tx)
                 else:
                     group, lo, hi = "v", min(A[1], ty), max(A[1], ty)
                 items.append({"seg": seg, "edge": edge, "group": group, "lo": lo, "hi": hi,
-                              "mid": (lo + hi) / 2.0, "value": rounded_val})
+                              "mid": (A[0] + B[0]) / 2.0 if group == "h" else (A[1] + B[1]) / 2.0,
+                              "value": val_mm})
 
             stage = "levels"
             items.sort(key=lambda it: it["value"], reverse=(self.bend_dim_order == "smallest_first"))
@@ -913,7 +852,7 @@ class SwDrawingExporter:
             drawing.ClearSelection2(True)
             levels = {g: 1 + max([i["level"] for i in items if i["group"] == g] or [-1]) for g in ("h", "v")}
             steps.append(f"bend dimensions: {created}/{len(items)} created, values "
-                         f"{[round(i['value'], 2) for i in items]}, levels {levels}")
+                         f"{[i['value'] for i in items]}, levels {levels}")
             if too_low:
                 steps.append("warning: bend dimensions reach the bend table area - raise bend_dim_pad_mm")
         except Exception as exc:
