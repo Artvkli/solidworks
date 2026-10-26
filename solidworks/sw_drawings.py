@@ -807,10 +807,32 @@ class SwDrawingExporter:
                 except Exception as exc:
                     steps.append(f"bend line {i}: sketch transform fallback failed ({exc})")
                 found = None
+                # Bend-line endpoints may extend a little beyond the model-vertex
+                # bbox returned by GetVertices (for example, where a bend terminates
+                # at the sheet boundary). Requiring BOTH endpoints to be inside that
+                # bbox incorrectly rejects valid lines. Prefer candidates whose
+                # midpoint is near the view bbox and whose segment overlaps it.
+                view_w = max(vb[2] - vb[0], 1e-9)
+                view_h = max(vb[3] - vb[1], 1e-9)
+                endpoint_margin = max(tol, 0.15 * max(view_w, view_h))
                 for k, cand in enumerate(candidates):
-                    c2 = cand
-                    if all(vb[0] - tol <= x <= vb[2] + tol and vb[1] - tol <= y <= vb[3] + tol for x, y in c2):
-                        found = c2
+                    (x1, y1), (x2, y2) = cand
+                    mx, my = (x1 + x2) / 2.0, (y1 + y2) / 2.0
+                    midpoint_near = (vb[0] - endpoint_margin <= mx <= vb[2] + endpoint_margin and
+                                     vb[1] - endpoint_margin <= my <= vb[3] + endpoint_margin)
+                    segment_overlaps = (max(x1, x2) >= vb[0] - endpoint_margin and
+                                        min(x1, x2) <= vb[2] + endpoint_margin and
+                                        max(y1, y2) >= vb[1] - endpoint_margin and
+                                        min(y1, y2) <= vb[3] + endpoint_margin)
+                    # Avoid accepting wildly transformed or degenerate geometry.
+                    seg_len = math.hypot(x2 - x1, y2 - y1)
+                    plausible_len = seg_len <= 1.5 * math.hypot(view_w, view_h) and seg_len > 1e-7
+                    if midpoint_near and segment_overlaps and plausible_len:
+                        found = cand
+                        if k > 0:
+                            steps.append(f"bend line {i}: accepted sketch-to-model candidate")
+                        else:
+                            steps.append(f"bend line {i}: accepted near-view candidate (endpoint margin {endpoint_margin:.6f} m)")
                         break
                 if found is None:
                     # Keep a useful diagnostic: distinguishes a coordinate-space problem
