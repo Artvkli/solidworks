@@ -795,60 +795,41 @@ class SwDrawingExporter:
 
             stage = "bend line positions"
             bends = []
+            view_w = max(vb[2] - vb[0], 1e-9)
+            view_h = max(vb[3] - vb[1], 1e-9)
+            margin = 0.03 * max(view_w, view_h)       # tight: a bend line lies INSIDE the flat pattern
+
+            def inside(cand):
+                return all(vb[0] - margin <= x <= vb[2] + margin and
+                           vb[1] - margin <= y <= vb[3] + margin for x, y in cand)
+
             for i, seg in enumerate(lines):
                 pts = self._segment_xyz(seg)
-                candidates = [[to_sheet(pt) for pt in pts]]
-                try:                                                    # sketch space -> model space
+                candidates = []
+                try:                                   # sketch space -> model space FIRST
                     sketch = self._get(seg, "GetSketch")
-                    model_to_sketch = self._get(sketch, "ModelToSketchTransform") if sketch is not None else None
-                    inv = self._get(model_to_sketch, "Inverse") if model_to_sketch is not None else None
+                    m2s = self._get(sketch, "ModelToSketchTransform") if sketch is not None else None
+                    inv = self._get(m2s, "Inverse") if m2s is not None else None
                     if inv is not None:
-                        candidates.append([to_sheet(pt, via=inv) for pt in pts])
+                        candidates.append(("sketch->model", [to_sheet(pt, via=inv) for pt in pts]))
                 except Exception as exc:
-                    steps.append(f"bend line {i}: sketch transform fallback failed ({exc})")
+                    steps.append(f"bend line {i}: sketch transform failed ({exc})")
+                try:
+                    candidates.append(("model", [to_sheet(pt) for pt in pts]))
+                except Exception:
+                    pass
+
                 found = None
-                # Bend-line endpoints may extend a little beyond the model-vertex
-                # bbox returned by GetVertices (for example, where a bend terminates
-                # at the sheet boundary). Requiring BOTH endpoints to be inside that
-                # bbox incorrectly rejects valid lines. Prefer candidates whose
-                # midpoint is near the view bbox and whose segment overlaps it.
-                view_w = max(vb[2] - vb[0], 1e-9)
-                view_h = max(vb[3] - vb[1], 1e-9)
-                endpoint_margin = max(tol, 0.15 * max(view_w, view_h))
-                for k, cand in enumerate(candidates):
+                for label, cand in candidates:
                     (x1, y1), (x2, y2) = cand
-                    mx, my = (x1 + x2) / 2.0, (y1 + y2) / 2.0
-                    midpoint_near = (vb[0] - endpoint_margin <= mx <= vb[2] + endpoint_margin and
-                                     vb[1] - endpoint_margin <= my <= vb[3] + endpoint_margin)
-                    segment_overlaps = (max(x1, x2) >= vb[0] - endpoint_margin and
-                                        min(x1, x2) <= vb[2] + endpoint_margin and
-                                        max(y1, y2) >= vb[1] - endpoint_margin and
-                                        min(y1, y2) <= vb[3] + endpoint_margin)
-                    # Avoid accepting wildly transformed or degenerate geometry.
-                    seg_len = math.hypot(x2 - x1, y2 - y1)
-                    plausible_len = seg_len <= 1.5 * math.hypot(view_w, view_h) and seg_len > 1e-7
-                    if midpoint_near and segment_overlaps and plausible_len:
+                    if inside(cand) and math.hypot(x2 - x1, y2 - y1) > 1e-7:
                         found = cand
-                        if k > 0:
-                            steps.append(f"bend line {i}: accepted sketch-to-model candidate")
-                        else:
-                            steps.append(f"bend line {i}: accepted near-view candidate (endpoint margin {endpoint_margin:.6f} m)")
+                        steps.append(f"bend line {i}: using {label} coordinates")
                         break
                 if found is None:
-                    # Keep a useful diagnostic: distinguishes a coordinate-space problem
-                    # from a genuinely missing/invalid bend segment.
-                    try:
-                        raw_box = (min(p[0] for p in pts), min(p[1] for p in pts),
-                                   max(p[0] for p in pts), max(p[1] for p in pts))
-                        cand_boxes = []
-                        for cand in candidates:
-                            cand_boxes.append((round(min(p[0] for p in cand), 6),
-                                               round(min(p[1] for p in cand), 6),
-                                               round(max(p[0] for p in cand), 6),
-                                               round(max(p[1] for p in cand), 6)))
-                        steps.append(f"bend line {i}: outside view bounds; raw={tuple(round(v,6) for v in raw_box)}, candidates={cand_boxes}, view={tuple(round(v,6) for v in vb)}")
-                    except Exception:
-                        steps.append(f"bend line {i}: position does not match the view - skipped")
+                    steps.append(f"bend line {i}: not inside the view - skipped "
+                                 f"(candidates={[[tuple(round(v, 5) for v in p) for p in c] for _, c in candidates]}, "
+                                 f"view={tuple(round(v, 5) for v in vb)})")
                     continue
                 bends.append((seg, found))
 
@@ -863,16 +844,19 @@ class SwDrawingExporter:
                 nx, ny = -uy, ux
                 s0 = nx * A[0] + ny * A[1]
                 pos = neg = None
+                ta, tb = sorted((ux * A[0] + uy * A[1], ux * B[0] + uy * B[1]))
+                pos = neg = None
                 for p, q, e in edges:
                     le = math.hypot(q[0] - p[0], q[1] - p[1])
                     if le < 1e-6 or abs(ux * (q[1] - p[1]) - uy * (q[0] - p[0])) / le > 0.01:
                         continue                                        # not parallel to the bend line
+                    tp, tq = sorted((ux * p[0] + uy * p[1], ux * q[0] + uy * q[1]))
+                    if min(tq, tb) - max(tp, ta) <= 0:
+                        continue                                        # does not face the bend line
                     delta = nx * p[0] + ny * p[1] - s0
                     if abs(delta) < 1e-4:
                         continue                                        # the bend line's own edge
-                    # OUTERMOST parallel edge on each side of the bend line
-                    # (= the outer boundary of the flat pattern, not inner cutout/step edges).
-                    if delta > 0 and (pos is None or delta > pos[0]):
+                    if delta > 0 and (pos is None or delta > pos[0]):   # outermost edge on each side
                         pos = (delta, e, 1.0)
                     if delta < 0 and (neg is None or -delta > neg[0]):
                         neg = (-delta, e, -1.0)
@@ -920,7 +904,7 @@ class SwDrawingExporter:
             except Exception:
                 sel = VARIANT(pythoncom.VT_DISPATCH, None)
 
-            created, too_low = 0, False
+            created, too_low, real = 0, False, []
             for it in items:
                 if it["group"] == "h":                       # measured along x -> stacked BELOW the view
                     px, py = it["mid"], outline[1] - start - it["level"] * step
@@ -932,12 +916,19 @@ class SwDrawingExporter:
                 drawing.ClearSelection2(True)
                 ok1, _ = self._select_vertex(view, it["seg"], False, sel)
                 ok2, _ = self._select_vertex(view, it["edge"], True, sel)
-                if ok1 and ok2 and drawing.AddDimension2(px, py, 0.0) is not None:
-                    created += 1
+                if ok1 and ok2:
+                    dim = drawing.AddDimension2(px, py, 0.0)
+                    if dim is not None:
+                        created += 1
+                        try:
+                            real.append(round(dim.GetDimension2(0).SystemValue * 1000.0, 2))
+                        except Exception:
+                            pass
             drawing.ClearSelection2(True)
             levels = {g: 1 + max([i["level"] for i in items if i["group"] == g] or [-1]) for g in ("h", "v")}
             steps.append(f"bend dimensions: {created}/{len(items)} created, values "
-                         f"{[round(i['value'], 2) for i in items]}, levels {levels}")
+                         f"{[round(i['value'], 2) for i in items]}, levels {levels}"
+                         f"actual {real}")
             if too_low:
                 steps.append("warning: bend dimensions reach the bend table area - raise bend_dim_pad_mm")
         except Exception as exc:
