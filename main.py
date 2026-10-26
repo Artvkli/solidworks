@@ -52,7 +52,8 @@ LAYOUT = {                            # same page logic as the PDF drawing (all 
     "band_gap_mm": 2,
     "view_gap_mm": 12,                # gap between Top and Front view
     "dim_pad_mm": 20,                 # room kept free around each view for its dimension lines
-    "common_scale": False,             # True = all views share one scale, False = a scale per group
+    "common_scale": False,            # True = all views share one scale, False = a scale per group
+    "scale_mode": "fine",             # "fine" = 1:n for any whole n (as large as fits), "standard" = fixed list
 }
 ADD_QTY_NOTE = True
 QTY_NOTE_X_MM = None                    # position of the "QTY=n" note (from the sheet's left / bottom edge)

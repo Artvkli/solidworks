@@ -1,6 +1,7 @@
 """One SLDDRW per sheet-metal part:
 master.slddrw + Top / Front / Flat pattern views + overall dimensions + QTY note + tagged bend table."""
 import gc
+import math
 import re
 import shutil
 import time
@@ -33,7 +34,8 @@ DEFAULT_LAYOUT = {
     "band_gap_mm": 2,
     "view_gap_mm": 12,             # gap between Top and Front view
     "dim_pad_mm": 20,              # room kept free around each view for its dimension lines
-    "common_scale": False,          # True = all views share one scale (like the reference), False = per group
+    "common_scale": False,         # True = all views share one scale (like the reference), False = per group
+    "scale_mode": "fine",          # "fine" = 1:n for any whole n (largest view that fits), "standard" = fixed list
 }
 
 
@@ -355,8 +357,12 @@ class SwDrawingExporter:
             view.Position = VARIANT(pythoncom.VT_ARRAY | pythoncom.VT_R8,
                                     (pos[0] + target_cx - cx, pos[1] + target_cy - cy))
 
-    @staticmethod
-    def _fit_scale(limit):
+    def _fit_scale(self, limit):
+        """Largest scale that still fits (limit = max scale factor allowed by the free area)."""
+        if self.layout.get("scale_mode", "fine") == "fine":
+            if limit >= 1:
+                return next(v for v in (10, 5, 4, 2, 1) if v <= limit * 1.001)
+            return 1.0 / max(1, math.ceil(1.0 / limit - 1e-9))        # 1:n, n = smallest whole number that fits
         return next((v for v in SCALES if v <= limit * 1.001), SCALES[-1])
 
     @staticmethod
@@ -387,10 +393,10 @@ class SwDrawingExporter:
             else:
                 folded_box, flat_box = None, (left, low, right, high)
 
-            def inner(box):                      # keep room for the dimension lines
-                return (box[0] + dim, box[1], box[2] - dim, box[3] - dim)
-
-            f_in, b_in = (inner(folded_box) if folded_box else None), inner(flat_box)
+            # keep room only on the sides where dimension lines are drawn:
+            #   Top/Front: above + right      Flat pattern: above + left
+            f_in = (folded_box[0], folded_box[1], folded_box[2] - dim, folded_box[3] - dim) if folded_box else None
+            b_in = (flat_box[0] + dim, flat_box[1], flat_box[2], flat_box[3] - dim)
             steps.append(f"sheet {width * 1000:.0f} x {height * 1000:.0f} mm | table top {table_top * 1000:.0f} mm | "
                          f"flat area {flat_box[1] * 1000:.0f}-{flat_box[3] * 1000:.0f} mm"
                          + (f" | folded area {folded_box[1] * 1000:.0f}-{folded_box[3] * 1000:.0f} mm" if folded_box else ""))
