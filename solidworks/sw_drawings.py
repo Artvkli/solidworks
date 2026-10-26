@@ -26,14 +26,14 @@ INVALID_FILENAME = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 
 DEFAULT_LAYOUT = {
     "margin_mm": 10,               # sheet border inset
-    "side_pad_mm": 5,              # free space between the border and the views (left / right / top)
+    "side_pad_mm": 0,              # free space between the border and the views (left / right / top)
     "top_pad_mm": 5,
     "table_gap_mm": 0,             # gap between the title block and the bend table (0 = attached)
     "table_clearance_mm": 9,       # free space between the bend table and the flat pattern area
     "folded_band_ratio": 0.38,     # top views take the upper 38% of the free area, flat pattern the rest
     "band_gap_mm": 2,
     "view_gap_mm": 12,             # gap between Top and Front view
-    "dim_pad_mm": 20,              # room kept free around each view for its dimension lines
+    "dim_pad_mm": 12,              # room kept free around each view for its dimension lines
     "common_scale": False,         # True = all views share one scale (like the reference), False = per group
     "scale_mode": "fine",          # "fine" = 1:n for any whole n (largest view that fits), "standard" = fixed list
 }
@@ -370,9 +370,23 @@ class SwDrawingExporter:
         return f"1:{1 / scale:.0f}" if scale < 1 else f"{scale:g}:1"
 
     def _size_at_unit_scale(self, view):
+        """Sets a known scale first and measures at it, so a wrong ScaleDecimal reading cannot distort the fit."""
+        probe = 0.05
+        view.ScaleDecimal = probe
         o = self._get(view, "GetOutline")
-        sc = float(self._get(view, "ScaleDecimal"))
-        return (o[2] - o[0]) / sc, (o[3] - o[1]) / sc
+        return (o[2] - o[0]) / probe, (o[3] - o[1]) / probe
+
+    def _settle_scale(self, view, scale, box_w, box_h):
+        """Applies the scale and checks the REAL outline; steps down until the view fits the box."""
+        w = h = 0.0
+        for _ in range(8):
+            view.ScaleDecimal = scale
+            o = self._get(view, "GetOutline")
+            w, h = o[2] - o[0], o[3] - o[1]
+            if w <= box_w * 1.002 and h <= box_h * 1.002:
+                break
+            scale = self._fit_scale(scale * 0.93)
+        return scale, (w, h)
 
     def _layout_views(self, drawing, folded, flat_view, table_top, steps):
         """Same page logic as the PDF drawing: the bend table sits above the title block, the free area above
@@ -415,9 +429,18 @@ class SwDrawingExporter:
             else:
                 scales = {k: self._fit_scale(v) for k, v in limits.items()}
 
+            b_w, b_h = b_in[2] - b_in[0], b_in[3] - b_in[1]
+            scales["flat"], (real_w, real_h) = self._settle_scale(flat_view, scales["flat"], b_w, b_h)
+            if lay["common_scale"] and "folded" in scales:
+                scales["folded"] = min(scales["folded"], scales["flat"])
+                scales["flat"] = scales["folded"]
+                flat_view.ScaleDecimal = scales["flat"]
             for _, v in folded:
                 v.ScaleDecimal = scales["folded"]
-            flat_view.ScaleDecimal = scales["flat"]
+            o = self._get(flat_view, "GetOutline")
+            steps.append(f"flat pattern at {self._scale_text(scales['flat'])}: "
+                         f"{(o[2] - o[0]) * 1000:.0f} x {(o[3] - o[1]) * 1000:.0f} mm "
+                         f"in a box of {b_w * 1000:.0f} x {b_h * 1000:.0f} mm")
 
             if folded:
                 heights = []

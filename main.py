@@ -44,14 +44,14 @@ SHEET_TEXT_REPLACEMENTS = {
 ADD_FOLDED_VIEWS = True               # Top + Front view above the flat pattern
 LAYOUT = {                            # same page logic as the PDF drawing (all values in mm unless stated)
     "margin_mm": 10,                  # sheet border inset
-    "side_pad_mm": 5,                 # free space between the border and the views
+    "side_pad_mm": 0,                 # free space between the border and the views
     "top_pad_mm": 5,
     "table_gap_mm": 0,                # gap between the title block and the bend table (0 = attached)
     "table_clearance_mm": 9,          # free space between the bend table and the flat pattern area
     "folded_band_ratio": 0.38,        # Top/Front views use the upper 38% of the free area, the flat pattern the rest
     "band_gap_mm": 2,
     "view_gap_mm": 12,                # gap between Top and Front view
-    "dim_pad_mm": 20,                 # room kept free around each view for its dimension lines
+    "dim_pad_mm": 12,                 # room kept free around each view for its dimension lines
     "common_scale": False,            # True = all views share one scale, False = a scale per group
     "scale_mode": "fine",             # "fine" = 1:n for any whole n (as large as fits), "standard" = fixed list
 }
@@ -60,7 +60,7 @@ QTY_NOTE_X_MM = None                    # position of the "QTY=n" note (from the
 QTY_NOTE_Y_MM = None            # None = computed like the PDF version (left of the table)
 # Overall dimensions of every view (length + width)
 ADD_DIMENSIONS = True
-DIMENSION_OFFSET_MM = 15              # distance of the dimension lines from the view
+DIMENSION_OFFSET_MM = 8               # distance of the dimension lines from the view
 # Bend table: every bend gets a letter tag (A, B, C...) on the flat pattern and the same tag in the table
 INSERT_BEND_TABLE = True
 BEND_TABLE_START_TAG = "A"             # "A" = letters, "1" = numbers
