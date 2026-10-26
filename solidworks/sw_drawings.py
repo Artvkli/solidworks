@@ -53,7 +53,7 @@ class SwDrawingExporter:
                  bend_table_remove_words=(), bend_table_start_value="A",
                  add_dimensions=True, dimension_offset_mm=15,
                  add_qty_note=True, qty_note_x_mm=None, qty_note_y_mm=None,
-                 add_bend_dimensions=False, bend_dim_offset_mm=8, bend_dim_step_mm=7,
+                 add_bend_dimensions=True, bend_dim_offset_mm=8, bend_dim_step_mm=7,
                  bend_dim_text_width_mm=14, bend_dim_order="largest_first"):
         self.sw_app = sw_app
         self.assembly_path = Path(assembly_path).resolve() if assembly_path else None
