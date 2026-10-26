@@ -34,7 +34,7 @@ DEFAULT_LAYOUT = {
     "band_gap_mm": 2,
     "view_gap_mm": 12,             # gap between Top and Front view
     "dim_pad_mm": 12,              # room kept free around each view for its dimension lines
-    "common_scale": False,         # True = all views share one scale (like the reference), False = per group
+    "common_scale": True,         # True = all views share one scale (like the reference), False = per group
     "bend_dim_pad_mm": 18,         # free space below the flat pattern for the bend dimensions
     "scale_mode": "fine",          # "fine" = 1:n for any whole n (largest view that fits), "standard" = fixed list
 }
@@ -501,11 +501,7 @@ class SwDrawingExporter:
     def _vertex_points(self, view, vertices):
         """[(x, y, vertex)] in view space, used only to find the extreme corners."""
         transform = self._get(view, "ModelToViewTransform")
-        math = None
-        try:
-            math = self.sw_app.GetMathUtility()
-        except Exception:
-            pass
+        math = self._get(self.sw_app, "GetMathUtility")
         points = []
         for vertex in vertices:
             p = self._get(vertex, "GetPoint")
@@ -595,7 +591,9 @@ class SwDrawingExporter:
     def _make_mapper(self, view):
         """model space -> view space (optionally through an extra transform first)."""
         transform = self._get(view, "ModelToViewTransform")
-        math_util = self.sw_app.GetMathUtility()
+        math_util = self._get(self.sw_app, "GetMathUtility")      # an object, not a function call
+        if transform is None or math_util is None:
+            raise RuntimeError("ModelToViewTransform / MathUtility not available")
 
         def to_view(xyz, via=None):
             mp = math_util.CreatePoint(VARIANT(pythoncom.VT_ARRAY | pythoncom.VT_R8,

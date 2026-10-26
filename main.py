@@ -12,7 +12,7 @@ except ImportError:
     raise
 
 from solidworks.assembly import SolidWorksAssembly, find_assemblies
-from solidworks.sw_drawing import SwDrawingExporter
+from solidworks.sw_drawings import SwDrawingExporter
 from solidworks.dwg_exporter import DwgExporter
 from solidworks.thickness_dwg import ThicknessDwgBuilder
 from solidworks.sheet_metal import SheetMetalDetector
@@ -25,7 +25,7 @@ MAX_ROW_WIDTH = 6000.0
 
 # True  -> only one SLDDRW (flat pattern) per part, no DXF/DWG.
 # False -> additionally run the old DXF merge / DWG export.
-SLDDRW_ONLY = True
+SLDDRW_ONLY = 3
 # Reuse the sheet metal scan of the last run (output/scan_cache.json).
 USE_SCAN_CACHE = True
 
@@ -52,7 +52,7 @@ LAYOUT = {                            # same page logic as the PDF drawing (all 
     "band_gap_mm": 2,
     "view_gap_mm": 12,                # gap between Top and Front view
     "dim_pad_mm": 12,                 # room kept free around each view for its dimension lines
-    "common_scale": False,            # True = all views share one scale, False = a scale per group
+    "common_scale": True,            # True = all views share one scale, False = a scale per group
     "bend_dim_pad_mm": 18,            # free space below the flat pattern for the bend dimensions
     "scale_mode": "fine",             # "fine" = 1:n for any whole n (as large as fits), "standard" = fixed list
 }
