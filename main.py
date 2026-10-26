@@ -25,7 +25,7 @@ MAX_ROW_WIDTH = 6000.0
 
 # True  -> only one SLDDRW (flat pattern) per part, no DXF/DWG.
 # False -> additionally run the old DXF merge / DWG export.
-SLDDRW_ONLY = 3
+SLDDRW_ONLY = True
 # Reuse the sheet metal scan of the last run (output/scan_cache.json).
 USE_SCAN_CACHE = True
 
@@ -52,8 +52,9 @@ LAYOUT = {                            # same page logic as the PDF drawing (all 
     "band_gap_mm": 2,
     "view_gap_mm": 12,                # gap between Top and Front view
     "dim_pad_mm": 12,                 # room kept free around each view for its dimension lines
-    "common_scale": True,            # True = all views share one scale, False = a scale per group
+    "common_scale": False,            # True = all views share one scale, False = a scale per group
     "bend_dim_pad_mm": 18,            # free space below the flat pattern for the bend dimensions
+    "auto_rotate_flat": True,         # rotate a tall flat pattern by 90 deg so its long side is horizontal
     "scale_mode": "fine",             # "fine" = 1:n for any whole n (as large as fits), "standard" = fixed list
 }
 # Bend dimensions: bend line -> nearest outer edge, sorted, stacked on levels so numbers never overlap
@@ -76,7 +77,7 @@ BEND_TABLE_RIGHT_MARGIN_MM = 10        # distance of the table's right edge from
 BEND_TABLE_BOTTOM_MM = 66              # height of the title block's top edge above the sheet bottom
 # Columns whose header contains one of these words are deleted (only used when no custom template is given)
 BEND_TABLE_REMOVE_WORDS = ("factor", "allowance", "deduction", "length", "thickness")
-SLDDRW_LIMIT = None            # e.g. 1 = test on the first part only, None = all parts
+SLDDRW_LIMIT = 2            # e.g. 1 = test on the first part only, None = all parts
 
 
 def connect_to_solidworks():

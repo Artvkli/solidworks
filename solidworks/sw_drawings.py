@@ -34,8 +34,9 @@ DEFAULT_LAYOUT = {
     "band_gap_mm": 2,
     "view_gap_mm": 12,             # gap between Top and Front view
     "dim_pad_mm": 12,              # room kept free around each view for its dimension lines
-    "common_scale": True,         # True = all views share one scale (like the reference), False = per group
+    "common_scale": False,         # True = all views share one scale (like the reference), False = per group
     "bend_dim_pad_mm": 18,         # free space below the flat pattern for the bend dimensions
+    "auto_rotate_flat": True,      # rotate a tall flat pattern by 90 deg so its long side is horizontal
     "scale_mode": "fine",          # "fine" = 1:n for any whole n (largest view that fits), "standard" = fixed list
 }
 
@@ -424,6 +425,15 @@ class SwDrawingExporter:
                          f"flat area {flat_box[1] * 1000:.0f}-{flat_box[3] * 1000:.0f} mm"
                          + (f" | folded area {folded_box[1] * 1000:.0f}-{folded_box[3] * 1000:.0f} mm" if folded_box else ""))
 
+            if lay.get("auto_rotate_flat", True):
+                o = self._get(flat_view, "GetOutline")
+                if (o[3] - o[1]) > (o[2] - o[0]) * 1.05:
+                    try:
+                        flat_view.Angle = math.pi / 2.0
+                        steps.append("flat pattern rotated 90 deg (long side horizontal)")
+                    except Exception as exc:
+                        steps.append(f"flat pattern rotation failed: {exc}")
+
             limits = {}
             if folded:
                 sizes = [self._size_at_unit_scale(v) for _, v in folded]
@@ -498,23 +508,24 @@ class SwDrawingExporter:
                 return list(entities)
         return []
 
-    def _vertex_points(self, view, vertices):
-        """[(x, y, vertex)] in view space, used only to find the extreme corners."""
-        transform = self._get(view, "ModelToViewTransform")
-        math = self._get(self.sw_app, "GetMathUtility")
+    def _vertex_points(self, view, vertices, steps):
+        """[(x, y, vertex)] in sheet coordinates, used only to find the extreme corners."""
+        try:
+            to_sheet = self._view_mapper(view, steps)
+        except Exception as exc:
+            steps.append(f"point transform unavailable ({exc}) - using model coordinates")
+            to_sheet = None
         points = []
         for vertex in vertices:
             p = self._get(vertex, "GetPoint")
             if not p:
                 continue
             xyz = (float(p[0]), float(p[1]), float(p[2]))
-            if math is not None and transform is not None:
-                try:
-                    mp = math.CreatePoint(VARIANT(pythoncom.VT_ARRAY | pythoncom.VT_R8, xyz))
-                    xyz = tuple(float(v) for v in mp.MultiplyTransform(transform).ArrayData)
-                except Exception:
-                    pass
-            points.append((xyz[0], xyz[1], vertex))
+            try:
+                x, y = to_sheet(xyz) if to_sheet else (xyz[0], xyz[1])
+            except Exception:
+                x, y = xyz[0], xyz[1]
+            points.append((x, y, vertex))
         return points
 
     def _select_vertex(self, view, vertex, append, sel):
@@ -535,7 +546,7 @@ class SwDrawingExporter:
         """Length (horizontal, above the view) and/or width (vertical, left or right of the view)."""
         stage = "vertices"
         try:
-            points = self._vertex_points(view, self._view_vertices(view))
+            points = self._vertex_points(view, self._view_vertices(view), steps)
             if len(points) < 2:
                 steps.append(f"dimensions {label}: no vertices found")
                 return
@@ -588,21 +599,81 @@ class SwDrawingExporter:
                 return list(entities)
         return []
 
-    def _make_mapper(self, view):
-        """model space -> view space (optionally through an extra transform first)."""
+    def _make_mapper(self, view, steps):
+        """model space -> view space. Uses SolidWorks' MathUtility; if that fails, the transform matrix."""
         transform = self._get(view, "ModelToViewTransform")
-        math_util = self._get(self.sw_app, "GetMathUtility")      # an object, not a function call
-        if transform is None or math_util is None:
-            raise RuntimeError("ModelToViewTransform / MathUtility not available")
+        if transform is None:
+            raise RuntimeError("ModelToViewTransform not available")
+        math_util = self._get(self.sw_app, "GetMathUtility")        # an object, not a function call
+        if math_util is not None:
+            def com_map(xyz, via=None):
+                mp = math_util.CreatePoint(VARIANT(pythoncom.VT_ARRAY | pythoncom.VT_R8,
+                                                   tuple(float(v) for v in xyz)))
+                if via is not None:
+                    mp = mp.MultiplyTransform(via)
+                a = mp.MultiplyTransform(transform).ArrayData
+                return float(a[0]), float(a[1])
+            try:
+                com_map((0.0, 0.0, 0.0))
+                return com_map, "com"
+            except Exception as exc:
+                steps.append(f"MathUtility transform failed ({exc}) - using the transform matrix")
 
-        def to_view(xyz, via=None):
-            mp = math_util.CreatePoint(VARIANT(pythoncom.VT_ARRAY | pythoncom.VT_R8,
-                                               tuple(float(v) for v in xyz)))
+        data = self._get(transform, "ArrayData")
+        if not data or len(data) < 13:
+            raise RuntimeError("transform matrix not available")
+        d = [float(v) for v in data]
+        rows = [d[0:3], d[3:6], d[6:9]]
+        state = {"transpose": False, "k": d[12] or 1.0}
+
+        def mat_map(xyz, via=None):
             if via is not None:
-                mp = mp.MultiplyTransform(via)
-            a = mp.MultiplyTransform(transform).ArrayData
-            return float(a[0]), float(a[1])
-        return to_view
+                raise RuntimeError("sketch transform needs MathUtility")
+            r = rows if not state["transpose"] else [[rows[j][i] for j in range(3)] for i in range(3)]
+            x, y, z = xyz
+            return (state["k"] * (r[0][0] * x + r[0][1] * y + r[0][2] * z),
+                    state["k"] * (r[1][0] * x + r[1][1] * y + r[1][2] * z))
+        mat_map.state = state
+        return mat_map, "matrix"
+
+    def _view_mapper(self, view, steps, verbose=False):
+        """Function xyz -> (x, y) in SHEET coordinates, calibrated against the view's outline.
+        .vb = bounding box of the view's vertices in sheet coordinates."""
+        to_view, kind = self._make_mapper(view, steps)
+        points = [p for p in (self._get(v, "GetPoint") for v in self._view_vertices(view)) if p]
+        if len(points) < 2:
+            raise RuntimeError("no vertices in the view")
+        outline = self._get(view, "GetOutline")
+        ow, oh = outline[2] - outline[0], outline[3] - outline[1]
+
+        def bbox():
+            xy = [to_view(p) for p in points]
+            return (min(x for x, _ in xy), min(y for _, y in xy), max(x for x, _ in xy), max(y for _, y in xy))
+
+        if kind == "matrix":                         # choose the matrix convention and the scale by the outline
+            state, best = to_view.state, None
+            for transpose in (False, True):
+                state["transpose"], state["k"] = transpose, 1.0
+                b = bbox()
+                w, h = b[2] - b[0], b[3] - b[1]
+                err = abs(w / h - ow / oh) if h > 1e-9 and oh > 1e-9 else abs(w - ow)
+                if best is None or err < best[0]:
+                    best = (err, transpose, w)
+            state["transpose"] = best[1]
+            state["k"] = ow / best[2] if best[2] > 1e-9 else 1.0
+        vb = bbox()
+        off = ((outline[0] + outline[2]) / 2.0 - (vb[0] + vb[2]) / 2.0,
+               (outline[1] + outline[3]) / 2.0 - (vb[1] + vb[3]) / 2.0)
+        if abs((vb[2] - vb[0]) - ow) > 0.05 * max(ow, 1e-9):
+            steps.append("warning: view transform and outline sizes differ")
+        if verbose:
+            steps.append(f"point transform: {kind}")
+
+        def to_sheet(xyz, via=None):
+            x, y = to_view(xyz, via)
+            return x + off[0], y + off[1]
+        to_sheet.vb = (vb[0] + off[0], vb[1] + off[1], vb[2] + off[0], vb[3] + off[1])
+        return to_sheet
 
     def _segment_xyz(self, segment):
         points = []
@@ -624,17 +695,9 @@ class SwDrawingExporter:
 
             # ---- geometry in sheet coordinates ----
             stage = "geometry"
-            to_view = self._make_mapper(view)
-            vxy = [to_view(p) for p in (self._get(v, "GetPoint") for v in self._view_vertices(view)) if p]
-            if len(vxy) < 2:
-                steps.append("bend dimensions skipped: no vertices in the view")
-                return
-            vb = (min(x for x, _ in vxy), min(y for _, y in vxy), max(x for x, _ in vxy), max(y for _, y in vxy))
+            to_sheet = self._view_mapper(view, steps, verbose=True)
+            vb = to_sheet.vb
             outline = self._get(view, "GetOutline")
-            off = ((outline[0] + outline[2]) / 2.0 - (vb[0] + vb[2]) / 2.0,
-                   (outline[1] + outline[3]) / 2.0 - (vb[1] + vb[3]) / 2.0)
-            if abs((vb[2] - vb[0]) - (outline[2] - outline[0])) > 0.05 * (outline[2] - outline[0]):
-                steps.append("warning: view transform and outline sizes differ")
             tol = 0.02 * max(vb[2] - vb[0], vb[3] - vb[1])
 
             stage = "edges"
@@ -647,24 +710,23 @@ class SwDrawingExporter:
                 q = self._get(self._get(e, "GetEndVertex"), "GetPoint")
                 if not p or not q:
                     continue
-                a, b = to_view(p), to_view(q)
-                edges.append(((a[0] + off[0], a[1] + off[1]), (b[0] + off[0], b[1] + off[1]), e))
+                edges.append((to_sheet(p), to_sheet(q), e))
             steps.append(f"straight edges used: {len(edges)}")
 
             stage = "bend line positions"
             bends = []
             for i, seg in enumerate(lines):
                 pts = self._segment_xyz(seg)
-                candidates = [[to_view(pt) for pt in pts]]
+                candidates = [[to_sheet(pt) for pt in pts]]
                 try:                                                    # sketch space -> model space
                     inv = self._get(self._get(self._get(seg, "GetSketch"), "ModelToSketchTransform"), "Inverse")
                     if inv is not None:
-                        candidates.append([to_view(pt, via=inv) for pt in pts])
+                        candidates.append([to_sheet(pt, via=inv) for pt in pts])
                 except Exception:
                     pass
                 found = None
                 for k, cand in enumerate(candidates):
-                    c2 = [(x + off[0], y + off[1]) for x, y in cand]
+                    c2 = cand
                     if all(vb[0] - tol <= x <= vb[2] + tol and vb[1] - tol <= y <= vb[3] + tol for x, y in c2):
                         found = c2
                         break
