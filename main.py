@@ -12,7 +12,7 @@ except ImportError:
     raise
 
 from solidworks.assembly import SolidWorksAssembly, find_assemblies
-from solidworks.sw_drawings import SwDrawingExporter
+from solidworks.sw_drawing import SwDrawingExporter
 from solidworks.dwg_exporter import DwgExporter
 from solidworks.thickness_dwg import ThicknessDwgBuilder
 from solidworks.sheet_metal import SheetMetalDetector
@@ -23,61 +23,60 @@ ODA_CONVERTER_PATH = None
 PART_GAP = 20.0
 MAX_ROW_WIDTH = 6000.0
 
-# True  -> only one SLDDRW (flat pattern) per part, no DXF/DWG.
+# True -> only one SLDDRW (flat pattern) per part, no DXF/DWG.
 # False -> additionally run the old DXF merge / DWG export.
 SLDDRW_ONLY = True
-# Reuse the sheet metal scan of the last run (output/scan_cache.json).
 USE_SCAN_CACHE = True
 
 # ---- flat pattern SLDDRW ----
 EXPORT_SLDDRW = True
-MASTER_DRAWING_NAME = "master.slddrw"   # in the input folder: your sheet format + title block
-SHEET_FORMAT_NAME = None                # e.g. "format.slddrt" (input folder); None = use the format inside master.slddrw
-# Placeholder text in the sheet format -> value. Fields: PartName, Quantity, Thickness, Material, Configuration
+MASTER_DRAWING_NAME = "master.slddrw"
+SHEET_FORMAT_NAME = None
 SHEET_TEXT_REPLACEMENTS = {
     "{PART_NAME}": "PartName",
     "{QTY}": "Quantity",
     "{THICKNESS}": "Thickness",
     "{MATERIAL}": "Material",
 }
-# Sheet layout (like the reference drawing: Top view, Front view, Flat pattern, QTY note, bend table)
-ADD_FOLDED_VIEWS = True               # Top + Front view above the flat pattern
-LAYOUT = {                            # same page logic as the PDF drawing (all values in mm unless stated)
-    "margin_mm": 10,                  # sheet border inset
-    "side_pad_mm": 0,                 # free space between the border and the views
+
+ADD_FOLDED_VIEWS = True  # Top + Front above the flat pattern
+LAYOUT = {
+    "margin_mm": 10,
+    "side_pad_mm": 0,
     "top_pad_mm": 5,
-    "table_gap_mm": 0,                # gap between the title block and the bend table (0 = attached)
-    "table_clearance_mm": 9,          # free space between the bend table and the flat pattern area
-    "folded_band_ratio": 0.38,        # Top/Front views use the upper 38% of the free area, the flat pattern the rest
+    "table_gap_mm": 0,
+    "table_clearance_mm": 9,
+    "folded_band_ratio": 0.38,
     "band_gap_mm": 2,
-    "view_gap_mm": 12,                # gap between Top and Front view
-    "dim_pad_mm": 12,                 # room kept free around each view for its dimension lines
-    "common_scale": False,            # True = all views share one scale, False = a scale per group
-    "bend_dim_pad_mm": 18,            # free space below the flat pattern for the bend dimensions
-    "auto_rotate_flat": True,         # rotate a tall flat pattern by 90 deg so its long side is horizontal
-    "scale_mode": "fine",             # "fine" = 1:n for any whole n (as large as fits), "standard" = fixed list
+    "view_gap_mm": 12,
+    "dim_pad_mm": 12,
+    "common_scale": False,
+    "bend_dim_pad_mm": 18,
+    "auto_rotate_flat": True,
+    "scale_mode": "fine",
 }
-# Bend dimensions: bend line -> nearest outer edge, sorted, stacked on levels so numbers never overlap
+
+# Bend dimensions: bend line -> nearest parallel outer edge.
 ADD_BEND_DIMENSIONS = True
-BEND_DIM_ORDER = "largest_first"      # "largest_first" (largest nearest to the view) or "smallest_first"
-BEND_DIM_OFFSET_MM = 8                # distance of the first level from the flat pattern
-BEND_DIM_STEP_MM = 7                  # distance between levels
-BEND_DIM_TEXT_WIDTH_MM = 14           # width reserved for one number
+BEND_DIM_ORDER = "largest_first"  # largest dimensions are placed farther outward
+BEND_DIM_OFFSET_MM = 8
+BEND_DIM_STEP_MM = 7
+BEND_DIM_TEXT_WIDTH_MM = 14
 ADD_QTY_NOTE = True
-QTY_NOTE_X_MM = None                    # position of the "QTY=n" note (from the sheet's left / bottom edge)
-QTY_NOTE_Y_MM = None            # None = computed like the PDF version (left of the table)
-# Overall dimensions of every view (length + width)
+QTY_NOTE_X_MM = None
+QTY_NOTE_Y_MM = None
+
+# Overall dimensions for Flat, Top and Front views.
 ADD_DIMENSIONS = True
-DIMENSION_OFFSET_MM = 8               # distance of the dimension lines from the view
-# Bend table: every bend gets a letter tag (A, B, C...) on the flat pattern and the same tag in the table
+DIMENSION_OFFSET_MM = 8
+
 INSERT_BEND_TABLE = True
-BEND_TABLE_START_TAG = "A"             # "A" = letters, "1" = numbers
-BEND_TABLE_TEMPLATE_NAME = None        # e.g. "bend.sldbndtbt" in the input folder (columns: Tag, Direction, Angle, Inner Radius)
-BEND_TABLE_RIGHT_MARGIN_MM = 10        # distance of the table's right edge from the sheet's right edge
-BEND_TABLE_BOTTOM_MM = 66              # height of the title block's top edge above the sheet bottom
-# Columns whose header contains one of these words are deleted (only used when no custom template is given)
+BEND_TABLE_START_TAG = "A"
+BEND_TABLE_TEMPLATE_NAME = None
+BEND_TABLE_RIGHT_MARGIN_MM = 10
+BEND_TABLE_BOTTOM_MM = 66
 BEND_TABLE_REMOVE_WORDS = ("factor", "allowance", "deduction", "length", "thickness")
-SLDDRW_LIMIT = 2            # e.g. 1 = test on the first part only, None = all parts
+SLDDRW_LIMIT = None  # e.g. 1 = test first part only, None = all parts
 
 
 def connect_to_solidworks():
@@ -205,7 +204,7 @@ def load_scan_cache(output_folder, assembly_path):
 
 
 def export_slddrw_files(sw_app, assembly_path, scan_result, output_folder, input_folder):
-    """Copies master.slddrw for every part, runs Edit Sheet Format, adds the flat pattern view and saves."""
+    """Copy master.slddrw for each part, add views/dimensions/table, then save."""
     master_path = input_folder / MASTER_DRAWING_NAME
     if not master_path.is_file():
         print(f"\nMASTER DRAWING NOT FOUND: {master_path}")
@@ -254,7 +253,7 @@ def export_slddrw_files(sw_app, assembly_path, scan_result, output_folder, input
     for index, item in enumerate(items, 1):
         stem = exporter._safe_name(item.get("name") or Path(item["path"]).stem)
         base, n = stem, 2
-        while stem.lower() in used_names:      # same name with different configuration
+        while stem.lower() in used_names:
             stem = f"{base}_{n}"
             n += 1
         used_names.add(stem.lower())
@@ -304,7 +303,6 @@ def main():
         return 1
 
     scan_result = load_scan_cache(output_folder, assembly_path) if USE_SCAN_CACHE else None
-
     if scan_result is not None:
         print("\n" + "=" * 60)
         print("USING THE SAVED SCAN (no parts are scanned again)")
@@ -316,10 +314,8 @@ def main():
         if not components:
             print("No components found. Stopping.")
             return 1
-
         unique_parts = assembly.get_unique_part_quantities(components)
         print_summary(components, unique_parts)
-
         detector = SheetMetalDetector(sw_app, assembly_path=assembly_path, read_thickness=GROUP_BY_THICKNESS)
         scan_result = detector.scan_and_export(unique_parts, output_folder)
         if USE_SCAN_CACHE:
@@ -333,12 +329,7 @@ def main():
             print(f"\nSLDDRW EXPORT FAILED (continuing): {type(exc).__name__}: {exc}")
             traceback.print_exc()
 
-    exporter = DwgExporter(
-        sw_app,
-        assembly_path=assembly_path,
-        reconnect=connect_to_solidworks,
-    )
-
+    exporter = DwgExporter(sw_app, assembly_path=assembly_path, reconnect=connect_to_solidworks)
     drawing_result = None
     try:
         if SLDDRW_ONLY:
@@ -371,7 +362,6 @@ def main():
             pass
 
     save_run_summary(output_folder, assembly_path, scan_result, drawing_result, slddrw_result)
-
     print("\n" + "=" * 60)
     print("PROCESS FINISHED")
     print("=" * 60)
