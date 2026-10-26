@@ -667,8 +667,13 @@ class SwDrawingExporter:
         rows = [d[0:3], d[3:6], d[6:9]]
         state = {"transpose": False, "k": d[12] or 1.0}
 
-        def apply_transform(xyz, xform, transpose=False, scale_override=None):
-            """Apply a SolidWorks MathTransform matrix, including translation."""
+        def apply_transform(xyz, xform, transpose=None, scale_override=None):
+            """Apply a SolidWorks MathTransform matrix, including translation.
+
+            The same ArrayData orientation selected from ModelToViewTransform is used
+            for chained sketch transforms as well; mixing conventions here can move
+            bend segments outside the drawing-view bounds.
+            """
             if xform is None:
                 return tuple(float(v) for v in xyz)
             arr = self._get(xform, "ArrayData")
@@ -676,11 +681,11 @@ class SwDrawingExporter:
                 raise RuntimeError("transform matrix data unavailable")
             a = [float(v) for v in arr]
             rr = [a[0:3], a[3:6], a[6:9]]
-            if transpose:
+            use_transpose = state["transpose"] if transpose is None else transpose
+            if use_transpose:
                 rr = [[rr[j][i] for j in range(3)] for i in range(3)]
             x, y, z = (float(v) for v in xyz)
             sc = float(scale_override if scale_override is not None else (a[12] or 1.0))
-            # SolidWorks MathTransform: 9 rotation values, 3 translation values, scale.
             return (sc * (rr[0][0]*x + rr[0][1]*y + rr[0][2]*z) + a[9],
                     sc * (rr[1][0]*x + rr[1][1]*y + rr[1][2]*z) + a[10],
                     sc * (rr[2][0]*x + rr[2][1]*y + rr[2][2]*z) + a[11])
@@ -808,7 +813,20 @@ class SwDrawingExporter:
                         found = c2
                         break
                 if found is None:
-                    steps.append(f"bend line {i}: position does not match the view - skipped")
+                    # Keep a useful diagnostic: distinguishes a coordinate-space problem
+                    # from a genuinely missing/invalid bend segment.
+                    try:
+                        raw_box = (min(p[0] for p in pts), min(p[1] for p in pts),
+                                   max(p[0] for p in pts), max(p[1] for p in pts))
+                        cand_boxes = []
+                        for cand in candidates:
+                            cand_boxes.append((round(min(p[0] for p in cand), 6),
+                                               round(min(p[1] for p in cand), 6),
+                                               round(max(p[0] for p in cand), 6),
+                                               round(max(p[1] for p in cand), 6)))
+                        steps.append(f"bend line {i}: outside view bounds; raw={tuple(round(v,6) for v in raw_box)}, candidates={cand_boxes}, view={tuple(round(v,6) for v in vb)}")
+                    except Exception:
+                        steps.append(f"bend line {i}: position does not match the view - skipped")
                     continue
                 bends.append((seg, found))
 
