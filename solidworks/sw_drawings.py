@@ -54,7 +54,7 @@ class SwDrawingExporter:
                  add_dimensions=True, dimension_offset_mm=15,
                  add_qty_note=True, qty_note_x_mm=None, qty_note_y_mm=None,
                  add_bend_dimensions=True, bend_dim_offset_mm=8, bend_dim_step_mm=7,
-                 bend_dim_text_width_mm=14, bend_dim_order="largest_first",bend_dim_inside=True):
+                 bend_dim_text_width_mm=14, bend_dim_order="largest_first"):
         self.sw_app = sw_app
         self.assembly_path = Path(assembly_path).resolve() if assembly_path else None
         self.reconnect = reconnect
@@ -80,7 +80,7 @@ class SwDrawingExporter:
         self.bend_dim_step_mm = bend_dim_step_mm
         self.bend_dim_text_width_mm = bend_dim_text_width_mm
         self.bend_dim_order = bend_dim_order
-        self.bend_dim_inside = bend_dim_inside
+
     # ---------------- helpers ----------------
     @staticmethod
     def _safe_name(name):
@@ -862,25 +862,40 @@ class SwDrawingExporter:
                 ux, uy = dx / length, dy / length
                 nx, ny = -uy, ux
                 s0 = nx * A[0] + ny * A[1]
-
-                # outermost parallel edge on each side of the bend line
-                pos = neg = None
+                # Only compare edges whose projection along the bend direction
+                # overlaps the bend segment. Otherwise a distant, unrelated edge
+                # (or another bend line) can be selected and produce dimensions
+                # such as 2064 mm instead of the edge setback.
+                bend_t0 = min(A[0] * ux + A[1] * uy, B[0] * ux + B[1] * uy)
+                bend_t1 = max(A[0] * ux + A[1] * uy, B[0] * ux + B[1] * uy)
+                span_tol = max(0.001, 0.01 * length)
+                pos_candidates = []
+                neg_candidates = []
                 for p, q, e in edges:
-                    le = math.hypot(q[0] - p[0], q[1] - p[1])
-                    if le < 1e-6 or abs(ux * (q[1] - p[1]) - uy * (q[0] - p[0])) / le > 0.01:
-                        continue                                        # not parallel to the bend line
+                    ex, ey = q[0] - p[0], q[1] - p[1]
+                    le = math.hypot(ex, ey)
+                    if le < 1e-6 or abs(ux * ey - uy * ex) / le > 0.01:
+                        continue  # only edges parallel to the bend line
+                    edge_t0 = min(p[0] * ux + p[1] * uy, q[0] * ux + q[1] * uy)
+                    edge_t1 = max(p[0] * ux + p[1] * uy, q[0] * ux + q[1] * uy)
+                    if edge_t1 < bend_t0 - span_tol or edge_t0 > bend_t1 + span_tol:
+                        continue  # edge does not lie alongside this bend segment
                     delta = nx * p[0] + ny * p[1] - s0
                     if abs(delta) < 1e-4:
-                        continue
-                    if delta > 0 and (pos is None or delta > pos[0]):   # farthest = outer edge
-                        pos = (delta, e, 1.0)
-                    if delta < 0 and (neg is None or -delta > neg[0]):
-                        neg = (-delta, e, -1.0)
+                        continue  # the bend line itself
+                    if delta > 0:
+                        pos_candidates.append((delta, e, 1.0))
+                    else:
+                        neg_candidates.append((-delta, e, -1.0))
+
+                # On each side, choose the OUTERMOST parallel edge, not the
+                # nearest parallel entity (which may be another bend line).
+                pos = max(pos_candidates, key=lambda o: o[0]) if pos_candidates else None
+                neg = max(neg_candidates, key=lambda o: o[0]) if neg_candidates else None
                 options = [o for o in (pos, neg) if o]
                 if not options:
-                    steps.append("a bend line has no parallel edge - skipped")
+                    steps.append("bend line has no overlapping outer-edge candidate - skipped")
                     continue
-                # of the two outer edges, take the closer one (the "37.10" in the reference)
                 dist, edge, sign = min(options, key=lambda o: o[0])
                 tx, ty = A[0] + sign * dist * nx, A[1] + sign * dist * ny
                 if abs(nx) >= abs(ny):
@@ -888,8 +903,7 @@ class SwDrawingExporter:
                 else:
                     group, lo, hi = "v", min(A[1], ty), max(A[1], ty)
                 items.append({"seg": seg, "edge": edge, "group": group, "lo": lo, "hi": hi,
-                              "mid": (lo + hi) / 2.0, "value": dist / scale * 1000.0,
-                              "cx": (A[0] + B[0]) / 2.0, "cy": (A[1] + B[1]) / 2.0})
+                              "mid": (lo + hi) / 2.0, "value": dist / scale * 1000.0})
 
             # ---- order + levels (no overlapping numbers) ----
             stage = "levels"
@@ -922,21 +936,19 @@ class SwDrawingExporter:
 
             created, too_low = 0, False
             for it in items:
-                if self.bend_dim_inside:
-                    # inside the view, next to the bend line (like the reference drawing)
-                    if it["group"] == "h":      # bend line vertical, dimension measured along x
-                        px, py = it["mid"], it["cy"] - 0.008 - it["level"] * step
-                    else:                       # bend line horizontal, dimension measured along y
-                        px, py = it["cx"] + 0.008 + it["level"] * step, it["mid"]
-                elif it["group"] == "h":
+                if it["group"] == "h":                       # measured along x -> stacked BELOW the view
                     px, py = it["mid"], outline[1] - start - it["level"] * step
                     too_low = too_low or py < limit_bottom
-                else:
+                else:                                        # measured along y -> stacked at the RIGHT
                     px, py = outline[2] + start + it["level"] * step, it["mid"]
-                    if px > width - self.layout["margin_mm"] / 1000.0:
+                    if px > width - self.layout["margin_mm"] / 1000.0:       # no room: use the left side
                         px = outline[0] - start - 0.010 - it["level"] * step
                 drawing.ClearSelection2(True)
-                # ... بقیه حلقه (select + AddDimension2) بدون تغییر
+                ok1, _ = self._select_vertex(view, it["seg"], False, sel)
+                ok2, _ = self._select_vertex(view, it["edge"], True, sel)
+                if ok1 and ok2 and drawing.AddDimension2(px, py, 0.0) is not None:
+                    created += 1
+            drawing.ClearSelection2(True)
             levels = {g: 1 + max([i["level"] for i in items if i["group"] == g] or [-1]) for g in ("h", "v")}
             steps.append(f"bend dimensions: {created}/{len(items)} created, values "
                          f"{[round(i['value'], 2) for i in items]}, levels {levels}")
