@@ -12,7 +12,7 @@ except ImportError:
     raise
 
 from solidworks.assembly import SolidWorksAssembly, find_assemblies
-from solidworks.sw_drawings import SwDrawingExporter
+from solidworks.sw_drawing import SwDrawingExporter
 from solidworks.dwg_exporter import DwgExporter
 from solidworks.thickness_dwg import ThicknessDwgBuilder
 from solidworks.sheet_metal import SheetMetalDetector
@@ -76,8 +76,8 @@ BEND_TABLE_TEMPLATE_NAME = None
 BEND_TABLE_RIGHT_MARGIN_MM = 10
 BEND_TABLE_BOTTOM_MM = 66
 BEND_TABLE_REMOVE_WORDS = ("factor", "allowance", "deduction", "length", "thickness")
-SLDDRW_LIMIT = 2  # e.g. 1 = test first part only, None = all parts
-bend_dim_order="smallest_first"
+SLDDRW_LIMIT = None  # e.g. 1 = test first part only, None = all parts
+
 
 def connect_to_solidworks():
     print("\nConnecting to SolidWorks...")
