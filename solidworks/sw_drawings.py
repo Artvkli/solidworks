@@ -588,16 +588,57 @@ class SwDrawingExporter:
             steps.append(f"dimensions {label} failed at '{stage}': {exc}")
 
     # ---------------- bend dimensions ----------------
-    def _view_edges(self, view):
+    def _view_edges(self, view, steps=None):
+        """Return visible edge entities, tolerating pywin32 SAFEARRAY/tuple variants.
+
+        swViewEntityType_e: Edge=1, SilhouetteEdge=3. Some SolidWorks versions
+        return a tuple/SAFEARRAY wrapper, so don't assume entities[0] is the edge.
+        """
         nothing = VARIANT(pythoncom.VT_DISPATCH, None)
-        for entity_type in (1, 2, 3, 4):
+        found = []
+        diagnostics = []
+
+        def as_items(value):
+            if value is None:
+                return []
+            # Some COM wrappers return (SAFEARRAY, status) instead of the array.
+            if isinstance(value, tuple) and len(value) == 2 and isinstance(value[1], (bool, int)):
+                value = value[0]
             try:
-                entities = view.GetVisibleEntities2(nothing, entity_type)
+                return list(value)
             except Exception:
-                continue
-            if entities and self._get(entities[0], "GetStartVertex") is not None:
-                return list(entities)
-        return []
+                return [value]
+
+        def looks_like_edge(obj):
+            if obj is None:
+                return False
+            try:
+                start = self._get(obj, "GetStartVertex")
+                end = self._get(obj, "GetEndVertex")
+                if start is not None and end is not None:
+                    return True
+            except Exception:
+                pass
+            # Fallback for wrappers exposing only curve/start/end point methods.
+            return (self._get(obj, "GetCurve") is not None and
+                    (self._get(obj, "GetStartPoint2") is not None or
+                     self._get(obj, "GetEndPoint2") is not None))
+
+        # Edge and silhouette-edge collections are the only relevant types here.
+        for entity_type in (1, 3):
+            try:
+                raw = view.GetVisibleEntities2(nothing, entity_type)
+                items = as_items(raw)
+                edges = [obj for obj in items if looks_like_edge(obj)]
+                diagnostics.append(f"type {entity_type}: {len(items)} entities/{len(edges)} edges")
+                for edge in edges:
+                    if not any(edge is prior for prior in found):
+                        found.append(edge)
+            except Exception as exc:
+                diagnostics.append(f"type {entity_type}: {exc}")
+        if steps is not None:
+            steps.append("visible edge scan: " + "; ".join(diagnostics))
+        return found
 
     def _make_mapper(self, view, steps):
         """model space -> view space. Uses SolidWorks' MathUtility; if that fails, the transform matrix."""
@@ -626,13 +667,34 @@ class SwDrawingExporter:
         rows = [d[0:3], d[3:6], d[6:9]]
         state = {"transpose": False, "k": d[12] or 1.0}
 
+        def apply_transform(xyz, xform, transpose=False, scale_override=None):
+            """Apply a SolidWorks MathTransform matrix, including translation."""
+            if xform is None:
+                return tuple(float(v) for v in xyz)
+            arr = self._get(xform, "ArrayData")
+            if arr is None or len(arr) < 13:
+                raise RuntimeError("transform matrix data unavailable")
+            a = [float(v) for v in arr]
+            rr = [a[0:3], a[3:6], a[6:9]]
+            if transpose:
+                rr = [[rr[j][i] for j in range(3)] for i in range(3)]
+            x, y, z = (float(v) for v in xyz)
+            sc = float(scale_override if scale_override is not None else (a[12] or 1.0))
+            # SolidWorks MathTransform: 9 rotation values, 3 translation values, scale.
+            return (sc * (rr[0][0]*x + rr[0][1]*y + rr[0][2]*z) + a[9],
+                    sc * (rr[1][0]*x + rr[1][1]*y + rr[1][2]*z) + a[10],
+                    sc * (rr[2][0]*x + rr[2][1]*y + rr[2][2]*z) + a[11])
+
         def mat_map(xyz, via=None):
-            if via is not None:
-                raise RuntimeError("sketch transform needs MathUtility")
+            # Bend-line endpoints may be in sketch space. Convert sketch -> model
+            # first, then model -> view. Previously this path always raised and
+            # caused every bend line to be discarded when MathUtility was unavailable.
+            model_xyz = apply_transform(xyz, via) if via is not None else tuple(float(v) for v in xyz)
+            x, y, z = model_xyz
             r = rows if not state["transpose"] else [[rows[j][i] for j in range(3)] for i in range(3)]
-            x, y, z = xyz
-            return (state["k"] * (r[0][0] * x + r[0][1] * y + r[0][2] * z),
-                    state["k"] * (r[1][0] * x + r[1][1] * y + r[1][2] * z))
+            sc = state["k"]
+            return (sc * (r[0][0]*x + r[0][1]*y + r[0][2]*z),
+                    sc * (r[1][0]*x + r[1][1]*y + r[1][2]*z))
         mat_map.state = state
         return mat_map, "matrix"
 
@@ -702,15 +764,28 @@ class SwDrawingExporter:
 
             stage = "edges"
             edges = []
-            for e in self._view_edges(view):
+            for e in self._view_edges(view, steps):
                 curve = self._get(e, "GetCurve")
-                if curve is not None and self._get(curve, "IsLine") is False:
+                is_line = self._get(curve, "IsLine") if curve is not None else None
+                if is_line is False:
                     continue
-                p = self._get(self._get(e, "GetStartVertex"), "GetPoint")
-                q = self._get(self._get(e, "GetEndVertex"), "GetPoint")
-                if not p or not q:
+                sv = self._get(e, "GetStartVertex")
+                ev = self._get(e, "GetEndVertex")
+                p = self._get(sv, "GetPoint") if sv is not None else None
+                q = self._get(ev, "GetPoint") if ev is not None else None
+                # Point2 endpoints are a fallback for edge wrappers that do not
+                # expose IVertex objects consistently through pywin32.
+                if p is None or q is None:
+                    p = self._get(e, "GetStartPoint2")
+                    q = self._get(e, "GetEndPoint2")
+                if p is None or q is None:
                     continue
-                edges.append((to_sheet(p), to_sheet(q), e))
+                try:
+                    p = tuple(float(p[i]) for i in range(3))
+                    q = tuple(float(q[i]) for i in range(3))
+                    edges.append((to_sheet(p), to_sheet(q), e))
+                except Exception:
+                    continue
             steps.append(f"straight edges used: {len(edges)}")
 
             stage = "bend line positions"
@@ -719,11 +794,13 @@ class SwDrawingExporter:
                 pts = self._segment_xyz(seg)
                 candidates = [[to_sheet(pt) for pt in pts]]
                 try:                                                    # sketch space -> model space
-                    inv = self._get(self._get(self._get(seg, "GetSketch"), "ModelToSketchTransform"), "Inverse")
+                    sketch = self._get(seg, "GetSketch")
+                    model_to_sketch = self._get(sketch, "ModelToSketchTransform") if sketch is not None else None
+                    inv = self._get(model_to_sketch, "Inverse") if model_to_sketch is not None else None
                     if inv is not None:
                         candidates.append([to_sheet(pt, via=inv) for pt in pts])
-                except Exception:
-                    pass
+                except Exception as exc:
+                    steps.append(f"bend line {i}: sketch transform fallback failed ({exc})")
                 found = None
                 for k, cand in enumerate(candidates):
                     c2 = cand
