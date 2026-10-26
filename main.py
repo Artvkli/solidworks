@@ -53,8 +53,15 @@ LAYOUT = {                            # same page logic as the PDF drawing (all 
     "view_gap_mm": 12,                # gap between Top and Front view
     "dim_pad_mm": 12,                 # room kept free around each view for its dimension lines
     "common_scale": False,            # True = all views share one scale, False = a scale per group
+    "bend_dim_pad_mm": 18,            # free space below the flat pattern for the bend dimensions
     "scale_mode": "fine",             # "fine" = 1:n for any whole n (as large as fits), "standard" = fixed list
 }
+# Bend dimensions: bend line -> nearest outer edge, sorted, stacked on levels so numbers never overlap
+ADD_BEND_DIMENSIONS = True
+BEND_DIM_ORDER = "largest_first"      # "largest_first" (largest nearest to the view) or "smallest_first"
+BEND_DIM_OFFSET_MM = 8                # distance of the first level from the flat pattern
+BEND_DIM_STEP_MM = 7                  # distance between levels
+BEND_DIM_TEXT_WIDTH_MM = 14           # width reserved for one number
 ADD_QTY_NOTE = True
 QTY_NOTE_X_MM = None                    # position of the "QTY=n" note (from the sheet's left / bottom edge)
 QTY_NOTE_Y_MM = None            # None = computed like the PDF version (left of the table)
@@ -222,6 +229,11 @@ def export_slddrw_files(sw_app, assembly_path, scan_result, output_folder, input
         bend_table_bottom_mm=BEND_TABLE_BOTTOM_MM,
         bend_table_remove_words=BEND_TABLE_REMOVE_WORDS,
         bend_table_start_value=BEND_TABLE_START_TAG,
+        add_bend_dimensions=ADD_BEND_DIMENSIONS,
+        bend_dim_offset_mm=BEND_DIM_OFFSET_MM,
+        bend_dim_step_mm=BEND_DIM_STEP_MM,
+        bend_dim_text_width_mm=BEND_DIM_TEXT_WIDTH_MM,
+        bend_dim_order=BEND_DIM_ORDER,
         add_dimensions=ADD_DIMENSIONS,
         dimension_offset_mm=DIMENSION_OFFSET_MM,
     )
