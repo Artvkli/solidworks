@@ -715,7 +715,7 @@ class SwDrawingExporter:
         return points
 
     def _add_bend_dimensions(self, drawing, view, scale, limit_bottom, steps):
-        """One dimension per bend to the nearest outer edge of the flat pattern view."""
+        """Measures distance from every bend line to the nearest outer edge (Backgauge / Bend Offset)."""
         stage = "bend lines"
         try:
             lines = list(self._get(view, "GetBendLines") or ())
@@ -773,29 +773,29 @@ class SwDrawingExporter:
                 nx, ny = -uy, ux
                 s0 = nx * A[0] + ny * A[1]
                 
-                # پیدا کردن نزدیک‌ترین لبه موازی خارجی
+                # پیدا کردن نزدیک‌ترین لبه خارجی هم‌راستا
                 candidates = []
                 for p, q, e in edges:
                     ex, ey = q[0] - p[0], q[1] - p[1]
                     le = math.hypot(ex, ey)
                     if le < 1e-6 or abs(ux * ey - uy * ex) / le > 0.05:
-                        continue  # فقط لبه‌های موازی
+                        continue  # فقط لبه‌های موازی با خط خم
                     
                     edge_s = nx * p[0] + ny * p[1]
                     delta = abs(edge_s - s0)
                     if delta < 1e-4:
-                        continue  # خود خط خم
+                        continue  # خود خط خم است
                     
                     candidates.append((delta, e, edge_s - s0))
 
                 if not candidates:
                     continue
 
-                # انتخاب نزدیک‌ترین لبه واقعی
+                # انتخاب دقیق‌ترین و نزدیک‌ترین لبه
                 dist, edge, sign_delta = min(candidates, key=lambda o: o[0])
                 val_mm = round(dist / scale * 1000.0, 1)
 
-                # حذف مقادیر تکراری اندازه‌گذاری
+                # از اندازه‌های تکراری جلوگیری کن
                 if val_mm in seen_values:
                     continue
                 seen_values.add(val_mm)
