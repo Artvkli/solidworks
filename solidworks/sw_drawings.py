@@ -870,17 +870,19 @@ class SwDrawingExporter:
                     delta = nx * p[0] + ny * p[1] - s0
                     if abs(delta) < 1e-4:
                         continue                                        # the bend line's own edge
-                    # The requested dimension is from the bend line to the nearest
-                    # parallel edge, not to the farthest parallel edge on each side.
-                    if delta > 0 and (pos is None or delta < pos[0]):
+                    # OUTERMOST parallel edge on each side of the bend line
+                    # (= the outer boundary of the flat pattern, not inner cutout/step edges).
+                    if delta > 0 and (pos is None or delta > pos[0]):
                         pos = (delta, e, 1.0)
-                    if delta < 0 and (neg is None or -delta < neg[0]):
+                    if delta < 0 and (neg is None or -delta > neg[0]):
                         neg = (-delta, e, -1.0)
+                    
                 options = [o for o in (pos, neg) if o]
                 if not options:
                     steps.append("a bend line has no parallel edge - skipped")
                     continue
-                dist, edge, sign = min(options, key=lambda o: o[0])    # nearest parallel edge on either side
+                    # of the two outer boundaries (one per side), use the nearer one
+                dist, edge, sign = min(options, key=lambda o: o[0])
                 tx, ty = A[0] + sign * dist * nx, A[1] + sign * dist * ny
                 if abs(nx) >= abs(ny):
                     group, lo, hi = "h", min(A[0], tx), max(A[0], tx)
