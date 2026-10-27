@@ -50,6 +50,10 @@ DEFAULT_LAYOUT = {
     "auto_rotate_flat": True,      # rotate a tall flat pattern by 90 deg so its long side is horizontal
     "scale_mode": "fine",          # "fine" = 1:n for any whole n (largest view that fits), "standard" = fixed list
     "view_enlarge": 1.5,           # views target 1.5x the size of the old fixed-band layout (reduced only if it does not fit)
+    "folded_enlarge": 1.5,         # Top / Front / Right: target size vs the old layout
+    "flat_enlarge": 1.5,           # flat pattern: target size vs the old layout
+    "folded_priority": True,       # if space is short, the flat pattern gives way first ...
+    "flat_min_ratio": 0.85,        # ... but never below 85% of its old size
 }
 
 # Grid cell (column, row) of each folded view inside the folded-view band; row 0 is the top row.
@@ -474,16 +478,48 @@ class SwDrawingExporter:
             cells.append((name, view, cell[0], cell[1]))
         return cells
 
+    def _layout_problems(self, folded, flat_view, pads, table_top, width, height):
+        """Every view + the room of its dimensions, checked against each other, the sheet border and the
+        bend table / title block. Returns a list of problems (empty = nothing overlaps)."""
+        mm = 0.001
+        dim_h, dim_v = self._dim_room()
+        m = self.layout["margin_mm"] * mm
+        tol = 0.2 * mm
+        boxes = []
+        for name, v in folded:
+            o = self._get(v, "GetOutline")
+            if o:
+                boxes.append((name, (o[0], o[1], o[2] + dim_v, o[3] + dim_h)))
+        o = self._get(flat_view, "GetOutline")
+        if o:
+            boxes.append(("flat", (o[0] - dim_v - pads.get("left", 0.0), o[1] - pads.get("bottom", 0.0),
+                                   o[2] + pads.get("right", 0.0), o[3] + dim_h + pads.get("top", 0.0))))
+        problems = []
+        for name, b in boxes:
+            if b[0] < m - tol or b[2] > width - m + tol or b[3] > height - m + tol:
+                problems.append(f"{name} outside the sheet border")
+            if b[1] < table_top - tol:
+                problems.append(f"{name} reaches the bend table / title block")
+        for i in range(len(boxes)):
+            for j in range(i + 1, len(boxes)):
+                (n1, a), (n2, b) = boxes[i], boxes[j]
+                if a[0] < b[2] - tol and b[0] < a[2] - tol and a[1] < b[3] - tol and b[1] < a[3] - tol:
+                    problems.append(f"{n1} overlaps {n2}")
+        return problems
+
     def _layout_views(self, drawing, folded, flat_view, table_top, steps, flat_pads=None):
         width, height = self._sheet_size(drawing)
         lay = self.layout
         mm = 0.001
         m, pad = lay["margin_mm"] * mm, lay["side_pad_mm"] * mm
         dim_h, dim_v = self._dim_room()
-        vgap = max(lay["view_gap_mm"] * mm, dim_h)   # the lower view's length dimension sits in the row gap
-        hgap = max(lay["view_gap_mm"] * mm, dim_v)   # the left view's width dimension sits in the column gap
+        vgap = max(lay["view_gap_mm"] * mm, dim_h)
+        hgap = max(lay["view_gap_mm"] * mm, dim_v)
         band_gap = lay["band_gap_mm"] * mm
-        enlarge = float(lay.get("view_enlarge", 1.0) or 1.0)
+        base_enlarge = float(lay.get("view_enlarge", 1.0) or 1.0)
+        folded_enlarge = float(lay.get("folded_enlarge", base_enlarge) or 1.0)
+        flat_enlarge = float(lay.get("flat_enlarge", base_enlarge) or 1.0)
+        common = bool(lay["common_scale"])
         pads = dict(self._initial_flat_pads() if flat_pads is None else flat_pads)
         left, right = m + pad, width - m - pad
         low = table_top + lay["table_clearance_mm"] * mm
@@ -513,7 +549,6 @@ class SwDrawingExporter:
             ncols, nrows = len(col_w), len(row_h)
             sum_w, sum_h = sum(col_w.values()), sum(row_h.values())
 
-            # space each group needs at scale s (geometry + outline border + gaps + dimension room)
             def folded_w(s): return sum_w * s + border_w * ncols + hgap * max(ncols - 1, 0) + dim_v
             def folded_h(s): return sum_h * s + border_h * nrows + vgap * max(nrows - 1, 0) + dim_h
             def flat_w(s): return fw * s + fbw + dim_v + pads.get("left", 0.0) + pads.get("right", 0.0)
@@ -522,7 +557,7 @@ class SwDrawingExporter:
             def limit(fixed, per_unit, room):
                 return (room - fixed) / per_unit if per_unit > 0 else 0.0
 
-            # reference = old fixed-band layout; target = reference x view_enlarge
+            # reference = old fixed-band layout
             if cells:
                 band = avail_h * lay["folded_band_ratio"]
                 ref_f = min(limit(folded_w(0), sum_w, avail_w), limit(folded_h(0), sum_h, band))
@@ -530,12 +565,18 @@ class SwDrawingExporter:
             else:
                 ref_f = None
                 ref_b = min(limit(flat_w(0), fw, avail_w), limit(flat_h(0), fh, avail_h))
-            target_b = max(ref_b * enlarge, 1e-9)
-            target_f = max(ref_f * enlarge, 1e-9) if cells else None
+            target_b = max(ref_b * flat_enlarge, 1e-9)
+            target_f = max(ref_f * folded_enlarge, 1e-9) if cells else None
+            flat_floor = (ref_b * float(lay.get("flat_min_ratio", 0.85))
+                          if cells and lay.get("folded_priority", True) and ref_b > 0 else None)
+
             sb = self._fit_scale(target_b)
             sf = self._fit_scale(target_f) if cells else None
-            if lay["common_scale"] and cells:
+            if common and cells:
                 sf = sb = min(sf, sb)
+
+            def step(s):
+                return self._fit_scale(s * 0.97)
 
             def fits(sf_, sb_):
                 if flat_w(sb_) > avail_w + 1e-6:
@@ -544,86 +585,99 @@ class SwDrawingExporter:
                     return flat_h(sb_) <= avail_h + 1e-6
                 return folded_w(sf_) <= avail_w + 1e-6 and folded_h(sf_) + band_gap + flat_h(sb_) <= avail_h + 1e-6
 
+            def shrink(sf_, sb_):
+                if common and cells:
+                    s = step(sb_)
+                    return s, s
+                if not cells or flat_w(sb_) > avail_w + 1e-6:
+                    return sf_, step(sb_)
+                if folded_w(sf_) > avail_w + 1e-6:
+                    return step(sf_), sb_
+                if flat_floor and step(sb_) >= flat_floor * 0.999:   # folded views first: flat gives way
+                    return sf_, step(sb_)
+                if sf_ / target_f >= sb_ / target_b:
+                    return step(sf_), sb_
+                return sf_, step(sb_)
+
             for _ in range(400):
                 if fits(sf, sb):
                     break
-                if lay["common_scale"] and cells:
-                    sf = sb = self._fit_scale(sb * 0.97)
-                elif not cells or flat_w(sb) > avail_w + 1e-6:
-                    sb = self._fit_scale(sb * 0.97)
-                elif folded_w(sf) > avail_w + 1e-6:
-                    sf = self._fit_scale(sf * 0.97)
-                elif sf / target_f >= sb / target_b:   # shrink whichever is further ahead of its target
-                    sf = self._fit_scale(sf * 0.97)
-                else:
-                    sb = self._fit_scale(sb * 0.97)
+                sf, sb = shrink(sf, sb)
 
-            # ---- boxes: folded band exactly as tall as needed, spare height shared ----
-            if cells:
-                extra = max(0.0, avail_h - folded_h(sf) - band_gap - flat_h(sb))
-                f_bot = high - folded_h(sf) - extra / 2.0
-                folded_box = (left, f_bot, right, high)
-                flat_box = (left, low, right, f_bot - band_gap)
-            else:
-                folded_box, flat_box = None, (left, low, right, high)
-            f_in = (folded_box[0], folded_box[1], folded_box[2] - dim_v, folded_box[3] - dim_h) if folded_box else None
-            b_in = (flat_box[0] + dim_v + pads.get("left", 0.0), flat_box[1] + pads.get("bottom", 0.0),
-                    flat_box[2] - pads.get("right", 0.0), flat_box[3] - dim_h - pads.get("top", 0.0))
+            for attempt in range(10):
+                # ---- boxes: folded band exactly as tall as needed, spare height shared ----
+                if cells:
+                    extra = max(0.0, avail_h - folded_h(sf) - band_gap - flat_h(sb))
+                    f_bot = high - folded_h(sf) - extra / 2.0
+                    folded_box = (left, f_bot, right, high)
+                    flat_box = (left, low, right, f_bot - band_gap)
+                else:
+                    folded_box, flat_box = None, (left, low, right, high)
+                f_in = (folded_box[0], folded_box[1], folded_box[2] - dim_v, folded_box[3] - dim_h) if folded_box else None
+                b_in = (flat_box[0] + dim_v + pads.get("left", 0.0), flat_box[1] + pads.get("bottom", 0.0),
+                        flat_box[2] - pads.get("right", 0.0), flat_box[3] - dim_h - pads.get("top", 0.0))
+
+                scales = {"flat": sb}
+                if cells:
+                    scales["folded"] = sf
+                b_w, b_h = b_in[2] - b_in[0], b_in[3] - b_in[1]
+                scales["flat"], _ = self._settle_scale(flat_view, scales["flat"], b_w, b_h)
+                if common and cells:
+                    scales["folded"] = scales["flat"] = min(scales["folded"], scales["flat"])
+                    flat_view.ScaleDecimal = scales["flat"]
+                for _, v in folded:
+                    v.ScaleDecimal = scales["folded"]
+
+                if cells:
+                    col_w2, row_h2 = {}, {}
+                    for name, v, c, r in cells:
+                        o = self._get(v, "GetOutline")
+                        col_w2[c] = max(col_w2.get(c, 0.0), o[2] - o[0])
+                        row_h2[r] = max(row_h2.get(r, 0.0), o[3] - o[1])
+                    cols, rows = sorted(col_w2), sorted(row_h2)
+                    total_w = sum(col_w2.values()) + hgap * (len(cols) - 1)
+                    total_h = sum(row_h2.values()) + vgap * (len(rows) - 1)
+                    x = (f_in[0] + f_in[2]) / 2.0 - total_w / 2.0
+                    col_x = {}
+                    for c in cols:
+                        col_x[c] = x + col_w2[c] / 2.0
+                        x += col_w2[c] + hgap
+                    y = (f_in[1] + f_in[3]) / 2.0 + total_h / 2.0
+                    row_y = {}
+                    for r in rows:
+                        row_y[r] = y - row_h2[r] / 2.0
+                        y -= row_h2[r] + vgap
+                    for name, v, c, r in cells:
+                        self._move_view(v, col_x[c], row_y[r])
+                self._move_view(flat_view, (b_in[0] + b_in[2]) / 2.0, (b_in[1] + b_in[3]) / 2.0)
+
+                problems = self._layout_problems(folded, flat_view, pads, table_top, width, height)
+                if not problems:
+                    break
+                steps.append(f"overlap check (attempt {attempt + 1}): {problems} -> views reduced one step")
+                sb = step(scales["flat"])
+                sf = sb if (common or not cells) else step(scales["folded"])
+
             steps.append(f"sheet {width * 1000:.0f} x {height * 1000:.0f} mm | table top {table_top * 1000:.0f} mm | "
                          f"flat area {flat_box[1] * 1000:.0f}-{flat_box[3] * 1000:.0f} mm"
                          + (f" | folded area {folded_box[1] * 1000:.0f}-{folded_box[3] * 1000:.0f} mm" if folded_box else "")
                          + f" | gaps h {hgap * 1000:.0f} / v {vgap * 1000:.0f} mm"
                          + " | bend dim room " + ", ".join(f"{k} {v * 1000:.0f}" for k, v in pads.items() if v))
-
-            scales = {"flat": sb}
-            if cells:
-                scales["folded"] = sf
-            b_w, b_h = b_in[2] - b_in[0], b_in[3] - b_in[1]
-            scales["flat"], _ = self._settle_scale(flat_view, scales["flat"], b_w, b_h)
-            if lay["common_scale"] and cells:
-                scales["folded"] = scales["flat"] = min(scales["folded"], scales["flat"])
-                flat_view.ScaleDecimal = scales["flat"]
-            for _, v in folded:
-                v.ScaleDecimal = scales["folded"]
             o = self._get(flat_view, "GetOutline")
             steps.append(f"flat pattern at {self._scale_text(scales['flat'])}: "
                          f"{(o[2] - o[0]) * 1000:.0f} x {(o[3] - o[1]) * 1000:.0f} mm "
                          f"in a box of {b_w * 1000:.0f} x {b_h * 1000:.0f} mm")
             steps.append("view size vs old layout: " + ", ".join(
-                f"{k} x{scales[k] / ref:.2f} (target x{enlarge:g})"
-                for k, ref in (("folded", ref_f), ("flat", ref_b)) if k in scales and ref and ref > 0))
-
-            if cells:
-                col_w, row_h, size = {}, {}, {}
-                for name, v, c, r in cells:
-                    o = self._get(v, "GetOutline")
-                    size[name] = (o[2] - o[0], o[3] - o[1])
-                    col_w[c] = max(col_w.get(c, 0.0), size[name][0])
-                    row_h[r] = max(row_h.get(r, 0.0), size[name][1])
-                cols, rows = sorted(col_w), sorted(row_h)
-                total_w = sum(col_w.values()) + hgap * (len(cols) - 1)
-                total_h = sum(row_h.values()) + vgap * (len(rows) - 1)
-                x = (f_in[0] + f_in[2]) / 2.0 - total_w / 2.0
-                col_x = {}
-                for c in cols:
-                    col_x[c] = x + col_w[c] / 2.0
-                    x += col_w[c] + hgap
-                y = (f_in[1] + f_in[3]) / 2.0 + total_h / 2.0
-                row_y = {}
-                for r in rows:
-                    row_y[r] = y - row_h[r] / 2.0
-                    y -= row_h[r] + vgap
-                for name, v, c, r in cells:
-                    self._move_view(v, col_x[c], row_y[r])
-                steps.append("folded views placed: " + ", ".join(f"{n} (col {c}, row {r})" for n, _, c, r in cells))
-            self._move_view(flat_view, (b_in[0] + b_in[2]) / 2.0, (b_in[1] + b_in[3]) / 2.0)
-
+                f"{k} x{scales[k] / ref:.2f} (target x{t:g})"
+                for k, ref, t in (("folded", ref_f, folded_enlarge), ("flat", ref_b, flat_enlarge))
+                if k in scales and ref and ref > 0))
+            steps.append("overlap check: " + ("OK - nothing overlaps" if not problems
+                                              else f"STILL OVERLAPPING {problems} - check manually"))
             steps.append("layout scales: " + ", ".join(f"{k} {self._scale_text(v)}" for k, v in scales.items()))
             return scales["flat"]
         except Exception as exc:
             steps.append(f"layout failed: {exc}")
             return None
-        
     def _set_sheet_scale(self, drawing, scale, steps):
         text = self._scale_text(scale)
         num, den = (1.0, float(round(1 / scale))) if scale < 1 else (float(round(scale)), 1.0)
@@ -1858,16 +1912,17 @@ class SwDrawingExporter:
             flat_scale = self._layout_views(drawing, folded, flat_view, table_top, steps, pads)
             if flat_scale and analysis and not analysis.get("error") and analysis.get("results"):
                 dim_h, dim_v = self._dim_room()
-                for _ in range(3):  # give the bend dimensions the room they actually need, then re-plan
+                for i in range(4):  # give the bend dimensions exactly the room they need, then re-plan
                     trial = self._plan_bend_dims(drawing, flat_view, analysis, table_top, [], folded, final=False)
                     if trial is None:
                         break
                     need = {k: v + 0.002 for k, v in trial["needs"].items()}
                     need["left"] = max(0.0, need["left"] - dim_v)
                     need["top"] = max(0.0, need["top"] - dim_h)
-                    if all(need[k] <= pads[k] + 0.0005 for k in SIDES):
+                    if all(need[k] <= pads[k] + 0.0005 and pads[k] - need[k] <= 0.001 for k in SIDES):
                         break
-                    pads = {k: max(pads[k], need[k]) for k in SIDES}
+                    # first rounds: exact room (unused space is given back); last round: only grow
+                    pads = dict(need) if i < 2 else {k: max(pads[k], need[k]) for k in SIDES}
                     steps.append("relayout: room for bend dimensions " +
                                  ", ".join(f"{k} {v * 1000:.0f} mm" for k, v in pads.items() if v))
                     flat_scale = self._layout_views(drawing, folded, flat_view, table_top, steps, pads) or flat_scale
