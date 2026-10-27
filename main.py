@@ -17,19 +17,23 @@ from solidworks.dwg_exporter import DwgExporter
 from solidworks.thickness_dwg import ThicknessDwgBuilder
 from solidworks.sheet_metal import SheetMetalDetector
 
-GROUP_BY_THICKNESS = True
+GROUP_BY_THICKNESS = True       # DXF/DWG: one file per thickness | SLDDRW/PDF: one folder per thickness
 REPEAT_BY_QUANTITY = False
 ODA_CONVERTER_PATH = None
 PART_GAP = 20.0
 MAX_ROW_WIDTH = 6000.0
-
-# True -> only one SLDDRW (flat pattern) per part, no DXF/DWG.
-# False -> additionally run the old DXF merge / DWG export.
-SLDDRW_ONLY = True
 USE_SCAN_CACHE = True
 
+# ---- output mode (chosen in the terminal at start; can also be given as: python main.py 1|2|3) ----
+#   label, make SLDDRW + PDF (bending), make DXF / DWG (laser)
+MODES = {
+    "1": ("DXF / DWG for laser cutting", False, True),
+    "2": ("SLDDRW + PDF for bending", True, False),
+    "3": ("Both (DXF / DWG + SLDDRW / PDF)", True, True),
+}
+
 # ---- flat pattern SLDDRW ----
-EXPORT_SLDDRW = True
+EXPORT_PDF = True               # a PDF next to every SLDDRW
 MASTER_DRAWING_NAME = "master.slddrw"
 SHEET_FORMAT_NAME = None
 SHEET_TEXT_REPLACEMENTS = {
@@ -71,7 +75,7 @@ BEND_DIM_STEP_MM = 7            # distance between stacked rows
 BEND_DIM_TEXT_WIDTH_MM = 14     # space reserved for one dimension text
 BEND_DIM_TEXT_HEIGHT_MM = 3.5
 BEND_DIM_RIGHT_PAD_MM = 18      # initial room right of the flat pattern (below: LAYOUT["bend_dim_pad_mm"]);
-                                # both grow automatically if the dimensions need more
+                                # both adapt automatically to what the dimensions need
 BEND_DIM_MERGE_COLLINEAR = True  # collinear bend lines measured to the same edge share one dimension
 BEND_DIM_VERIFY = "flag"        # each dimension is read back from SolidWorks; "flag" = report a mismatch,
                                 # "delete" = also remove the mismatching dimension
@@ -93,9 +97,33 @@ BEND_TABLE_REMOVE_WORDS = ("factor", "allowance", "deduction", "length", "thickn
 # Controlled test: only the first N sheet-metal parts (scan order) and/or the parts named here.
 # While either is set, drawings go to output/flat_drawings_test so production drawings are not overwritten.
 # Production run: SLDDRW_LIMIT = None and SLDDRW_ONLY_PARTS = None.
-SLDDRW_LIMIT = 1
+SLDDRW_LIMIT = None  # e.g. 5 - only the first N sheet-metal parts (scan order)
 SLDDRW_ONLY_PARTS = None  # e.g. ("AHU3500-08",) - part names as printed in the scan
 SLDDRW_TEST_FOLDER = "flat_drawings_test"
+
+
+def choose_mode():
+    """Terminal menu. Returns (label, make_slddrw, make_dxf) or None to quit."""
+    arg = sys.argv[1].strip() if len(sys.argv) > 1 else None
+    if arg in MODES:
+        print(f"\nMode {arg}: {MODES[arg][0]} (from the command line)")
+        return MODES[arg]
+
+    print("\nWhat do you want to export?")
+    for key, (label, _slddrw, _dxf) in MODES.items():
+        print(f"  {key}. {label}")
+    print("  0. Exit")
+    while True:
+        try:
+            choice = input("Select 1, 2 or 3: ").strip()
+        except EOFError:
+            return None
+        if choice in MODES:
+            print(f"Selected: {MODES[choice][0]}")
+            return MODES[choice]
+        if choice.lower() in ("0", "q", "exit"):
+            return None
+        print("Invalid choice - type 1, 2, 3 (or 0 to exit).")
 
 
 def connect_to_solidworks():
@@ -135,9 +163,10 @@ def print_summary(components, unique_parts):
     print(f"Unique part/config: {len(unique_parts)}")
 
 
-def save_run_summary(output_folder, assembly_path, scan_result, drawing_result, slddrw_result):
+def save_run_summary(output_folder, assembly_path, mode_label, scan_result, drawing_result, slddrw_result):
     data = {
         "assembly": str(assembly_path),
+        "mode": mode_label,
         "scan": {
             "unique_parts": scan_result.get("unique_parts", 0),
             "sheet_metal": scan_result.get("sheet_metal", 0),
@@ -148,6 +177,7 @@ def save_run_summary(output_folder, assembly_path, scan_result, drawing_result, 
         },
         "slddrw": {
             "created": len(slddrw_result["created"]) if slddrw_result else 0,
+            "pdf_failed": slddrw_result.get("pdf_failed", []) if slddrw_result else [],
             "failed": slddrw_result["failed"] if slddrw_result else [],
         },
         "drawings": {
@@ -223,7 +253,7 @@ def load_scan_cache(output_folder, assembly_path):
 
 
 def export_slddrw_files(sw_app, assembly_path, scan_result, output_folder, input_folder):
-    """Copy master.slddrw for each part, add views/dimensions/table, then save."""
+    """Copy master.slddrw for each part, add views/dimensions/table, save SLDDRW + PDF (one folder per thickness)."""
     master_path = input_folder / MASTER_DRAWING_NAME
     if not master_path.is_file():
         print(f"\nMASTER DRAWING NOT FOUND: {master_path}")
@@ -261,6 +291,8 @@ def export_slddrw_files(sw_app, assembly_path, scan_result, output_folder, input
         bend_dim_merge_collinear=BEND_DIM_MERGE_COLLINEAR,
         bend_dim_verify=BEND_DIM_VERIFY,
         bend_debug_json=BEND_DEBUG_JSON,
+        group_by_thickness=GROUP_BY_THICKNESS,
+        export_pdf=EXPORT_PDF,
     )
     items = scan_result["sheet_metal_parts"]
     test_mode = bool(SLDDRW_LIMIT or SLDDRW_ONLY_PARTS)
@@ -272,12 +304,12 @@ def export_slddrw_files(sw_app, assembly_path, scan_result, output_folder, input
     if SLDDRW_LIMIT:
         items = items[:int(SLDDRW_LIMIT)]
 
-    folder = output_folder / (SLDDRW_TEST_FOLDER if test_mode else "flat_drawings")
+    folder = output_folder / (SLDDRW_TEST_FOLDER if test_mode else "خروجی خمکاری")
     folder.mkdir(parents=True, exist_ok=True)
-    results = {"created": [], "failed": []}
+    results = {"created": [], "pdf_failed": [], "failed": []}
 
     print("\n" + "=" * 60)
-    print(f"FLAT PATTERN SLDDRW FILES ({len(items)} parts)"
+    print(f"BENDING DRAWINGS: SLDDRW{' + PDF' if EXPORT_PDF else ''} ({len(items)} parts)"
           + (f" - TEST MODE -> {folder.name}" if test_mode else ""))
     print("=" * 60)
 
@@ -294,9 +326,17 @@ def export_slddrw_files(sw_app, assembly_path, scan_result, output_folder, input
         ok, message, steps = exporter.export_part(item, slddrw_path)
         record = {"part": item.get("name"), "message": message, "steps": steps}
         if ok:
-            record.update({"slddrw": str(slddrw_path), "quantity": item.get("quantity", 1)})
+            record.update({"slddrw": item.get("slddrw_path") or str(slddrw_path),
+                           "pdf": item.get("pdf_path"),
+                           "thickness": item.get("thickness"),
+                           "quantity": item.get("quantity", 1)})
             results["created"].append(record)
-            print(f"[{index}/{len(items)}] OK: {item.get('name')}")
+            pdf_ok = message == "ok"
+            if EXPORT_PDF and not pdf_ok:
+                results["pdf_failed"].append(item.get("name"))
+            where = Path(record["slddrw"]).parent.name
+            print(f"[{index}/{len(items)}] OK: {item.get('name')} -> {where}"
+                  + ("" if pdf_ok else "  (PDF NOT saved)"))
         else:
             results["failed"].append(record)
             print(f"[{index}/{len(items)}] FAILED: {item.get('name')} -> {message}")
@@ -305,9 +345,42 @@ def export_slddrw_files(sw_app, assembly_path, scan_result, output_folder, input
 
     summary = folder / "slddrw_summary.json"
     summary.write_text(json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(f"\nSLDDRW: {len(results['created'])} created, {len(results['failed'])} failed")
+    print(f"\nSLDDRW: {len(results['created'])} created, {len(results['failed'])} failed"
+          + (f" | PDF missing for {len(results['pdf_failed'])}" if results["pdf_failed"] else ""))
     print(f"Summary: {summary}")
     return results
+
+
+def export_laser_files(sw_app, assembly_path, scan_result, output_folder):
+    """DXF export, merge per thickness and DWG conversion (laser cutting)."""
+    print("\n" + "=" * 60)
+    print("LASER FILES: DXF / DWG")
+    print("=" * 60)
+    exporter = DwgExporter(sw_app, assembly_path=assembly_path, reconnect=connect_to_solidworks)
+    try:
+        builder = ThicknessDwgBuilder(
+            exporter,
+            gap=PART_GAP,
+            max_row_width=MAX_ROW_WIDTH,
+            repeat_by_quantity=REPEAT_BY_QUANTITY,
+            oda_path=ODA_CONVERTER_PATH,
+            group_by_thickness=GROUP_BY_THICKNESS,
+        )
+        return builder.build(
+            scan_result["sheet_metal_parts"],
+            output_folder / ("خروجی برش لیزر" if GROUP_BY_THICKNESS else "خروجی برش لیزر"),
+            base_name=assembly_path.stem,
+        )
+    except Exception as exc:
+        print("\nDXF / DWG EXPORT FAILED")
+        print(f"{type(exc).__name__}: {exc}")
+        traceback.print_exc()
+        return {"files": [], "failed_parts": [], "error": str(exc)}
+    finally:
+        try:
+            exporter.activate_assembly()
+        except Exception:
+            pass
 
 
 def main():
@@ -318,8 +391,14 @@ def main():
     output_folder.mkdir(exist_ok=True)
 
     print("\n" + "=" * 60)
-    print("SOLIDWORKS SHEET METAL -> FLAT PATTERN SLDDRW / DXF / DWG")
+    print("SOLIDWORKS SHEET METAL -> LASER (DXF / DWG) / BENDING (SLDDRW / PDF)")
     print("=" * 60)
+
+    mode = choose_mode()
+    if mode is None:
+        print("Nothing selected. Exit.")
+        return 0
+    mode_label, make_slddrw, make_dxf = mode
 
     sw_app = connect_to_solidworks()
     if sw_app is None:
@@ -354,58 +433,43 @@ def main():
             save_scan_cache(output_folder, assembly_path, scan_result)
 
     slddrw_result = None
-    if EXPORT_SLDDRW:
-        try:
-            slddrw_result = export_slddrw_files(sw_app, assembly_path, scan_result, output_folder, input_folder)
-        except Exception as exc:
-            print(f"\nSLDDRW EXPORT FAILED (continuing): {type(exc).__name__}: {exc}")
-            traceback.print_exc()
-
-    exporter = DwgExporter(sw_app, assembly_path=assembly_path, reconnect=connect_to_solidworks)
     drawing_result = None
     try:
-        if SLDDRW_ONLY:
-            print("\nSLDDRW_ONLY is on: DXF export, merging and DWG conversion are skipped.")
-        else:
-            builder = ThicknessDwgBuilder(
-                exporter,
-                gap=PART_GAP,
-                max_row_width=MAX_ROW_WIDTH,
-                repeat_by_quantity=REPEAT_BY_QUANTITY,
-                oda_path=ODA_CONVERTER_PATH,
-                group_by_thickness=GROUP_BY_THICKNESS,
-            )
-            drawing_result = builder.build(
-                scan_result["sheet_metal_parts"],
-                output_folder / ("by_thickness" if GROUP_BY_THICKNESS else "combined"),
-                base_name=assembly_path.stem,
-            )
-    except Exception as exc:
-        print("\nDRAWING EXPORT FAILED")
-        print(f"{type(exc).__name__}: {exc}")
-        traceback.print_exc()
-        drawing_result = {"files": [], "failed_parts": [], "error": str(exc)}
+        if make_dxf:
+            drawing_result = export_laser_files(sw_app, assembly_path, scan_result, output_folder)
+        if make_slddrw:
+            try:
+                slddrw_result = export_slddrw_files(sw_app, assembly_path, scan_result, output_folder, input_folder)
+            except Exception as exc:
+                print(f"\nSLDDRW EXPORT FAILED (continuing): {type(exc).__name__}: {exc}")
+                traceback.print_exc()
     finally:
-        exporter.activate_assembly()
+        if not make_dxf:  # the laser export re-activates the assembly itself
+            try:
+                DwgExporter(sw_app, assembly_path=assembly_path, reconnect=connect_to_solidworks).activate_assembly()
+            except Exception:
+                pass
         gc.collect()
         try:
             pythoncom.CoFreeUnusedLibraries()
         except Exception:
             pass
 
-    save_run_summary(output_folder, assembly_path, scan_result, drawing_result, slddrw_result)
+    save_run_summary(output_folder, assembly_path, mode_label, scan_result, drawing_result, slddrw_result)
     print("\n" + "=" * 60)
-    print("PROCESS FINISHED")
+    print(f"PROCESS FINISHED - {mode_label}")
     print("=" * 60)
     print(f"Sheet metal (unique): {scan_result['sheet_metal']}")
     print(f"Sheet metal (quantity): {scan_result['total_quantity']}")
     print(f"Not sheet metal: {scan_result['not_sheet_metal']}")
     print(f"Scan failures: {scan_result['failed']}")
-    if slddrw_result:
-        print(f"SLDDRW created: {len(slddrw_result['created'])}  |  failed: {len(slddrw_result['failed'])}")
-    if drawing_result:
-        print(f"Drawings created: {len(drawing_result['files'])}")
-        print(f"Export failures: {len(drawing_result['failed_parts'])}")
+    if make_dxf and drawing_result:
+        print(f"Laser files (DXF/DWG) created: {len(drawing_result['files'])}  |  "
+              f"export failures: {len(drawing_result['failed_parts'])}")
+    if make_slddrw and slddrw_result:
+        print(f"Bending drawings (SLDDRW) created: {len(slddrw_result['created'])}  |  "
+              f"failed: {len(slddrw_result['failed'])}"
+              + (f"  |  PDF missing: {len(slddrw_result['pdf_failed'])}" if slddrw_result.get("pdf_failed") else ""))
     print(f"Output: {output_folder}")
     return 0
 

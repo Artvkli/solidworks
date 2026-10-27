@@ -50,7 +50,7 @@ DEFAULT_LAYOUT = {
     "auto_rotate_flat": True,      # rotate a tall flat pattern by 90 deg so its long side is horizontal
     "scale_mode": "fine",          # "fine" = 1:n for any whole n (largest view that fits), "standard" = fixed list
     "view_enlarge": 1.5,           # views target 1.5x the size of the old fixed-band layout (reduced only if it does not fit)
-    "folded_enlarge": 1.5,         # Top / Front / Right: target size vs the old layout
+    "folded_enlarge": 1.8,         # Top / Front / Right: target size vs the old layout
     "flat_enlarge": 1.5,           # flat pattern: target size vs the old layout
     "folded_priority": True,       # if space is short, the flat pattern gives way first ...
     "flat_min_ratio": 0.85,        # ... but never below 85% of its old size
@@ -79,7 +79,8 @@ class SwDrawingExporter:
                  bend_dim_text_width_mm=14, bend_dim_order="largest_outside",
                  folded_view_names=("*Top", "*Front"), bend_dim_right_pad_mm=18,
                  bend_dim_text_height_mm=3.5, bend_dim_max_levels=12, bend_dim_merge_collinear=True,
-                 bend_dim_verify="flag", bend_tag_max_distance_mm=15, bend_debug_json=False):
+                 bend_dim_verify="flag", bend_tag_max_distance_mm=15, bend_debug_json=False,group_by_thickness=True, export_pdf=True,
+                 thickness_folder_format="{thickness:g} mm", unknown_thickness_folder="no thickness"):
         self.sw_app = sw_app
         self.assembly_path = Path(assembly_path).resolve() if assembly_path else None
         self.reconnect = reconnect
@@ -119,6 +120,10 @@ class SwDrawingExporter:
         self._bend_tags = []
         self._current_item = {}
         self.bend_table_scale = float(bend_table_scale or 1.0)
+        self.group_by_thickness = group_by_thickness
+        self.export_pdf = export_pdf
+        self.thickness_folder_format = thickness_folder_format
+        self.unknown_thickness_folder = unknown_thickness_folder
 
     # ---------------- helpers ----------------
     @staticmethod
@@ -1782,8 +1787,69 @@ class SwDrawingExporter:
             steps.append(f"bend table tags not read: {exc}")
             return []
 
+    # ---------------- output folders / PDF ----------------
+    def _thickness_folder(self, item):
+        """Folder name for the part's sheet thickness (mm), e.g. '1.5 mm'."""
+        try:
+            t = float(item.get("thickness"))
+            if not t > 0:
+                raise ValueError
+            return self._safe_name(self.thickness_folder_format.format(thickness=round(t, 3)))
+        except Exception:
+            return self._safe_name(self.unknown_thickness_folder)
+
+    def output_paths(self, item, slddrw_path):
+        """(slddrw path, pdf path) - inside the thickness folder when group_by_thickness is on."""
+        p = Path(slddrw_path)
+        if self.group_by_thickness:
+            folder = self._thickness_folder(item)
+            if p.parent.name != folder:          # not nested twice if the caller already used the folder
+                p = p.parent / folder / p.name
+        return p, p.with_suffix(".pdf")
+
+    def _save_pdf(self, drawing, pdf_path, steps):
+        """Export the open drawing (all sheets) as PDF next to the SLDDRW."""
+        pdf_path = Path(pdf_path)
+        try:
+            if pdf_path.exists():
+                pdf_path.unlink()
+        except Exception as exc:
+            steps.append(f"PDF NOT saved: old PDF is locked (open in a viewer?) - {exc}")
+            return False
+        nothing = VARIANT(pythoncom.VT_DISPATCH, None)
+        export_data = None
+        try:
+            export_data = self.sw_app.GetExportFileData(1)          # swExportPdfData
+            export_data.SetSheets(1, nothing)                        # swExportData_ExportAllSheets
+        except Exception:
+            pass
+        tried = []
+        try:
+            errors, warnings = self._byref_i4(), self._byref_i4()
+            drawing.Extension.SaveAs(str(pdf_path), SW_SAVE_AS_CURRENT_VERSION, SW_SAVE_SILENT,
+                                     export_data if export_data is not None else nothing, errors, warnings)
+            if self._written(pdf_path):
+                steps.append(f"PDF saved: {pdf_path.name}")
+                return True
+            tried.append(f"Extension.SaveAs errors={getattr(errors, 'value', errors)}")
+        except Exception as exc:
+            tried.append(f"Extension.SaveAs: {exc}")
+        try:
+            drawing.SaveAs3(str(pdf_path), SW_SAVE_AS_CURRENT_VERSION, SW_SAVE_SILENT)
+            if self._written(pdf_path):
+                steps.append(f"PDF saved: {pdf_path.name} (SaveAs3)")
+                return True
+            tried.append("SaveAs3: no file written")
+        except Exception as exc:
+            tried.append(f"SaveAs3: {exc}")
+        steps.append("PDF NOT saved - " + "; ".join(tried))
+        return False
+
     # ---------------- public ----------------
     def export_part(self, item, slddrw_path):
+        slddrw_path, pdf_path = self.output_paths(item, slddrw_path)
+        item["slddrw_path"] = str(slddrw_path)
+        item["pdf_path"] = str(pdf_path) if self.export_pdf else None
         ok, message, steps = self._export_once(item, slddrw_path)
         if not ok and self._is_connection_error(message):
             steps.append("connection lost -> reconnecting and retrying once")
@@ -1792,16 +1858,18 @@ class SwDrawingExporter:
                 ok, message, steps2 = self._export_once(item, slddrw_path)
                 steps += steps2
         if not ok:
-            try:
-                Path(slddrw_path).unlink(missing_ok=True)
-            except Exception:
-                pass
+            for p in (slddrw_path, pdf_path):
+                try:
+                    Path(p).unlink(missing_ok=True)
+                except Exception:
+                    pass
         return ok, message, steps
 
     def _export_once(self, item, slddrw_path):
         steps = []
         slddrw_path = Path(slddrw_path)
         slddrw_path.parent.mkdir(parents=True, exist_ok=True)
+        steps.append(f"output folder: {slddrw_path.parent}")
         if slddrw_path.exists():
             try:
                 slddrw_path.unlink()
@@ -1956,7 +2024,9 @@ class SwDrawingExporter:
             err = drawing.SaveAs3(str(slddrw_path), SW_SAVE_AS_CURRENT_VERSION, SW_SAVE_SILENT)
             if not self._written(slddrw_path):
                 return False, f"SaveAs3 failed (code {err})", steps
-            steps.append("SLDDRW saved")
+            steps.append(f"SLDDRW saved: {slddrw_path.name}")
+            if self.export_pdf and not self._save_pdf(drawing, slddrw_path.with_suffix(".pdf"), steps):
+                return True, "ok (PDF not saved - see steps)", steps
             return True, "ok", steps
 
         except Exception as exc:
