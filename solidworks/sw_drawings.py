@@ -55,21 +55,6 @@ DEFAULT_LAYOUT = {
 # Top sits above Front, Right sits to the right of Front (same arrangement as the earlier Top-over-Front stack).
 FOLDED_GRID = {"top": (0, 0), "front": (0, 1), "right": (1, 1), "left": (-1, 1), "bottom": (0, 2), "back": (2, 1)}
 SIDES = ("left", "right", "top", "bottom")
-
-# What each folded view is dimensioned with (as in the reference drawing AHU22000-02):
-#   length   = overall horizontal size (above the view)
-#   width    = overall vertical size (width_side: "left" or "right" of the view)
-#   h_steps  = horizontal flange depths, each measured from the back face of the profile (stacked above);
-#              the largest one is the overall horizontal size
-#   v_steps  = vertical flange heights, each measured from the base face (stacked to the right);
-#              the largest one is the overall vertical size
-DEFAULT_FOLDED_VIEW_DIMS = {
-    "top": {"length": True},                                   # 2192.00
-    "front": {"v_steps": True},                                # 38.00 / 26.50
-    "right": {"width": True, "width_side": "left", "h_steps": True},   # 127.5 + 38.00 / 26.50 / 23.00
-}
-VIEW_DIMS_FALLBACK = {"length": True, "width": True, "width_side": "right", "h_steps": False, "v_steps": False}
-MAX_STEP_DIMS = 6
 DIM_VALUE_TOL = 1e-5               # 0.01 mm: created dimension must match the computed value within this
 
 
@@ -89,8 +74,7 @@ class SwDrawingExporter:
                  bend_dim_text_width_mm=14, bend_dim_order="largest_outside",
                  folded_view_names=("*Top", "*Front"), bend_dim_right_pad_mm=18,
                  bend_dim_text_height_mm=3.5, bend_dim_max_levels=12, bend_dim_merge_collinear=True,
-                 bend_dim_verify="flag", bend_tag_max_distance_mm=15, bend_debug_json=False,
-                 folded_view_dims=None):
+                 bend_dim_verify="flag", bend_tag_max_distance_mm=15, bend_debug_json=False):
         self.sw_app = sw_app
         self.assembly_path = Path(assembly_path).resolve() if assembly_path else None
         self.reconnect = reconnect
@@ -130,11 +114,7 @@ class SwDrawingExporter:
         self._convention_source = None
         self._convention_check_failed = False
         self._bend_tags = []
-        self._bend_radii = []
         self._current_item = {}
-        self.folded_view_dims = {k: dict(v) for k, v in DEFAULT_FOLDED_VIEW_DIMS.items()}
-        for name, spec in (folded_view_dims or {}).items():
-            self.folded_view_dims[str(name).strip().lstrip("*").lower()] = dict(spec)
 
     # ---------------- helpers ----------------
     @staticmethod
@@ -483,12 +463,13 @@ class SwDrawingExporter:
             cells.append((name, view, cell[0], cell[1]))
         return cells
 
-    def _layout_views(self, drawing, folded, flat_view, table_top, steps, flat_pads=None, folded_pads=None):
+    def _layout_views(self, drawing, folded, flat_view, table_top, steps, flat_pads=None):
         width, height = self._sheet_size(drawing)
         lay = self.layout
         mm = 0.001
         m, pad, dim = lay["margin_mm"] * mm, lay["side_pad_mm"] * mm, lay["dim_pad_mm"] * mm
         vgap = lay["view_gap_mm"] * mm
+        hgap = max(vgap, dim)          # the left view's width dimension sits between two views of a row
         pads = dict(self._initial_flat_pads() if flat_pads is None else flat_pads)
         left, right = m + pad, width - m - pad
         low = table_top + lay["table_clearance_mm"] * mm
@@ -501,9 +482,7 @@ class SwDrawingExporter:
             else:
                 folded_box, flat_box = None, (left, low, right, high)
 
-            f_in = folded_box
-            fpads = {name: dict({"top": dim, "right": dim, "left": 0.0, "bottom": 0.0},
-                                **((folded_pads or {}).get(name) or {})) for name, _ in folded}
+            f_in = (folded_box[0], folded_box[1], folded_box[2] - dim, folded_box[3] - dim) if folded_box else None
             b_in = (flat_box[0] + dim + pads.get("left", 0.0), flat_box[1] + pads.get("bottom", 0.0),
                     flat_box[2] - pads.get("right", 0.0), flat_box[3] - dim - pads.get("top", 0.0))
             steps.append(f"sheet {width * 1000:.0f} x {height * 1000:.0f} mm | table top {table_top * 1000:.0f} mm | "
@@ -524,15 +503,15 @@ class SwDrawingExporter:
             cells = self._folded_cells(folded) if folded else []
             if cells:
                 sizes = [self._unit_size_and_border(v) for _, v, _, _ in cells]
-                col_w, row_h, col_fix, row_fix = {}, {}, {}, {}
-                for (name, _, c, r), (w, h, bw, bh) in zip(cells, sizes):
+                col_w, row_h = {}, {}
+                for (_, _, c, r), (w, h, _bw, _bh) in zip(cells, sizes):
                     col_w[c] = max(col_w.get(c, 0.0), w)
                     row_h[r] = max(row_h.get(r, 0.0), h)
-                    col_fix[c] = max(col_fix.get(c, 0.0), bw + fpads[name]["left"] + fpads[name]["right"])
-                    row_fix[r] = max(row_fix.get(r, 0.0), bh + fpads[name]["top"] + fpads[name]["bottom"])
+                border_w = max(s[2] for s in sizes)
+                border_h = max(s[3] for s in sizes)
                 limits["folded"] = min(
-                    (f_in[2] - f_in[0] - vgap * (len(col_w) - 1) - sum(col_fix.values())) / sum(col_w.values()),
-                    (f_in[3] - f_in[1] - vgap * (len(row_h) - 1) - sum(row_fix.values())) / sum(row_h.values()))
+                    (f_in[2] - f_in[0] - hgap * (len(col_w) - 1) - border_w * len(col_w)) / sum(col_w.values()),
+                    (f_in[3] - f_in[1] - vgap * (len(row_h) - 1) - border_h * len(row_h)) / sum(row_h.values()))
             fw, fh, fbw, fbh = self._unit_size_and_border(flat_view)
             limits["flat"] = min((b_in[2] - b_in[0] - fbw) / fw, (b_in[3] - b_in[1] - fbh) / fh)
 
@@ -556,30 +535,25 @@ class SwDrawingExporter:
                          f"in a box of {b_w * 1000:.0f} x {b_h * 1000:.0f} mm")
 
             if cells:
-                # each cell = [left pad | view | right pad] x [top pad | view | bottom pad]; views of one column
-                # share a centre line, views of one row share a centre height
-                geo_w, geo_h, pl, pr, pt, pb = {}, {}, {}, {}, {}, {}
+                col_w, row_h, size = {}, {}, {}
                 for name, v, c, r in cells:
                     o = self._get(v, "GetOutline")
-                    geo_w[c] = max(geo_w.get(c, 0.0), o[2] - o[0])
-                    geo_h[r] = max(geo_h.get(r, 0.0), o[3] - o[1])
-                    pl[c] = max(pl.get(c, 0.0), fpads[name]["left"])
-                    pr[c] = max(pr.get(c, 0.0), fpads[name]["right"])
-                    pt[r] = max(pt.get(r, 0.0), fpads[name]["top"])
-                    pb[r] = max(pb.get(r, 0.0), fpads[name]["bottom"])
-                cols, rows = sorted(geo_w), sorted(geo_h)
-                total_w = sum(geo_w[c] + pl[c] + pr[c] for c in cols) + vgap * (len(cols) - 1)
-                total_h = sum(geo_h[r] + pt[r] + pb[r] for r in rows) + vgap * (len(rows) - 1)
+                    size[name] = (o[2] - o[0], o[3] - o[1])
+                    col_w[c] = max(col_w.get(c, 0.0), size[name][0])
+                    row_h[r] = max(row_h.get(r, 0.0), size[name][1])
+                cols, rows = sorted(col_w), sorted(row_h)
+                total_w = sum(col_w.values()) + hgap * (len(cols) - 1)
+                total_h = sum(row_h.values()) + vgap * (len(rows) - 1)
                 x = (f_in[0] + f_in[2]) / 2.0 - total_w / 2.0
                 col_x = {}
                 for c in cols:
-                    col_x[c] = x + pl[c] + geo_w[c] / 2.0
-                    x += pl[c] + geo_w[c] + pr[c] + vgap
+                    col_x[c] = x + col_w[c] / 2.0
+                    x += col_w[c] + hgap
                 y = (f_in[1] + f_in[3]) / 2.0 + total_h / 2.0
                 row_y = {}
                 for r in rows:
-                    row_y[r] = y - pt[r] - geo_h[r] / 2.0
-                    y -= pt[r] + geo_h[r] + pb[r] + vgap
+                    row_y[r] = y - row_h[r] / 2.0
+                    y -= row_h[r] + vgap
                 for name, v, c, r in cells:
                     self._move_view(v, col_x[c], row_y[r])
                 steps.append("folded views placed: " + ", ".join(f"{n} (col {c}, row {r})" for n, _, c, r in cells))
@@ -839,153 +813,6 @@ class SwDrawingExporter:
             steps.append(f"dimensions {label} -> " + ", ".join(made))
         except Exception as exc:
             steps.append(f"dimensions {label} failed at '{stage}': {exc}")
-
-    # ---------------- folded view dimensions ----------------
-    def _view_dim_spec(self, name):
-        spec = dict(VIEW_DIMS_FALLBACK)
-        if name in self.folded_view_dims:
-            spec.update({"length": False, "width": False})
-            spec.update(self.folded_view_dims[name])
-        return spec
-
-    def _profile_steps(self, view, axis, steps):
-        """Flange steps of a folded view along one sheet axis ("h" or "v").
-
-        Straight edges perpendicular to the axis are collected; the base is the extreme side with the most
-        edge length (the back of the profile, e.g. the web). Each distinct edge position farther than
-        2*thickness + inner radius from the base is one step (positions closer than ~thickness are merged,
-        keeping the outer one). Returns {"base": vertex, "items": [(model distance, vertex)]} or None."""
-        to_sheet = self._view_mapper(view, steps)
-        scale = float(self._get(view, "ScaleDecimal") or 1.0)
-        t = float(self._current_item.get("thickness") or 1.0) / 1000.0
-        radius = (max(self._bend_radii) / 1000.0) if self._bend_radii else t
-        merge = max(1.1 * t, 0.0003)
-        min_step = 2 * t + radius
-        items = []
-        for edge in self._view_edges(view):
-            p, q = self._edge_points(edge)
-            if p is None or q is None:
-                continue
-            curve = self._get(edge, "GetCurve")
-            if curve is not None and self._get(curve, "IsLine") is False:
-                continue
-            a, b = to_sheet(p), to_sheet(q)
-            dx, dy = b[0] - a[0], b[1] - a[1]
-            length = math.hypot(dx, dy)
-            if length / scale < max(0.3 * t, 0.0002):
-                continue
-            if axis == "h" and abs(dx) > 0.01 * length:
-                continue
-            if axis == "v" and abs(dy) > 0.01 * length:
-                continue
-            pos = (a[0] + b[0]) / 2.0 if axis == "h" else (a[1] + b[1]) / 2.0
-            vertex = self._get(edge, "GetStartVertex") or self._get(edge, "GetEndVertex")
-            if vertex is not None:
-                items.append((pos, length, vertex))
-        if len(items) < 2:
-            return None
-        lo, hi = min(i[0] for i in items), max(i[0] for i in items)
-        tol = merge * scale
-        at_lo = [i for i in items if i[0] - lo <= tol]
-        at_hi = [i for i in items if hi - i[0] <= tol]
-        base_items = at_lo if sum(i[1] for i in at_lo) >= sum(i[1] for i in at_hi) else at_hi
-        base_pos = lo if base_items is at_lo else hi
-        base_vertex = max(base_items, key=lambda i: i[1])[2]
-        found = sorted(((abs(i[0] - base_pos) / scale, i[2]) for i in items), key=lambda x: x[0])
-        clusters = []
-        for dist, vertex in found:
-            if dist <= min_step:
-                continue
-            if clusters and dist - clusters[-1][-1][0] <= merge:
-                clusters[-1].append((dist, vertex))
-            else:
-                clusters.append([(dist, vertex)])
-        steps_found = [max(c, key=lambda x: x[0]) for c in clusters]
-        if len(steps_found) > MAX_STEP_DIMS:
-            steps.append(f"{len(steps_found)} flange steps found - only the {MAX_STEP_DIMS} largest are dimensioned")
-            steps_found = steps_found[-MAX_STEP_DIMS:]
-        return {"base": base_vertex, "items": steps_found}
-
-    def _plan_folded_dims(self, name, view, steps):
-        """Spec + flange steps for one folded view (scale independent: distances are model distances)."""
-        spec = self._view_dim_spec(name)
-        plan = {"spec": spec, "h": None, "v": None}
-        for axis in ("h", "v"):
-            if spec.get(f"{axis}_steps"):
-                try:
-                    plan[axis] = self._profile_steps(view, axis, steps)
-                except Exception as exc:
-                    steps.append(f"dimensions {name}: flange steps not found ({exc})")
-        return plan
-
-    def _folded_pads(self, plan):
-        """Room (metres) around a folded view for its dimensions: top / right / left / bottom."""
-        off, step = self.dimension_offset_mm / 1000.0, self.bend_dim_step_mm / 1000.0
-        text = self.bend_dim_text_height_mm / 1000.0 + 0.001
-
-        def room(n):
-            return off + (n - 1) * step + text if n else 0.0
-        spec = plan["spec"]
-        n_top = len(plan["h"]["items"]) if plan.get("h") else (1 if spec.get("length") else 0)
-        n_right = len(plan["v"]["items"]) if plan.get("v") else 0
-        n_left = 0
-        if spec.get("width") and not plan.get("v"):
-            if spec.get("width_side", "right") == "left":
-                n_left = 1
-            else:
-                n_right = max(n_right, 1)
-        return {"top": room(n_top), "right": room(n_right), "left": room(n_left), "bottom": 0.0}
-
-    def _add_step_dimensions(self, drawing, view, label, axis, steps_plan, steps):
-        """Baseline dimensions from the base face to each flange step, stacked outward (smallest first)."""
-        to_sheet = self._view_mapper(view, steps)
-        outline = self._get(view, "GetOutline")
-        off, step = self.dimension_offset_mm / 1000.0, self.bend_dim_step_mm / 1000.0
-        sel = self._select_data(drawing, view)
-        base = steps_plan["base"]
-        bx, by = to_sheet(tuple(float(c) for c in self._get(base, "GetPoint")))
-        made = []
-        for level, (expected, vertex) in enumerate(steps_plan["items"]):
-            vx, vy = to_sheet(tuple(float(c) for c in self._get(vertex, "GetPoint")))
-            drawing.ClearSelection2(True)
-            ok1, _ = self._select_vertex(view, base, False, sel)
-            ok2, _ = self._select_vertex(view, vertex, True, sel)
-            if not (ok1 and ok2):
-                made.append(f"{expected * 1000:.1f}: could not select")
-                continue
-            if axis == "h":
-                dim = drawing.AddHorizontalDimension2((bx + vx) / 2.0, outline[3] + off + level * step, 0.0)
-            else:
-                dim = drawing.AddVerticalDimension2(outline[2] + off + level * step, (by + vy) / 2.0, 0.0)
-            if dim is None:
-                made.append(f"{expected * 1000:.1f}: failed")
-                continue
-            actual = self._dimension_value(dim)
-            if actual is not None and abs(actual - expected) > max(0.0002, 0.002 * expected):
-                self._delete_annotation(drawing, dim)
-                made.append(f"{expected * 1000:.1f}: SolidWorks measured {actual * 1000:.1f} - MISMATCH, removed")
-            else:
-                made.append(f"{expected * 1000:.1f} mm " + ("verified" if actual is not None else "(not readable)"))
-        drawing.ClearSelection2(True)
-        what = "flange depths" if axis == "h" else "flange heights"
-        steps.append(f"dimensions {label} {what} -> " + (", ".join(made) or "none found"))
-
-    def _add_folded_view_dims(self, drawing, name, view, plan, steps):
-        spec = plan["spec"]
-        length = bool(spec.get("length")) and not plan.get("h")
-        width = bool(spec.get("width")) and not plan.get("v")
-        if length or width:
-            self._add_overall_dimensions(drawing, view, steps, name, length, width, spec.get("width_side", "right"))
-        for axis in ("h", "v"):
-            if spec.get(f"{axis}_steps"):
-                if plan.get(axis):
-                    try:
-                        self._add_step_dimensions(drawing, view, name, axis, plan[axis], steps)
-                    except Exception as exc:
-                        steps.append(f"dimensions {name} steps failed: {exc}")
-                else:  # no steps could be found: fall back to the overall size on that axis
-                    self._add_overall_dimensions(drawing, view, steps, name, axis == "h", axis == "v",
-                                                 "right")
 
     # ---------------- bend dimensions: geometry ----------------
     def _view_edges(self, view, steps=None):
@@ -1693,13 +1520,6 @@ class SwDrawingExporter:
             tags = [self._cell(grid, r, tag_col) for r in range(header_row + 1, rows)]
             tags = [t for t in tags if t]
             steps.append(f"bend table tags: {tags}")
-            radius_col = next((c for c in range(cols) if "radius" in self._cell(grid, header_row, c).lower()), None)
-            self._bend_radii = []
-            if radius_col is not None:
-                for r in range(header_row + 1, rows):
-                    m = re.search(r"\d+(?:[.,]\d+)?", self._cell(grid, r, radius_col))
-                    if m:
-                        self._bend_radii.append(float(m.group(0).replace(",", ".")))
             return tags
         except Exception as exc:
             steps.append(f"bend table tags not read: {exc}")
@@ -1831,12 +1651,8 @@ class SwDrawingExporter:
             if self.add_bend_dimensions:
                 # bend values do not depend on the layout, so they are measured once
                 analysis = self._analyze_bends(flat_view, steps, item)
-            # folded view dimensions: what each view gets and how much room that needs (scale independent)
-            folded_plans = {name: self._plan_folded_dims(name, v, steps) for name, v in folded} \
-                if self.add_dimensions else {}
-            folded_pads = {name: self._folded_pads(plan) for name, plan in folded_plans.items()}
             pads = self._initial_flat_pads()
-            flat_scale = self._layout_views(drawing, folded, flat_view, table_top, steps, pads, folded_pads)
+            flat_scale = self._layout_views(drawing, folded, flat_view, table_top, steps, pads)
             if flat_scale and analysis and not analysis.get("error") and analysis.get("results"):
                 dim_pad = self.layout["dim_pad_mm"] / 1000.0
                 for _ in range(3):  # give the bend dimensions the room they actually need, then re-plan
@@ -1851,8 +1667,7 @@ class SwDrawingExporter:
                     pads = {k: max(pads[k], need[k]) for k in SIDES}
                     steps.append("relayout: room for bend dimensions " +
                                  ", ".join(f"{k} {v * 1000:.0f} mm" for k, v in pads.items() if v))
-                    flat_scale = self._layout_views(drawing, folded, flat_view, table_top, steps, pads,
-                                                    folded_pads) or flat_scale
+                    flat_scale = self._layout_views(drawing, folded, flat_view, table_top, steps, pads) or flat_scale
                 plan = self._plan_bend_dims(drawing, flat_view, analysis, table_top, steps, folded, final=True)
             if flat_scale:
                 self._set_sheet_scale(drawing, flat_scale, steps)
@@ -1862,7 +1677,7 @@ class SwDrawingExporter:
                     if name == "flat":
                         self._add_overall_dimensions(drawing, v, steps, "flat", True, True, "left")
                     else:
-                        self._add_folded_view_dims(drawing, name, v, folded_plans[name], steps)
+                        self._add_overall_dimensions(drawing, v, steps, name, True, True, "right")
 
             if analysis is not None:
                 self._finish_bend_dims(drawing, flat_view, analysis, plan, steps)
