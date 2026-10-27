@@ -105,9 +105,7 @@ class SwDrawingExporter:
         self.bend_dim_text_height_mm = bend_dim_text_height_mm
         self.bend_dim_max_levels = int(bend_dim_max_levels)
         self.bend_dim_merge_collinear = bend_dim_merge_collinear
-        # wrong bend dimensions are always removed and retried with another selection method;
-        # kept for call compatibility ("flag" / "delete")
-        self.bend_dim_verify = bend_dim_verify
+        self.bend_dim_verify = bend_dim_verify          # "flag" = keep + report mismatches, "delete" = remove them
         self.bend_tag_max_distance_mm = bend_tag_max_distance_mm
         self.bend_debug_json = bend_debug_json
         self._convention = None                          # MathTransform convention, verified once per session
@@ -1141,7 +1139,6 @@ class SwDrawingExporter:
                 b0, b1 = sheet_lines[r["id"]]
                 e = edges[r["edge"]]
                 dims.append({"key": r["id"], "b0": b0, "b1": b1, "e0": to_sheet(e["m0"]), "e1": to_sheet(e["m1"])})
-            edge_mid = {d["key"]: ((d["e0"][0] + d["e1"][0]) / 2.0, (d["e0"][1] + d["e1"][1]) / 2.0) for d in dims}
             bounds = (self.layout["margin_mm"] * mm, table_top, width - self.layout["margin_mm"] * mm,
                       height - self.layout["margin_mm"] * mm) if final else None
             placements, needs = plan_placements(
@@ -1155,7 +1152,6 @@ class SwDrawingExporter:
                                  + (f" - AMBIGUOUS (tag is as close to another bend line, check manually): "
                                     f"{ambiguous}" if ambiguous else ""))
             return {"placements": placements, "needs": needs, "tags": tags, "unassigned_tags": unassigned,
-                    "edge_mid": edge_mid,
                     "ambiguous_tags": ambiguous,
                     "sheet_lines": sheet_lines, "transform_status": to_sheet.status}
         except Exception as exc:
@@ -1175,36 +1171,7 @@ class SwDrawingExporter:
         except Exception:
             return None
 
-    def _selection_count(self, drawing):
-        try:
-            return int(drawing.SelectionManager.GetSelectedObjectCount2(-1))
-        except Exception:
-            return None
-
-    def _bend_selection_strategies(self, drawing, view, edge, edge_mid, sel):
-        """Ways to add the reference edge to a selection that already holds the bend line. A model edge
-        picked through the COM object is not always accepted by every SolidWorks version, and if it is
-        silently dropped AddDimension2 dimensions the bend line alone = its LENGTH. A point on the edge
-        gives the same bend-to-edge width (point-to-line distance), so the edge's end vertex is a fallback."""
-        nothing = VARIANT(pythoncom.VT_DISPATCH, None)
-        entity = edge["entity"]
-        vertex = self._get(entity, "GetStartVertex") or self._get(entity, "GetEndVertex")
-        strategies = [("edge", lambda: entity.Select4(True, sel)),
-                      ("edge via view", lambda: view.SelectEntity(entity, True))]
-        if vertex is not None:
-            strategies += [("edge end point", lambda: vertex.Select4(True, sel)),
-                           ("edge end point via view", lambda: view.SelectEntity(vertex, True))]
-        if edge_mid is not None:
-            strategies.append(("edge picked at its sheet position", lambda: drawing.Extension.SelectByID2(
-                "", "EDGE", edge_mid[0], edge_mid[1], 0.0, True, 0, nothing, 0)))
-        return strategies
-
     def _create_bend_dims(self, drawing, view, analysis, plan, steps):
-        """Create one width dimension (bend line -> outer edge) per planned bend.
-
-        Every attempt must have exactly two entities selected, and the value SolidWorks measures is read back
-        and compared with the computed width. A wrong dimension (e.g. the bend-line length) is deleted and the
-        next selection method is tried; a bend is never left with a dimension whose value is wrong."""
         results = {r["id"]: r for r in analysis["results"]}
         bends = {r["id"]: r for r in analysis["bends"]}
         sel = self._select_data(drawing, view)
@@ -1212,73 +1179,49 @@ class SwDrawingExporter:
         for p in plan["placements"]:
             r = results[p["key"]]
             edge = analysis["edges"][r["edge"]]
-            seg = bends[r["id"]]["seg"]
             tag = plan["tags"].get(r["id"], "?")
-            label = f"bend {r['id']} [tag {tag}] width {r['value'] * 1000:.2f} mm"
+            label = f"bend {r['id']} [tag {tag}] {r['value'] * 1000:.2f} mm"
+            drawing.ClearSelection2(True)
+            ok1, _ = self._select_entity(view, bends[r["id"]]["seg"], False, sel)
+            ok2, _ = self._select_entity(view, edge["entity"], True, sel)
+            if not (ok1 and ok2):
+                r["created"] = False
+                steps.append(f"{label}: could not select bend line/edge - NOT dimensioned")
+                continue
             px, py = p["text_point"]
-            tried = []
-            done = False
-            r["created"] = False
-            for how, add_edge in self._bend_selection_strategies(drawing, view, edge,
-                                                                  plan.get("edge_mid", {}).get(r["id"]), sel):
-                drawing.ClearSelection2(True)
-                ok, _ = self._select_entity(view, seg, False, sel)
-                if not ok:
-                    tried.append("bend line not selectable")
-                    break
-                try:
-                    if not add_edge():
-                        tried.append(f"{how}: not selected")
-                        continue
-                except Exception as exc:
-                    tried.append(f"{how}: {exc}")
-                    continue
-                count = self._selection_count(drawing)
-                if count is not None and count != 2:
-                    tried.append(f"{how}: {count} item(s) selected instead of 2")
-                    continue
-                display = drawing.AddDimension2(px, py, 0.0)
-                if display is None:
-                    tried.append(f"{how}: AddDimension2 returned nothing")
-                    continue
-                actual = self._dimension_value(display)
-                if actual is not None and abs(actual - r["value"]) > DIM_VALUE_TOL:
-                    what = (" = bend-line LENGTH" if abs(actual - r.get("length", -1)) <= DIM_VALUE_TOL else "")
-                    deleted = self._delete_annotation(drawing, display)
-                    tried.append(f"{how}: SolidWorks measured {actual * 1000:.2f} mm{what}"
-                                 + (" (removed)" if deleted else " (COULD NOT REMOVE - delete it manually)"))
-                    continue
-                r["created"], r["solidworks_value"], r["selection"] = True, actual, how
-                created += 1
-                done = True
-                check = "verified" if actual is not None else "value not readable - check manually"
-                steps.append(f"{label} -> {p['side']} level {p['level']}, {check} (selected: {how})"
-                             + (f", {p['collisions']} unavoidable overlap(s)" if p["collisions"] else "")
-                             + (f" [earlier attempts: {'; '.join(tried)}]" if tried else ""))
-                break
-            if not done:
+            display = drawing.AddDimension2(px, py, 0.0)
+            if display is None:
+                r["created"] = False
+                steps.append(f"{label}: AddDimension2 returned nothing - NOT dimensioned")
+                continue
+            actual = self._dimension_value(display)
+            r["created"], r["solidworks_value"] = True, actual
+            if actual is not None and abs(actual - r["value"]) > DIM_VALUE_TOL:
                 mismatched.append(r["id"])
-                steps.append(f"{label}: NOT dimensioned - MISMATCH, no selection method gave the width "
-                             f"({'; '.join(tried) or 'no method available'})")
+                note = (f"{label}: SolidWorks measured {actual * 1000:.2f} mm - MISMATCH, check this dimension")
+                if self.bend_dim_verify == "delete":
+                    if self._delete_annotation(drawing, display):
+                        r["created"] = False
+                        note += " (deleted)"
+                steps.append(note)
+                continue
+            created += 1
+            check = "verified" if actual is not None else "value not readable"
+            steps.append(f"{label} -> {p['side']} level {p['level']}, {check}"
+                         + (f", {p['collisions']} unavoidable overlap(s)" if p["collisions"] else ""))
         drawing.ClearSelection2(True)
         return created, mismatched
 
     def _delete_annotation(self, drawing, display):
-        nothing = VARIANT(pythoncom.VT_DISPATCH, None)
         try:
+            nothing = VARIANT(pythoncom.VT_DISPATCH, None)
             annotation = self._get(display, "GetAnnotation")
             drawing.ClearSelection2(True)
-            if annotation is None or not annotation.Select3(False, nothing):
-                return False
+            if annotation is not None and annotation.Select3(False, nothing):
+                drawing.Extension.DeleteSelection2(6)
+                return True
         except Exception:
-            return False
-        for delete in (lambda: drawing.Extension.DeleteSelection2(0), lambda: drawing.EditDelete()):
-            try:
-                result = delete()
-                if result is None or result:
-                    return True
-            except Exception:
-                continue
+            pass
         return False
 
     def _report_bends(self, analysis, plan, steps):
@@ -1307,7 +1250,7 @@ class SwDrawingExporter:
         if plan is not None:
             created, mismatched = self._create_bend_dims(drawing, view, analysis, plan, steps)
             ok = [r for r in analysis["results"] if r["status"] == "ok"]
-            steps.append(f"bend dimensions: {created}/{len(ok)} created and verified, widths (bend line -> outer edge) "
+            steps.append(f"bend dimensions: {created}/{len(ok)} created and verified, values "
                          f"{[round(r['value'] * 1000, 2) for r in ok]}, levels "
                          f"{sorted({p['level'] for p in plan['placements']})}"
                          + (f", MISMATCH on {mismatched}" if mismatched else ""))
