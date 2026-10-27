@@ -1178,21 +1178,53 @@ class SwDrawingExporter:
         except Exception:
             return None
 
+    def _selected_object(self, drawing, index):
+        try:
+            return drawing.SelectionManager.GetSelectedObject6(index, -1)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _same_pair(a, b, tol=2e-5):
+        """True if the two 3D point pairs are the same segment (either direction)."""
+        if not a or not b or None in a or None in b:
+            return False
+        def close(p, q):
+            return all(abs(p[i] - q[i]) <= tol for i in range(3))
+        return (close(a[0], b[0]) and close(a[1], b[1])) or (close(a[0], b[1]) and close(a[1], b[0]))
+
+    def _is_bend_line(self, obj, bend_xyz):
+        try:
+            return self._same_pair(self._segment_xyz(obj), bend_xyz)
+        except Exception:
+            return False
+
+    def _is_edge(self, obj, edge):
+        try:
+            return self._same_pair(self._edge_points(obj), (edge["m0"], edge["m1"]))
+        except Exception:
+            return False
+
     def _select_pair_by_entities(self, drawing, view, bend_seg, edge_entity, sel):
-        """Bend line + outer edge selected as objects; True only if BOTH ended up in the selection."""
         drawing.ClearSelection2(True)
         ok1, _ = self._select_entity(view, bend_seg, False, sel)
         ok2, _ = self._select_entity(view, edge_entity, True, sel)
         count = self._selected_count(drawing)
         return ok1 and ok2 and (count is None or count >= 2)
 
-    def _select_pair_by_position(self, drawing, bend_line, edge_line):
-        """Fallback: pick the bend line and the edge at their sheet midpoints."""
+    def _select_pair_by_position(self, drawing, bend, edge, bend_line, edge_line):
+        """Pick bend line and edge by sheet position, and keep the pick ONLY if the selected objects really are
+        this bend line and this outer edge (checked by their end points). Several points along each are tried."""
         nothing = VARIANT(pythoncom.VT_DISPATCH, None)
         ext = drawing.Extension
-        bx, by = (bend_line[0][0] + bend_line[1][0]) / 2.0, (bend_line[0][1] + bend_line[1][1]) / 2.0
-        ex, ey = (edge_line[0][0] + edge_line[1][0]) / 2.0, (edge_line[0][1] + edge_line[1][1]) / 2.0
-        drawing.ClearSelection2(True)
+        try:
+            bend_xyz = self._segment_xyz(bend["seg"])
+        except Exception:
+            bend_xyz = None
+        fractions = (0.5, 0.3, 0.7, 0.15, 0.85)
+
+        def at(line, f):
+            return (line[0][0] + f * (line[1][0] - line[0][0]), line[0][1] + f * (line[1][1] - line[0][1]))
 
         def pick(x, y, types, append):
             for t in types:
@@ -1203,29 +1235,58 @@ class SwDrawingExporter:
                     pass
             return False
 
-        ok1 = pick(bx, by, ("EXTSKETCHSEGMENT", "SKETCHSEGMENT", ""), False)
-        ok2 = ok1 and pick(ex, ey, ("EDGE", "SILHOUETTE", ""), True)
-        count = self._selected_count(drawing)
-        return ok1 and ok2 and (count is None or count >= 2)
+        for fb in fractions:
+            bx, by = at(bend_line, fb)
+            drawing.ClearSelection2(True)
+            if not pick(bx, by, ("EXTSKETCHSEGMENT", "SKETCHSEGMENT", ""), False):
+                continue
+            if bend_xyz is not None and not self._is_bend_line(self._selected_object(drawing, 1), bend_xyz):
+                continue
+            for fe in fractions:
+                ex, ey = at(edge_line, fe)
+                if not pick(ex, ey, ("EDGE", "SILHOUETTE", ""), True):
+                    continue
+                count = self._selected_count(drawing) or 2
+                if count >= 2 and self._is_edge(self._selected_object(drawing, count), edge):
+                    return True
+                # wrong edge: start again with only the bend line selected
+                drawing.ClearSelection2(True)
+                pick(bx, by, ("EXTSKETCHSEGMENT", "SKETCHSEGMENT", ""), False)
+            break
+        drawing.ClearSelection2(True)
+        return False
 
     @staticmethod
     def _perpendicular_dim_function(bend_line):
-        """Dimension type perpendicular to the bend line, so it can only measure the bend-to-edge distance."""
         (x0, y0), (x1, y1) = bend_line
         dx, dy = abs(x1 - x0), abs(y1 - y0)
         length = math.hypot(dx, dy)
         if length < 1e-9:
             return "AddDimension2"
-        if dy <= 0.01 * length:       # horizontal bend line -> vertical distance
+        if dy <= 0.01 * length:
             return "AddVerticalDimension2"
-        if dx <= 0.01 * length:       # vertical bend line -> horizontal distance
+        if dx <= 0.01 * length:
             return "AddHorizontalDimension2"
         return "AddDimension2"
 
+    def _override_dimension(self, display, value):
+        """Show the computed bend dimension value on the dimension. Returns how it was done, or None."""
+        text = f"{value * 1000:.2f}".rstrip("0").rstrip(".")
+        try:
+            display.SetOverride(True, float(value))     # SolidWorks 2019+: overridden value, system units
+            return f"value overridden to {text} mm"
+        except Exception:
+            pass
+        try:
+            display.SetText(1, text)                     # swDimensionTextAll: replaces <DIM>
+            return f"text set to {text}"
+        except Exception:
+            return None
+
     def _create_bend_dims(self, drawing, view, analysis, plan, steps):
-        """Width dimension of every bend: bend line -> nearest outer edge of the flat pattern.
-        A dimension that comes out as the bend line LENGTH (or any other wrong value) is removed and the next
-        selection / dimension method is tried; nothing wrong is left on the sheet."""
+        """Width dimension of every bend (bend line -> nearest outer edge). The value written on the sheet is
+        ALWAYS the computed bend dimension: if SolidWorks measures something else, the dimension is redone with
+        a verified selection, and as a last resort its text is overridden with the computed value."""
         results = {r["id"]: r for r in analysis["results"]}
         bends = {r["id"]: r for r in analysis["bends"]}
         sel = self._select_data(drawing, view)
@@ -1236,7 +1297,6 @@ class SwDrawingExporter:
             bend = bends[r["id"]]
             tag = plan["tags"].get(r["id"], "?")
             expected = r["value"]
-            bend_len = math.hypot(bend["p1"][0] - bend["p0"][0], bend["p1"][1] - bend["p0"][1])
             label = f"bend {r['id']} [tag {tag}] width {expected * 1000:.2f} mm"
             bend_line = plan["sheet_lines"].get(r["id"])
             edge_line = plan.get("edge_lines", {}).get(r["id"])
@@ -1248,16 +1308,24 @@ class SwDrawingExporter:
             if bend_line and edge_line:
                 attempts += [("position", f) for f in funcs]
 
-            r["created"], tried, stuck = False, [], None
-            for how, f in attempts:
+            r["created"], tried = False, []
+            for i, (how, f) in enumerate(attempts):
+                last = i == len(attempts) - 1
                 try:
                     if how == "entities":
                         ok = self._select_pair_by_entities(drawing, view, bend["seg"], edge["entity"], sel)
                     else:
-                        ok = self._select_pair_by_position(drawing, bend_line, edge_line)
+                        ok = self._select_pair_by_position(drawing, bend, edge, bend_line, edge_line)
                     if not ok:
-                        tried.append(f"{how}: bend line + edge not both selected")
-                        continue
+                        tried.append(f"{how}: correct bend line + edge not selected")
+                        if not last:
+                            continue
+                        # nothing correct could be selected: dimension the bend line to the edge anyway
+                        if not self._select_pair_by_entities(drawing, view, bend["seg"], edge["entity"], sel):
+                            self._select_pair_by_position(drawing, bend, edge, bend_line, edge_line) or \
+                                drawing.ClearSelection2(True)
+                        if not self._selected_count(drawing):
+                            continue
                     display = getattr(drawing, f)(px, py, 0.0)
                 except Exception as exc:
                     tried.append(f"{how}/{f}: {exc}")
@@ -1273,25 +1341,27 @@ class SwDrawingExporter:
                     steps.append(f"{label} -> {p['side']} level {p['level']}, {check} ({how}/{f})"
                                  + (f", {p['collisions']} unavoidable overlap(s)" if p["collisions"] else ""))
                     break
-                what = ("the bend line LENGTH" if abs(actual - bend_len) <= DIM_VALUE_TOL
-                        else f"{actual * 1000:.2f} mm")
-                if self._delete_annotation(drawing, display):
-                    tried.append(f"{how}/{f}: measured {what} -> removed, retrying")
+                # SolidWorks measured something else
+                if not last and self._delete_annotation(drawing, display):
+                    tried.append(f"{how}/{f}: measured {actual * 1000:.2f} mm -> removed, retrying")
+                    continue
+                how_fixed = self._override_dimension(display, expected)
+                r["created"], r["solidworks_value"] = True, actual
+                if how_fixed:
+                    created += 1
+                    r["overridden"] = True
+                    steps.append(f"{label} -> SolidWorks measured {actual * 1000:.2f} mm, {how_fixed} "
+                                 f"(computed bend dimension used; check the extension lines). " + "; ".join(tried))
                 else:
-                    stuck = actual
-                    tried.append(f"{how}/{f}: measured {what} and could not be removed")
-                    break
+                    mismatched.append(r["id"])
+                    steps.append(f"{label}: MISMATCH {actual * 1000:.2f} mm and value could not be overridden - "
+                                 "check manually; " + "; ".join(tried))
+                break
             if not r["created"]:
                 mismatched.append(r["id"])
-                if stuck is not None:
-                    r["created"], r["solidworks_value"] = True, stuck
-                    steps.append(f"{label}: MISMATCH left on sheet ({stuck * 1000:.2f} mm) - check manually; "
-                                 + "; ".join(tried))
-                else:
-                    steps.append(f"{label}: NOT dimensioned - " + "; ".join(tried))
+                steps.append(f"{label}: NOT dimensioned - " + "; ".join(tried))
         drawing.ClearSelection2(True)
         return created, mismatched
-
     def _delete_annotation(self, drawing, display):
         try:
             nothing = VARIANT(pythoncom.VT_DISPATCH, None)
