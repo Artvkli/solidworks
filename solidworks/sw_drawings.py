@@ -1153,7 +1153,8 @@ class SwDrawingExporter:
                                     f"{ambiguous}" if ambiguous else ""))
             return {"placements": placements, "needs": needs, "tags": tags, "unassigned_tags": unassigned,
                     "ambiguous_tags": ambiguous,
-                    "sheet_lines": sheet_lines, "transform_status": to_sheet.status}
+                    "sheet_lines": sheet_lines, "transform_status": to_sheet.status,
+                    "edge_lines": {d["key"]: (d["e0"], d["e1"]) for d in dims}}
         except Exception as exc:
             steps.append(f"bend dimension placement failed: {type(exc).__name__}: {exc}")
             return None
@@ -1171,7 +1172,60 @@ class SwDrawingExporter:
         except Exception:
             return None
 
+    def _selected_count(self, drawing):
+        try:
+            return int(drawing.SelectionManager.GetSelectedObjectCount2(-1))
+        except Exception:
+            return None
+
+    def _select_pair_by_entities(self, drawing, view, bend_seg, edge_entity, sel):
+        """Bend line + outer edge selected as objects; True only if BOTH ended up in the selection."""
+        drawing.ClearSelection2(True)
+        ok1, _ = self._select_entity(view, bend_seg, False, sel)
+        ok2, _ = self._select_entity(view, edge_entity, True, sel)
+        count = self._selected_count(drawing)
+        return ok1 and ok2 and (count is None or count >= 2)
+
+    def _select_pair_by_position(self, drawing, bend_line, edge_line):
+        """Fallback: pick the bend line and the edge at their sheet midpoints."""
+        nothing = VARIANT(pythoncom.VT_DISPATCH, None)
+        ext = drawing.Extension
+        bx, by = (bend_line[0][0] + bend_line[1][0]) / 2.0, (bend_line[0][1] + bend_line[1][1]) / 2.0
+        ex, ey = (edge_line[0][0] + edge_line[1][0]) / 2.0, (edge_line[0][1] + edge_line[1][1]) / 2.0
+        drawing.ClearSelection2(True)
+
+        def pick(x, y, types, append):
+            for t in types:
+                try:
+                    if ext.SelectByID2("", t, x, y, 0.0, append, 0, nothing, 0):
+                        return True
+                except Exception:
+                    pass
+            return False
+
+        ok1 = pick(bx, by, ("EXTSKETCHSEGMENT", "SKETCHSEGMENT", ""), False)
+        ok2 = ok1 and pick(ex, ey, ("EDGE", "SILHOUETTE", ""), True)
+        count = self._selected_count(drawing)
+        return ok1 and ok2 and (count is None or count >= 2)
+
+    @staticmethod
+    def _perpendicular_dim_function(bend_line):
+        """Dimension type perpendicular to the bend line, so it can only measure the bend-to-edge distance."""
+        (x0, y0), (x1, y1) = bend_line
+        dx, dy = abs(x1 - x0), abs(y1 - y0)
+        length = math.hypot(dx, dy)
+        if length < 1e-9:
+            return "AddDimension2"
+        if dy <= 0.01 * length:       # horizontal bend line -> vertical distance
+            return "AddVerticalDimension2"
+        if dx <= 0.01 * length:       # vertical bend line -> horizontal distance
+            return "AddHorizontalDimension2"
+        return "AddDimension2"
+
     def _create_bend_dims(self, drawing, view, analysis, plan, steps):
+        """Width dimension of every bend: bend line -> nearest outer edge of the flat pattern.
+        A dimension that comes out as the bend line LENGTH (or any other wrong value) is removed and the next
+        selection / dimension method is tried; nothing wrong is left on the sheet."""
         results = {r["id"]: r for r in analysis["results"]}
         bends = {r["id"]: r for r in analysis["bends"]}
         sel = self._select_data(drawing, view)
@@ -1179,36 +1233,62 @@ class SwDrawingExporter:
         for p in plan["placements"]:
             r = results[p["key"]]
             edge = analysis["edges"][r["edge"]]
+            bend = bends[r["id"]]
             tag = plan["tags"].get(r["id"], "?")
-            label = f"bend {r['id']} [tag {tag}] {r['value'] * 1000:.2f} mm"
-            drawing.ClearSelection2(True)
-            ok1, _ = self._select_entity(view, bends[r["id"]]["seg"], False, sel)
-            ok2, _ = self._select_entity(view, edge["entity"], True, sel)
-            if not (ok1 and ok2):
-                r["created"] = False
-                steps.append(f"{label}: could not select bend line/edge - NOT dimensioned")
-                continue
+            expected = r["value"]
+            bend_len = math.hypot(bend["p1"][0] - bend["p0"][0], bend["p1"][1] - bend["p0"][1])
+            label = f"bend {r['id']} [tag {tag}] width {expected * 1000:.2f} mm"
+            bend_line = plan["sheet_lines"].get(r["id"])
+            edge_line = plan.get("edge_lines", {}).get(r["id"])
             px, py = p["text_point"]
-            display = drawing.AddDimension2(px, py, 0.0)
-            if display is None:
-                r["created"] = False
-                steps.append(f"{label}: AddDimension2 returned nothing - NOT dimensioned")
-                continue
-            actual = self._dimension_value(display)
-            r["created"], r["solidworks_value"] = True, actual
-            if actual is not None and abs(actual - r["value"]) > DIM_VALUE_TOL:
+
+            func = self._perpendicular_dim_function(bend_line) if bend_line else "AddDimension2"
+            funcs = [func] + (["AddDimension2"] if func != "AddDimension2" else [])
+            attempts = [("entities", f) for f in funcs]
+            if bend_line and edge_line:
+                attempts += [("position", f) for f in funcs]
+
+            r["created"], tried, stuck = False, [], None
+            for how, f in attempts:
+                try:
+                    if how == "entities":
+                        ok = self._select_pair_by_entities(drawing, view, bend["seg"], edge["entity"], sel)
+                    else:
+                        ok = self._select_pair_by_position(drawing, bend_line, edge_line)
+                    if not ok:
+                        tried.append(f"{how}: bend line + edge not both selected")
+                        continue
+                    display = getattr(drawing, f)(px, py, 0.0)
+                except Exception as exc:
+                    tried.append(f"{how}/{f}: {exc}")
+                    continue
+                if display is None:
+                    tried.append(f"{how}/{f}: no dimension created")
+                    continue
+                actual = self._dimension_value(display)
+                if actual is None or abs(actual - expected) <= DIM_VALUE_TOL:
+                    r["created"], r["solidworks_value"] = True, actual
+                    created += 1
+                    check = "verified" if actual is not None else "value not readable"
+                    steps.append(f"{label} -> {p['side']} level {p['level']}, {check} ({how}/{f})"
+                                 + (f", {p['collisions']} unavoidable overlap(s)" if p["collisions"] else ""))
+                    break
+                what = ("the bend line LENGTH" if abs(actual - bend_len) <= DIM_VALUE_TOL
+                        else f"{actual * 1000:.2f} mm")
+                if self._delete_annotation(drawing, display):
+                    tried.append(f"{how}/{f}: measured {what} -> removed, retrying")
+                else:
+                    stuck = actual
+                    tried.append(f"{how}/{f}: measured {what} and could not be removed")
+                    break
+            if not r["created"]:
                 mismatched.append(r["id"])
-                note = (f"{label}: SolidWorks measured {actual * 1000:.2f} mm - MISMATCH, check this dimension")
-                if self.bend_dim_verify == "delete":
-                    if self._delete_annotation(drawing, display):
-                        r["created"] = False
-                        note += " (deleted)"
-                steps.append(note)
-                continue
-            created += 1
-            check = "verified" if actual is not None else "value not readable"
-            steps.append(f"{label} -> {p['side']} level {p['level']}, {check}"
-                         + (f", {p['collisions']} unavoidable overlap(s)" if p["collisions"] else ""))
+                if stuck is not None:
+                    r["created"], r["solidworks_value"] = True, stuck
+                    steps.append(f"{label}: MISMATCH left on sheet ({stuck * 1000:.2f} mm) - check manually; "
+                                 + "; ".join(tried))
+                else:
+                    steps.append(f"{label}: NOT dimensioned - " + "; ".join(tried))
         drawing.ClearSelection2(True)
         return created, mismatched
 
