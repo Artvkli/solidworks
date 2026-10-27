@@ -356,7 +356,8 @@ class ThicknessDwgBuilder:
 
         if any(not f["is_dwg"] for f in files):
             print()
-            print("Some files are DXF because ODA File Converter was not found.")
+            print("Some files are DXF because the DWG conversion was unavailable or failed")
+            print("(see the 'DXF only: ...' reason printed for each file above).")
             print("Install the free 'ODA File Converter' and run again to get DWG,")
             print("or open the DXF in AutoCAD and use Save As -> DWG.")
 

@@ -1,6 +1,14 @@
 """One SLDDRW per sheet-metal part:
-master.slddrw + Top / Front / Flat pattern views + overall dimensions + QTY note + tagged bend table."""
+master.slddrw + folded views (Top / Front / Right) + Flat pattern view + overall dimensions
++ bend-line-to-outer-edge dimensions + QTY note + tagged bend table.
+
+Bend dimensions (see bend_geometry.py for the coordinate systems):
+  values are decided in the true-size frame of the bend-line sketch (sketch -> model via
+  ModelToSketchTransform), the drawing-view transform is only used to place text and pair tags,
+  and every created dimension is read back from SolidWorks and compared with the expected value.
+"""
 import gc
+import json
 import math
 import re
 import shutil
@@ -9,6 +17,9 @@ from pathlib import Path
 
 import pythoncom
 from win32com.client import VARIANT
+
+from .bend_geometry import (Xform, assign_tags, classify_outer, detect_convention, measure_bends,
+                            order_key, plan_placements, same_segment)
 
 SW_DOC_PART = 1
 SW_DOC_DRAWING = 3
@@ -40,6 +51,12 @@ DEFAULT_LAYOUT = {
     "scale_mode": "fine",          # "fine" = 1:n for any whole n (largest view that fits), "standard" = fixed list
 }
 
+# Grid cell (column, row) of each folded view inside the folded-view band; row 0 is the top row.
+# Top sits above Front, Right sits to the right of Front (same arrangement as the earlier Top-over-Front stack).
+FOLDED_GRID = {"top": (0, 0), "front": (0, 1), "right": (1, 1), "left": (-1, 1), "bottom": (0, 2), "back": (2, 1)}
+SIDES = ("left", "right", "top", "bottom")
+DIM_VALUE_TOL = 1e-5               # 0.01 mm: created dimension must match the computed value within this
+
 
 class SwDrawingExporter:
     """Per part: copy master.slddrw -> Edit Sheet Format -> remove old views -> Top / Front / Flat pattern
@@ -54,7 +71,10 @@ class SwDrawingExporter:
                  add_dimensions=True, dimension_offset_mm=15,
                  add_qty_note=True, qty_note_x_mm=None, qty_note_y_mm=None,
                  add_bend_dimensions=True, bend_dim_offset_mm=8, bend_dim_step_mm=7,
-                 bend_dim_text_width_mm=14, bend_dim_order="largest_first"):
+                 bend_dim_text_width_mm=14, bend_dim_order="largest_outside",
+                 folded_view_names=("*Top", "*Front"), bend_dim_right_pad_mm=18,
+                 bend_dim_text_height_mm=3.5, bend_dim_max_levels=12, bend_dim_merge_collinear=True,
+                 bend_dim_verify="flag", bend_tag_max_distance_mm=15, bend_debug_json=False):
         self.sw_app = sw_app
         self.assembly_path = Path(assembly_path).resolve() if assembly_path else None
         self.reconnect = reconnect
@@ -80,6 +100,17 @@ class SwDrawingExporter:
         self.bend_dim_step_mm = bend_dim_step_mm
         self.bend_dim_text_width_mm = bend_dim_text_width_mm
         self.bend_dim_order = bend_dim_order
+        self.folded_view_names = tuple(folded_view_names or ())
+        self.bend_dim_right_pad_mm = bend_dim_right_pad_mm
+        self.bend_dim_text_height_mm = bend_dim_text_height_mm
+        self.bend_dim_max_levels = int(bend_dim_max_levels)
+        self.bend_dim_merge_collinear = bend_dim_merge_collinear
+        self.bend_dim_verify = bend_dim_verify          # "flag" = keep + report mismatches, "delete" = remove them
+        self.bend_tag_max_distance_mm = bend_tag_max_distance_mm
+        self.bend_debug_json = bend_debug_json
+        self._convention = None                          # MathTransform convention, verified once per session
+        self._bend_tags = []
+        self._current_item = {}
 
     # ---------------- helpers ----------------
     @staticmethod
@@ -364,6 +395,10 @@ class SwDrawingExporter:
                                     (pos[0] + target_cx - cx, pos[1] + target_cy - cy))
 
     def _fit_scale(self, limit):
+        if not limit or limit <= 0:
+            # No usable room (e.g. the bend table / margins leave a negative box).
+            # Previously "fine" mode returned 1:1 here; use the smallest scale instead.
+            return SCALES[-1]
         if self.layout.get("scale_mode", "fine") == "fine":
             if limit >= 1:
                 return next(v for v in (10, 5, 4, 2, 1) if v <= limit * 1.001)
@@ -391,12 +426,35 @@ class SwDrawingExporter:
             scale = self._fit_scale(scale * 0.93)
         return scale, (w, h)
 
-    def _layout_views(self, drawing, folded, flat_view, table_top, steps):
+    def _initial_flat_pads(self):
+        """Extra room (metres) around the flat pattern for bend dimensions: below and to the right."""
+        if not self.add_bend_dimensions:
+            return dict.fromkeys(SIDES, 0.0)
+        return {"left": 0.0, "top": 0.0,
+                "bottom": self.layout.get("bend_dim_pad_mm", 18) / 1000.0,
+                "right": self.bend_dim_right_pad_mm / 1000.0}
+
+    @staticmethod
+    def _folded_cells(folded):
+        """(name, view, column, row) for each folded view, using FOLDED_GRID; unknown names go right of row 1."""
+        cells, used = [], set()
+        for name, view in folded:
+            cell = FOLDED_GRID.get(name)
+            if cell is None or cell in used:
+                col = max([c for c, r in used if r == 1] + [0]) + 1
+                cell = (col, 1)
+            used.add(cell)
+            cells.append((name, view, cell[0], cell[1]))
+        return cells
+
+    def _layout_views(self, drawing, folded, flat_view, table_top, steps, flat_pads=None):
         width, height = self._sheet_size(drawing)
         lay = self.layout
         mm = 0.001
         m, pad, dim = lay["margin_mm"] * mm, lay["side_pad_mm"] * mm, lay["dim_pad_mm"] * mm
         vgap = lay["view_gap_mm"] * mm
+        hgap = max(vgap, dim)          # the left view's width dimension sits between two views of a row
+        pads = dict(self._initial_flat_pads() if flat_pads is None else flat_pads)
         left, right = m + pad, width - m - pad
         low = table_top + lay["table_clearance_mm"] * mm
         high = height - m - lay["top_pad_mm"] * mm
@@ -409,11 +467,12 @@ class SwDrawingExporter:
                 folded_box, flat_box = None, (left, low, right, high)
 
             f_in = (folded_box[0], folded_box[1], folded_box[2] - dim, folded_box[3] - dim) if folded_box else None
-            bend_pad = lay.get("bend_dim_pad_mm", 18) * mm if self.add_bend_dimensions else 0.0
-            b_in = (flat_box[0] + dim, flat_box[1] + bend_pad, flat_box[2], flat_box[3] - dim)
+            b_in = (flat_box[0] + dim + pads.get("left", 0.0), flat_box[1] + pads.get("bottom", 0.0),
+                    flat_box[2] - pads.get("right", 0.0), flat_box[3] - dim - pads.get("top", 0.0))
             steps.append(f"sheet {width * 1000:.0f} x {height * 1000:.0f} mm | table top {table_top * 1000:.0f} mm | "
                          f"flat area {flat_box[1] * 1000:.0f}-{flat_box[3] * 1000:.0f} mm"
-                         + (f" | folded area {folded_box[1] * 1000:.0f}-{folded_box[3] * 1000:.0f} mm" if folded_box else ""))
+                         + (f" | folded area {folded_box[1] * 1000:.0f}-{folded_box[3] * 1000:.0f} mm" if folded_box else "")
+                         + " | bend dim room " + ", ".join(f"{k} {v * 1000:.0f}" for k, v in pads.items() if v))
 
             if lay.get("auto_rotate_flat", True):
                 o = self._get(flat_view, "GetOutline")
@@ -425,10 +484,15 @@ class SwDrawingExporter:
                         steps.append(f"flat pattern rotation failed: {exc}")
 
             limits = {}
-            if folded:
-                sizes = [self._size_at_unit_scale(v) for _, v in folded]
-                limits["folded"] = min((f_in[2] - f_in[0]) / max(w for w, _ in sizes),
-                                       (f_in[3] - f_in[1] - vgap * (len(folded) - 1)) / sum(h for _, h in sizes))
+            cells = self._folded_cells(folded) if folded else []
+            if cells:
+                sizes = [self._size_at_unit_scale(v) for _, v, _, _ in cells]
+                col_w, row_h = {}, {}
+                for (_, _, c, r), (w, h) in zip(cells, sizes):
+                    col_w[c] = max(col_w.get(c, 0.0), w)
+                    row_h[r] = max(row_h.get(r, 0.0), h)
+                limits["folded"] = min((f_in[2] - f_in[0] - hgap * (len(col_w) - 1)) / sum(col_w.values()),
+                                       (f_in[3] - f_in[1] - vgap * (len(row_h) - 1)) / sum(row_h.values()))
             fw, fh = self._size_at_unit_scale(flat_view)
             limits["flat"] = min((b_in[2] - b_in[0]) / fw, (b_in[3] - b_in[1]) / fh)
 
@@ -439,7 +503,7 @@ class SwDrawingExporter:
                 scales = {k: self._fit_scale(v) for k, v in limits.items()}
 
             b_w, b_h = b_in[2] - b_in[0], b_in[3] - b_in[1]
-            scales["flat"], (real_w, real_h) = self._settle_scale(flat_view, scales["flat"], b_w, b_h)
+            scales["flat"], _ = self._settle_scale(flat_view, scales["flat"], b_w, b_h)
             if lay["common_scale"] and "folded" in scales:
                 scales["folded"] = min(scales["folded"], scales["flat"])
                 scales["flat"] = scales["folded"]
@@ -451,16 +515,29 @@ class SwDrawingExporter:
                          f"{(o[2] - o[0]) * 1000:.0f} x {(o[3] - o[1]) * 1000:.0f} mm "
                          f"in a box of {b_w * 1000:.0f} x {b_h * 1000:.0f} mm")
 
-            if folded:
-                heights = []
-                for _, v in folded:
+            if cells:
+                col_w, row_h, size = {}, {}, {}
+                for name, v, c, r in cells:
                     o = self._get(v, "GetOutline")
-                    heights.append(o[3] - o[1])
-                total = sum(heights) + vgap * (len(folded) - 1)
-                cursor = (f_in[1] + f_in[3]) / 2.0 + total / 2.0
-                for (_, v), h in zip(folded, heights):
-                    self._move_view(v, (f_in[0] + f_in[2]) / 2.0, cursor - h / 2.0)
-                    cursor -= h + vgap
+                    size[name] = (o[2] - o[0], o[3] - o[1])
+                    col_w[c] = max(col_w.get(c, 0.0), size[name][0])
+                    row_h[r] = max(row_h.get(r, 0.0), size[name][1])
+                cols, rows = sorted(col_w), sorted(row_h)
+                total_w = sum(col_w.values()) + hgap * (len(cols) - 1)
+                total_h = sum(row_h.values()) + vgap * (len(rows) - 1)
+                x = (f_in[0] + f_in[2]) / 2.0 - total_w / 2.0
+                col_x = {}
+                for c in cols:
+                    col_x[c] = x + col_w[c] / 2.0
+                    x += col_w[c] + hgap
+                y = (f_in[1] + f_in[3]) / 2.0 + total_h / 2.0
+                row_y = {}
+                for r in rows:
+                    row_y[r] = y - row_h[r] / 2.0
+                    y -= row_h[r] + vgap
+                for name, v, c, r in cells:
+                    self._move_view(v, col_x[c], row_y[r])
+                steps.append("folded views placed: " + ", ".join(f"{n} (col {c}, row {r})" for n, _, c, r in cells))
             self._move_view(flat_view, (b_in[0] + b_in[2]) / 2.0, (b_in[1] + b_in[3]) / 2.0)
 
             txt = ", ".join(f"{k} {self._scale_text(v)}" for k, v in scales.items())
@@ -484,6 +561,96 @@ class SwDrawingExporter:
         except Exception:
             pass
 
+    # ---------------- coordinate transforms ----------------
+    def _math_point(self, xyz):
+        math_util = self._get(self.sw_app, "GetMathUtility")
+        if math_util is None:
+            raise RuntimeError("MathUtility not available")
+        return math_util.CreatePoint(VARIANT(pythoncom.VT_ARRAY | pythoncom.VT_R8, tuple(float(v) for v in xyz)))
+
+    def _to_xform(self, com_xform, label, steps):
+        """Read a SolidWorks MathTransform into an Xform. The matrix convention is verified once per session by
+        letting SolidWorks transform a probe point (IMathPoint.MultiplyTransform) and comparing the result."""
+        if com_xform is None:
+            raise RuntimeError(f"{label} not available")
+        data = self._get(com_xform, "ArrayData")
+        if not data or len(data) < 13:
+            raise RuntimeError(f"{label}: ArrayData not available")
+        data = [float(v) for v in data]
+        if self._convention is None:
+            probe = (0.1234, -0.5678, 0.9012)
+            try:
+                out = self._get(self._math_point(probe).MultiplyTransform(com_xform), "ArrayData")
+            except Exception as exc:
+                out = None
+                steps.append(f"{label}: convention check unavailable ({exc}) - using documented row-vector form")
+            if out is None:
+                return Xform.from_array(data, "row")
+            convention = detect_convention(data, probe, [float(v) for v in out])
+            if convention is None:
+                raise RuntimeError(f"{label}: SolidWorks transform result matches no known matrix convention")
+            self._convention = convention
+            steps.append(f"transform convention verified with IMathPoint.MultiplyTransform: {convention} vectors")
+        return Xform.from_array(data, self._convention)
+
+    def _sheet_mapper(self, view, steps, points=None):
+        """model xyz -> sheet xy for this view, built from IView.ModelToViewTransform and checked against
+        IView.GetOutline. Orientation always comes from the transform matrix; the outline can only correct a
+        uniform scale and the position (logged), and a size mismatch in one direction aborts."""
+        mv = self._to_xform(self._get(view, "ModelToViewTransform"), "ModelToViewTransform", steps)
+        if points is None:
+            points = self._visible_model_points(view)
+        outline = self._get(view, "GetOutline")
+        k, dx, dy, status = 1.0, 0.0, 0.0, "not checked (no vertices or outline)"
+        if points and outline:
+            mapped = [mv.apply(p)[:2] for p in points]
+            bx0, by0 = min(p[0] for p in mapped), min(p[1] for p in mapped)
+            bx1, by1 = max(p[0] for p in mapped), max(p[1] for p in mapped)
+            bw, bh = bx1 - bx0, by1 - by0
+            ow, oh = outline[2] - outline[0], outline[3] - outline[1]
+            close = lambda a, b: abs(a - b) <= 0.03 * max(a, b) + 0.002  # noqa: E731
+            if close(bw, ow) and close(bh, oh):
+                status = "matches the view outline"
+            else:
+                kw = ow / bw if bw > 1e-9 else None
+                kh = oh / bh if bh > 1e-9 else None
+                if kw and kh and abs(kw - kh) <= 0.03 * max(kw, kh):
+                    k = (kw + kh) / 2.0
+                    status = f"scale corrected by {k:.6g} to match the view outline"
+                else:
+                    raise RuntimeError(
+                        f"drawing-view transform does not match the view outline (mapped {bw * 1000:.1f} x "
+                        f"{bh * 1000:.1f} mm, outline {ow * 1000:.1f} x {oh * 1000:.1f} mm)")
+            cx, cy = k * (bx0 + bx1) / 2.0, k * (by0 + by1) / 2.0
+            ox, oy = (outline[0] + outline[2]) / 2.0, (outline[1] + outline[3]) / 2.0
+            if abs(ox - cx) > 0.002 + 0.03 * ow or abs(oy - cy) > 0.002 + 0.03 * oh:
+                dx, dy = ox - cx, oy - cy
+                status += f"; position corrected by ({dx * 1000:.1f}, {dy * 1000:.1f}) mm"
+
+        def to_sheet(xyz):
+            x, y, _z = mv.apply(xyz)
+            return (k * x + dx, k * y + dy)
+
+        to_sheet.status = status
+        to_sheet.xform = mv
+        to_sheet.points = points
+        return to_sheet
+
+    def _view_mapper(self, view, steps, verbose=False):
+        """Compatibility wrapper: model xyz (optionally through `via`, an Xform into model space) -> sheet xy."""
+        mapper = self._sheet_mapper(view, steps)
+        if not mapper.points:
+            raise RuntimeError("no vertices in the view")
+        if verbose:
+            steps.append(f"view transform: {mapper.status}")
+
+        def to_sheet(xyz, via=None):
+            return mapper(via.apply(xyz) if via is not None else xyz)
+        pts = [mapper(p) for p in mapper.points]
+        to_sheet.vb = (min(p[0] for p in pts), min(p[1] for p in pts), max(p[0] for p in pts), max(p[1] for p in pts))
+        to_sheet.status = mapper.status
+        return to_sheet
+
     # ---------------- overall dimensions ----------------
     def _view_vertices(self, view):
         nothing = VARIANT(pythoncom.VT_DISPATCH, None)
@@ -495,6 +662,17 @@ class SwDrawingExporter:
             if entities and self._get(entities[0], "GetPoint") is not None:
                 return list(entities)
         return []
+
+    def _visible_model_points(self, view):
+        points = []
+        for vertex in self._view_vertices(view):
+            p = self._get(vertex, "GetPoint")
+            if p:
+                points.append(tuple(float(c) for c in p[:3]))
+        if not points:
+            for edge in self._view_edges(view):
+                points.extend(p for p in self._edge_points(edge) if p is not None)
+        return points
 
     def _vertex_points(self, view, vertices, steps):
         try:
@@ -528,6 +706,16 @@ class SwDrawingExporter:
             pass
         return False, None
 
+    _select_entity = _select_vertex
+
+    def _select_data(self, drawing, view):
+        try:
+            sel = drawing.SelectionManager.CreateSelectData()
+            sel.View = view
+            return sel
+        except Exception:
+            return VARIANT(pythoncom.VT_DISPATCH, None)
+
     def _add_overall_dimensions(self, drawing, view, steps, label, length=True, width=True, width_side="right"):
         stage = "vertices"
         try:
@@ -540,11 +728,7 @@ class SwDrawingExporter:
 
             outline = self._get(view, "GetOutline")
             off = self.dimension_offset_mm / 1000.0
-            try:
-                sel = drawing.SelectionManager.CreateSelectData()
-                sel.View = view
-            except Exception:
-                sel = VARIANT(pythoncom.VT_DISPATCH, None)
+            sel = self._select_data(drawing, view)
 
             jobs = []
             if length:
@@ -559,7 +743,7 @@ class SwDrawingExporter:
             for name, a_pt, b_pt, func, px, py in jobs:
                 stage = f"{name}: select"
                 drawing.ClearSelection2(True)
-                ok1, how1 = self._select_vertex(view, a_pt[2], False, sel)
+                ok1, _ = self._select_vertex(view, a_pt[2], False, sel)
                 ok2, _ = self._select_vertex(view, b_pt[2], True, sel)
                 if not (ok1 and ok2):
                     made.append(f"{name}: could not select corners")
@@ -572,8 +756,10 @@ class SwDrawingExporter:
         except Exception as exc:
             steps.append(f"dimensions {label} failed at '{stage}': {exc}")
 
-    # ---------------- bend dimensions ----------------
+    # ---------------- bend dimensions: geometry ----------------
     def _view_edges(self, view, steps=None):
+        """Visible model edges of the view. Entity type codes are probed and the returned objects are classified
+        by their methods, so the result does not depend on the numeric swViewEntityType_e values."""
         nothing = VARIANT(pythoncom.VT_DISPATCH, None)
         found = []
         diagnostics = []
@@ -602,7 +788,7 @@ class SwDrawingExporter:
                     (self._get(obj, "GetStartPoint2") is not None or
                      self._get(obj, "GetEndPoint2") is not None))
 
-        for entity_type in (1, 3):
+        for entity_type in (1, 2, 3, 4):
             try:
                 raw = view.GetVisibleEntities2(nothing, entity_type)
                 items = as_items(raw)
@@ -617,95 +803,18 @@ class SwDrawingExporter:
             steps.append("visible edge scan: " + "; ".join(diagnostics))
         return found
 
-    def _make_mapper(self, view, steps):
-        transform = self._get(view, "ModelToViewTransform")
-        if transform is None:
-            raise RuntimeError("ModelToViewTransform not available")
-        math_util = self._get(self.sw_app, "GetMathUtility")
-        if math_util is not None:
-            def com_map(xyz, via=None):
-                mp = math_util.CreatePoint(VARIANT(pythoncom.VT_ARRAY | pythoncom.VT_R8,
-                                                   tuple(float(v) for v in xyz)))
-                if via is not None:
-                    mp = mp.MultiplyTransform(via)
-                a = mp.MultiplyTransform(transform).ArrayData
-                return float(a[0]), float(a[1])
+    def _edge_points(self, edge):
+        """(start, end) model points of an edge, or (None, None) for closed edges such as full circles."""
+        out = []
+        for vertex_name, point_name in (("GetStartVertex", "GetStartPoint2"), ("GetEndVertex", "GetEndPoint2")):
+            p = self._get(self._get(edge, vertex_name), "GetPoint")
+            if p is None:
+                p = self._get(edge, point_name)
             try:
-                com_map((0.0, 0.0, 0.0))
-                return com_map, "com"
-            except Exception as exc:
-                steps.append(f"MathUtility transform failed ({exc}) - using the transform matrix")
-
-        data = self._get(transform, "ArrayData")
-        if not data or len(data) < 13:
-            raise RuntimeError("transform matrix not available")
-        d = [float(v) for v in data]
-        rows = [d[0:3], d[3:6], d[6:9]]
-        state = {"transpose": False, "k": d[12] or 1.0}
-
-        def apply_transform(xyz, xform, transpose=None, scale_override=None):
-            if xform is None:
-                return tuple(float(v) for v in xyz)
-            arr = self._get(xform, "ArrayData")
-            if arr is None or len(arr) < 13:
-                raise RuntimeError("transform matrix data unavailable")
-            a = [float(v) for v in arr]
-            rr = [a[0:3], a[3:6], a[6:9]]
-            use_transpose = state["transpose"] if transpose is None else transpose
-            if use_transpose:
-                rr = [[rr[j][i] for j in range(3)] for i in range(3)]
-            x, y, z = (float(v) for v in xyz)
-            sc = float(scale_override if scale_override is not None else (a[12] or 1.0))
-            return (sc * (rr[0][0]*x + rr[0][1]*y + rr[0][2]*z) + a[9],
-                    sc * (rr[1][0]*x + rr[1][1]*y + rr[1][2]*z) + a[10],
-                    sc * (rr[2][0]*x + rr[2][1]*y + rr[2][2]*z) + a[11])
-
-        def mat_map(xyz, via=None):
-            model_xyz = apply_transform(xyz, via) if via is not None else tuple(float(v) for v in xyz)
-            x, y, z = model_xyz
-            r = rows if not state["transpose"] else [[rows[j][i] for j in range(3)] for i in range(3)]
-            sc = state["k"]
-            return (sc * (r[0][0]*x + r[0][1]*y + r[0][2]*z),
-                    sc * (r[1][0]*x + r[1][1]*y + r[1][2]*z))
-        mat_map.state = state
-        return mat_map, "matrix"
-
-    def _view_mapper(self, view, steps, verbose=False):
-        to_view, kind = self._make_mapper(view, steps)
-        points = [p for p in (self._get(v, "GetPoint") for v in self._view_vertices(view)) if p]
-        if len(points) < 2:
-            raise RuntimeError("no vertices in the view")
-        outline = self._get(view, "GetOutline")
-        ow, oh = outline[2] - outline[0], outline[3] - outline[1]
-
-        def bbox():
-            xy = [to_view(p) for p in points]
-            return (min(x for x, _ in xy), min(y for _, y in xy), max(x for x, _ in xy), max(y for _, y in xy))
-
-        if kind == "matrix":
-            state, best = to_view.state, None
-            for transpose in (False, True):
-                state["transpose"], state["k"] = transpose, 1.0
-                b = bbox()
-                w, h = b[2] - b[0], b[3] - b[1]
-                err = abs(w / h - ow / oh) if h > 1e-9 and oh > 1e-9 else abs(w - ow)
-                if best is None or err < best[0]:
-                    best = (err, transpose, w)
-            state["transpose"] = best[1]
-            state["k"] = ow / best[2] if best[2] > 1e-9 else 1.0
-        vb = bbox()
-        off = ((outline[0] + outline[2]) / 2.0 - (vb[0] + vb[2]) / 2.0,
-               (outline[1] + outline[3]) / 2.0 - (vb[1] + vb[3]) / 2.0)
-        if abs((vb[2] - vb[0]) - ow) > 0.05 * max(ow, 1e-9):
-            steps.append("warning: view transform and outline sizes differ")
-        if verbose:
-            steps.append(f"point transform: {kind}")
-
-        def to_sheet(xyz, via=None):
-            x, y = to_view(xyz, via)
-            return x + off[0], y + off[1]
-        to_sheet.vb = (vb[0] + off[0], vb[1] + off[1], vb[2] + off[0], vb[3] + off[1])
-        return to_sheet
+                out.append(tuple(float(p[i]) for i in range(3)) if p is not None else None)
+            except Exception:
+                out.append(None)
+        return tuple(out)
 
     def _segment_xyz(self, segment):
         points = []
@@ -714,149 +823,347 @@ class SwDrawingExporter:
             points.append(tuple(float(self._get(pt, c)) for c in ("X", "Y", "Z")))
         return points
 
-    def _add_bend_dimensions(self, drawing, view, scale, limit_bottom, steps):
-        """Measures distance from every bend line to the nearest outer edge (Backgauge / Bend Offset)."""
-        stage = "bend lines"
-        try:
-            lines = list(self._get(view, "GetBendLines") or ())
-            steps.append(f"bend lines in the flat pattern view: {len(lines)}")
-            if not lines:
-                return
-            scale = float(scale or self._get(view, "ScaleDecimal"))
+    def _bend_frame(self, lines, steps):
+        """Bend lines in the measuring frame (= sketch frame of the first readable bend line).
 
-            stage = "geometry"
-            to_sheet = self._view_mapper(view, steps, verbose=True)
-            vb = to_sheet.vb
-            outline = self._get(view, "GetOutline")
+        GetBendLines returns sketch segments whose points are in their sketch's LOCAL frame. A segment from a
+        different sketch is brought over through model space: sketch_i -> model -> reference sketch.
+        Returns (model_to_frame Xform, [record per bend line]); unreadable lines get an "error" entry.
+        """
+        reference = None
+        records = []
+        for index, seg in enumerate(lines):
+            record = {"index": index, "id": f"#{index + 1}", "seg": seg}
+            try:
+                sketch = self._get(seg, "GetSketch")
+                if sketch is None:
+                    raise RuntimeError("GetSketch returned nothing")
+                model_to_sketch = self._to_xform(self._get(sketch, "ModelToSketchTransform"),
+                                                 "ModelToSketchTransform", steps)
+                pts = self._segment_xyz(seg)
+                if reference is None:
+                    reference = model_to_sketch
+                same = all(abs(a - b) <= 1e-12 for a, b in zip(model_to_sketch.to_array(), reference.to_array()))
+                if not same:
+                    to_frame = model_to_sketch.inverse().then(reference)
+                    pts = [to_frame.apply(p) for p in pts]
+                record.update(p0=pts[0][:2], p1=pts[1][:2], z=(pts[0][2], pts[1][2]), own_sketch=not same)
+            except Exception as exc:
+                record["error"] = f"{type(exc).__name__}: {exc}"
+            records.append(record)
+        if reference is None:
+            raise RuntimeError("no bend line has a readable sketch transform (ISketch.ModelToSketchTransform)")
+        return reference, records
 
-            stage = "edges"
-            edges = []
-            for e in self._view_edges(view, steps):
-                curve = self._get(e, "GetCurve")
-                is_line = self._get(curve, "IsLine") if curve is not None else None
-                if is_line is False:
+    def _outer_loop_hint(self, edge_records, model_to_frame, steps):
+        """Outer boundary straight from SolidWorks: the largest planar face parallel to the sheet, its loop
+        with ILoop2.IsOuter() = True. Returns [(p0, p1)] in the frame, or None."""
+        best = None
+        for record in edge_records[:300]:
+            faces = self._get(record["entity"], "GetTwoAdjacentFaces2")
+            for face in (faces or ()):
+                if face is None:
                     continue
-                sv = self._get(e, "GetStartVertex")
-                ev = self._get(e, "GetEndVertex")
-                p = self._get(sv, "GetPoint") if sv is not None else None
-                q = self._get(ev, "GetPoint") if ev is not None else None
-                if p is None or q is None:
-                    p = self._get(e, "GetStartPoint2")
-                    q = self._get(e, "GetEndPoint2")
-                if p is None or q is None:
-                    continue
+                normal = self._get(face, "Normal")
+                area = self._get(face, "GetArea")
                 try:
-                    p = tuple(float(p[i]) for i in range(3))
-                    q = tuple(float(q[i]) for i in range(3))
-                    edges.append((to_sheet(p), to_sheet(q), e))
+                    if not normal or not area or abs(model_to_frame.normal_z(normal)) < 0.999:
+                        continue
+                    if best is None or float(area) > best[0] * (1 + 1e-9):
+                        best = (float(area), face)
                 except Exception:
                     continue
-            steps.append(f"straight edges used: {len(edges)}")
+        if best is None:
+            steps.append("outer boundary: no sheet face found through the API - using the edge loops")
+            return None
+        segments = []
+        for loop in (self._get(best[1], "GetLoops") or ()):
+            if not self._get(loop, "IsOuter"):
+                continue
+            for edge in (self._get(loop, "GetEdges") or ()):
+                p, q = self._edge_points(edge)
+                if p is not None and q is not None:
+                    segments.append((model_to_frame.apply(p)[:2], model_to_frame.apply(q)[:2]))
+        steps.append(f"outer boundary: face of {best[0] * 1e6:.0f} mm2, outer loop with {len(segments)} edge(s)")
+        return segments or None
 
-            stage = "bend line positions"
-            bends = []
-            for i, seg in enumerate(lines):
-                pts = self._segment_xyz(seg)
-                cand = [to_sheet(pt) for pt in pts]
-                bends.append((seg, cand))
+    def _analyze_bends(self, view, steps, item=None):
+        """Measure every bend line to its outer reference edge. Never raises: problems go to analysis['error']."""
+        analysis = {"error": None, "bends": [], "edges": [], "results": [], "outer": set(), "outer_info": {}}
+        try:
+            lines = list(self._get(view, "GetBendLines") or ())
+            analysis["bend_count"] = len(lines)
+            steps.append(f"bend lines in the flat pattern view: {len(lines)}")
+            if not lines:
+                return analysis
 
-            stage = "distances"
-            items = []
-            seen_values = set()
+            model_to_frame, records = self._bend_frame(lines, steps)
+            analysis["model_to_frame"] = model_to_frame
+            analysis["bends"] = records
+            bad = [r for r in records if "error" in r]
+            if bad:
+                steps.append("bend lines unreadable (reported, not dimensioned): "
+                             + ", ".join(f"{r['id']} ({r['error']})" for r in bad))
 
-            for seg, (A, B) in bends:
-                dx, dy = B[0] - A[0], B[1] - A[1]
-                length = math.hypot(dx, dy)
-                if length < 1e-6:
+            edges, zs = [], []
+            for entity in self._view_edges(view, steps):
+                p, q = self._edge_points(entity)
+                if p is None or q is None:
                     continue
-                ux, uy = dx / length, dy / length
-                nx, ny = -uy, ux
-                s0 = nx * A[0] + ny * A[1]
-                
-                # پیدا کردن نزدیک‌ترین لبه خارجی هم‌راستا
-                candidates = []
-                for p, q, e in edges:
-                    ex, ey = q[0] - p[0], q[1] - p[1]
-                    le = math.hypot(ex, ey)
-                    if le < 1e-6 or abs(ux * ey - uy * ex) / le > 0.05:
-                        continue  # فقط لبه‌های موازی با خط خم
-                    
-                    edge_s = nx * p[0] + ny * p[1]
-                    delta = abs(edge_s - s0)
-                    if delta < 1e-4:
-                        continue  # خود خط خم است
-                    
-                    candidates.append((delta, e, edge_s - s0))
+                curve = self._get(entity, "GetCurve")
+                is_line = self._get(curve, "IsLine") if curve is not None else None
+                f0, f1 = model_to_frame.apply(p), model_to_frame.apply(q)
+                zs += [f0[2], f1[2]]  # checked on ALL edges, before any filtering
+                record = {"id": len(edges), "entity": entity, "m0": p, "m1": q, "f0": f0, "f1": f1,
+                          "p0": f0[:2], "p1": f1[:2], "is_line": True if is_line is None else bool(is_line)}
+                if math.hypot(f1[0] - f0[0], f1[1] - f0[1]) < 1e-6:
+                    continue  # edge across the thickness: a point in the sheet plane
+                if any(same_segment(record["p0"], record["p1"], e["p0"], e["p1"], 1e-5) for e in edges):
+                    continue  # same outline edge on the other face of the sheet
+                edges.append(record)
+            analysis["edges"] = edges
+            steps.append(f"sheet edges in the bend frame: {len(edges)}")
+            if not edges:
+                raise RuntimeError("no visible edges with readable end points")
 
-                if not candidates:
-                    continue
+            # the frame must be the sheet plane: every edge end point lies within the sheet thickness of it
+            thickness = float((item or {}).get("thickness") or 0.0) / 1000.0
+            allowed = (1.5 * thickness + 0.0002) if thickness > 0 else 0.01
+            spread = max(zs) - min(zs)
+            analysis["frame_check"] = {"z_spread_mm": round(spread * 1000, 4), "allowed_mm": round(allowed * 1000, 4)}
+            if spread > allowed:
+                raise RuntimeError(f"edges are not in the bend-sketch plane (spread {spread * 1000:.2f} mm > "
+                                   f"{allowed * 1000:.2f} mm) - coordinate frames do not match")
 
-                # انتخاب دقیق‌ترین و نزدیک‌ترین لبه
-                dist, edge, sign_delta = min(candidates, key=lambda o: o[0])
-                val_mm = round(dist / scale * 1000.0, 1)
+            hint = self._outer_loop_hint(edges, model_to_frame, steps)
+            outer, info = classify_outer([(e["p0"], e["p1"]) for e in edges], hint)
+            analysis["outer"], analysis["outer_info"] = outer, info
+            steps.append(f"outer boundary: {len(outer)} edge(s) via {info['method']}"
+                         + (f" - WARNING: {info['warning']}" if info.get("warning") else ""))
+            if not outer:
+                raise RuntimeError("outer boundary of the flat pattern could not be determined")
 
-                # از اندازه‌های تکراری جلوگیری کن
-                if val_mm in seen_values:
-                    continue
-                seen_values.add(val_mm)
+            valid = [r for r in records if "error" not in r]
+            results = measure_bends([{"id": r["id"], "p0": r["p0"], "p1": r["p1"]} for r in valid],
+                                    edges, outer, info.get("polygon"),
+                                    merge_collinear=self.bend_dim_merge_collinear)
+            for r in bad:
+                results.append({"id": r["id"], "status": "invalid", "reason": r["error"], "value": None})
+            analysis["results"] = results
 
-                sign = 1.0 if sign_delta > 0 else -1.0
-                tx, ty = A[0] + sign * dist * nx, A[1] + sign * dist * ny
-
-                if abs(nx) >= abs(ny):
-                    group, lo, hi = "h", min(A[0], tx), max(A[0], tx)
-                else:
-                    group, lo, hi = "v", min(A[1], ty), max(A[1], ty)
-                items.append({"seg": seg, "edge": edge, "group": group, "lo": lo, "hi": hi,
-                              "mid": (A[0] + B[0]) / 2.0 if group == "h" else (A[1] + B[1]) / 2.0,
-                              "value": val_mm})
-
-            stage = "levels"
-            items.sort(key=lambda it: it["value"], reverse=(self.bend_dim_order == "smallest_first"))
-            tw = self.bend_dim_text_width_mm / 1000.0
-            gap = 0.001
-            for group in ("h", "v"):
-                placed = []
-                for it in (i for i in items if i["group"] == group):
-                    lo, hi = min(it["lo"], it["mid"] - tw / 2.0), max(it["hi"], it["mid"] + tw / 2.0)
-                    level = 0
-                    while any(l == level and lo < h2 + gap and hi > l2 - gap for l, l2, h2 in placed):
-                        level += 1
-                    it["level"] = level
-                    placed.append((level, lo, hi))
-
-            stage = "dimensions"
-            start = self.bend_dim_offset_mm / 1000.0
-            step = self.bend_dim_step_mm / 1000.0
-            width, _ = self._sheet_size(drawing)
-            try:
-                sel = drawing.SelectionManager.CreateSelectData()
-                sel.View = view
-            except Exception:
-                sel = VARIANT(pythoncom.VT_DISPATCH, None)
-
-            created, too_low = 0, False
-            for it in items:
-                if it["group"] == "h":
-                    px, py = it["mid"], outline[1] - start - it["level"] * step
-                    too_low = too_low or py < limit_bottom
-                else:
-                    px, py = outline[2] + start + it["level"] * step, it["mid"]
-                    if px > width - self.layout["margin_mm"] / 1000.0:
-                        px = outline[0] - start - 0.010 - it["level"] * step
-                drawing.ClearSelection2(True)
-                ok1, _ = self._select_vertex(view, it["seg"], False, sel)
-                ok2, _ = self._select_vertex(view, it["edge"], True, sel)
-                if ok1 and ok2 and drawing.AddDimension2(px, py, 0.0) is not None:
-                    created += 1
-            drawing.ClearSelection2(True)
-            levels = {g: 1 + max([i["level"] for i in items if i["group"] == g] or [-1]) for g in ("h", "v")}
-            steps.append(f"bend dimensions: {created}/{len(items)} created, values "
-                         f"{[i['value'] for i in items]}, levels {levels}")
-            if too_low:
-                steps.append("warning: bend dimensions reach the bend table area - raise bend_dim_pad_mm")
+            outside = [r for r in results if r["status"] == "outside_boundary"]
+            if valid and len(outside) * 2 > len(valid):
+                raise RuntimeError(f"{len(outside)} of {len(valid)} bend lines fall outside the outer boundary - "
+                                   "bend-line and edge coordinates do not match; no bend dimensions created")
         except Exception as exc:
-            steps.append(f"bend dimensions failed at '{stage}': {exc}")
+            analysis["error"] = f"{type(exc).__name__}: {exc}"
+            steps.append(f"bend dimensions failed: {analysis['error']}")
+        return analysis
+
+    # ---------------- bend dimensions: tags + placement ----------------
+    def _view_notes(self, view):
+        notes = self._get(view, "GetNotes")
+        items = list(notes) if notes else []
+        if not items:
+            note = self._get(view, "GetFirstNote")
+            for _ in range(5000):
+                if note is None:
+                    break
+                items.append(note)
+                note = self._get(note, "GetNext")
+        out = []
+        for note in items:
+            text = self._get(note, "GetText")
+            position = self._get(self._get(note, "GetAnnotation"), "GetPosition")
+            if text and position and len(position) >= 2:
+                out.append((str(text).strip(), (float(position[0]), float(position[1]))))
+        return out
+
+    def _plan_bend_dims(self, drawing, view, analysis, table_top, steps, folded=(), final=True):
+        """Map the measured bends to the sheet, pair bend tags, and plan text positions.
+        Returns the plan dict or None (reason logged)."""
+        if analysis.get("error") or not analysis.get("results"):
+            return None
+        try:
+            edges = analysis["edges"]
+            to_sheet = self._sheet_mapper(view, steps, points=[e["m0"] for e in edges] + [e["m1"] for e in edges])
+            frame_to_model = analysis["model_to_frame"].inverse()
+            bends = {r["id"]: r for r in analysis["bends"] if "error" not in r}
+
+            def bend_sheet(bid):
+                b = bends[bid]
+                return (to_sheet(frame_to_model.apply((b["p0"][0], b["p0"][1], b["z"][0]))),
+                        to_sheet(frame_to_model.apply((b["p1"][0], b["p1"][1], b["z"][1]))))
+
+            sheet_lines = {bid: bend_sheet(bid) for bid in bends}
+            tag_names = list(self._bend_tags)
+            notes = self._view_notes(view)
+            tags, unassigned, ambiguous = assign_tags(sheet_lines, notes, tag_names,
+                                                      self.bend_tag_max_distance_mm / 1000.0)
+
+            mm = 0.001
+            width, height = self._sheet_size(drawing)
+            outline = self._get(view, "GetOutline")
+            off, th, tw = self.dimension_offset_mm * mm, self.bend_dim_text_height_mm * mm, self.bend_dim_text_width_mm * mm
+            obstacles = [(x - 2.5 * mm, y - 2.5 * mm, x + 2.5 * mm, y + 2.5 * mm)
+                         for text, (x, y) in notes if text in tag_names or not tag_names]
+            if outline and self.add_dimensions:  # overall length (above) and width (left) of the flat view
+                obstacles.append((outline[0], outline[3], outline[2], outline[3] + off + th))
+                obstacles.append((outline[0] - off - tw / 2.0, outline[1], outline[0], outline[3]))
+            for _name, folded_view in folded:
+                o = self._get(folded_view, "GetOutline")
+                if o:
+                    dim = self.layout["dim_pad_mm"] * mm
+                    obstacles.append((o[0], o[1], o[2] + dim, o[3] + dim))
+
+            outer_ids = analysis["outer"] or set(range(len(edges)))
+            part_points = [to_sheet(edges[i][k]) for i in outer_ids for k in ("m0", "m1")]
+            ok = sorted((r for r in analysis["results"] if r["status"] == "ok"), key=order_key(self.bend_dim_order))
+            dims = []
+            for r in ok:
+                b0, b1 = sheet_lines[r["id"]]
+                e = edges[r["edge"]]
+                dims.append({"key": r["id"], "b0": b0, "b1": b1, "e0": to_sheet(e["m0"]), "e1": to_sheet(e["m1"])})
+            bounds = (self.layout["margin_mm"] * mm, table_top, width - self.layout["margin_mm"] * mm,
+                      height - self.layout["margin_mm"] * mm) if final else None
+            placements, needs = plan_placements(
+                dims, part_points, self.bend_dim_offset_mm * mm, self.bend_dim_step_mm * mm, tw, th,
+                max_levels=self.bend_dim_max_levels, bounds=bounds, obstacles=obstacles) if dims else ([], dict.fromkeys(SIDES, 0.0))
+            if final:
+                steps.append(f"bend view transform: {to_sheet.status}")
+                if tag_names or notes:
+                    steps.append(f"bend tags paired: {len(tags)} of {len(tag_names) or len(notes)}"
+                                 + (f" (unpaired: {unassigned})" if unassigned else "")
+                                 + (f" - AMBIGUOUS (tag is as close to another bend line, check manually): "
+                                    f"{ambiguous}" if ambiguous else ""))
+            return {"placements": placements, "needs": needs, "tags": tags, "unassigned_tags": unassigned,
+                    "ambiguous_tags": ambiguous,
+                    "sheet_lines": sheet_lines, "transform_status": to_sheet.status}
+        except Exception as exc:
+            steps.append(f"bend dimension placement failed: {type(exc).__name__}: {exc}")
+            return None
+
+    # ---------------- bend dimensions: create + verify ----------------
+    def _dimension_value(self, display_dimension):
+        dimension = None
+        try:
+            dimension = display_dimension.GetDimension2(0)
+        except Exception:
+            dimension = self._get(display_dimension, "GetDimension")
+        value = self._get(dimension, "SystemValue")
+        try:
+            return float(value)
+        except Exception:
+            return None
+
+    def _create_bend_dims(self, drawing, view, analysis, plan, steps):
+        results = {r["id"]: r for r in analysis["results"]}
+        bends = {r["id"]: r for r in analysis["bends"]}
+        sel = self._select_data(drawing, view)
+        created, mismatched = 0, []
+        for p in plan["placements"]:
+            r = results[p["key"]]
+            edge = analysis["edges"][r["edge"]]
+            tag = plan["tags"].get(r["id"], "?")
+            label = f"bend {r['id']} [tag {tag}] {r['value'] * 1000:.2f} mm"
+            drawing.ClearSelection2(True)
+            ok1, _ = self._select_entity(view, bends[r["id"]]["seg"], False, sel)
+            ok2, _ = self._select_entity(view, edge["entity"], True, sel)
+            if not (ok1 and ok2):
+                r["created"] = False
+                steps.append(f"{label}: could not select bend line/edge - NOT dimensioned")
+                continue
+            px, py = p["text_point"]
+            display = drawing.AddDimension2(px, py, 0.0)
+            if display is None:
+                r["created"] = False
+                steps.append(f"{label}: AddDimension2 returned nothing - NOT dimensioned")
+                continue
+            actual = self._dimension_value(display)
+            r["created"], r["solidworks_value"] = True, actual
+            if actual is not None and abs(actual - r["value"]) > DIM_VALUE_TOL:
+                mismatched.append(r["id"])
+                note = (f"{label}: SolidWorks measured {actual * 1000:.2f} mm - MISMATCH, check this dimension")
+                if self.bend_dim_verify == "delete":
+                    if self._delete_annotation(drawing, display):
+                        r["created"] = False
+                        note += " (deleted)"
+                steps.append(note)
+                continue
+            created += 1
+            check = "verified" if actual is not None else "value not readable"
+            steps.append(f"{label} -> {p['side']} level {p['level']}, {check}"
+                         + (f", {p['collisions']} unavoidable overlap(s)" if p["collisions"] else ""))
+        drawing.ClearSelection2(True)
+        return created, mismatched
+
+    def _delete_annotation(self, drawing, display):
+        try:
+            nothing = VARIANT(pythoncom.VT_DISPATCH, None)
+            annotation = self._get(display, "GetAnnotation")
+            drawing.ClearSelection2(True)
+            if annotation is not None and annotation.Select3(False, nothing):
+                drawing.Extension.DeleteSelection2(6)
+                return True
+        except Exception:
+            pass
+        return False
+
+    def _report_bends(self, analysis, plan, steps):
+        """One line per bend that is NOT dimensioned and why - nothing is dropped silently."""
+        for r in analysis.get("results", []):
+            if r["status"] == "ok":
+                continue
+            tag = (plan or {}).get("tags", {}).get(r["id"])
+            who = f"bend {r['id']}" + (f" [tag {tag}]" if tag else "")
+            if r["status"] in ("merged", "duplicate"):
+                steps.append(f"{who}: shares the dimension of bend {r.get('merged_into')} ({r['reason']})")
+            else:
+                steps.append(f"{who}: NOT dimensioned - {r['status']}: {r['reason']} (manual review)")
+
+    def _add_bend_dimensions(self, drawing, view, scale, limit_bottom, steps, folded=()):
+        """Measure, place and create the bend dimensions of a flat pattern view (no relayout).
+        `scale` is kept for call compatibility; values come from geometry, not from the view scale.
+        Returns (analysis, plan)."""
+        analysis = self._analyze_bends(view, steps, self._current_item)
+        plan = self._plan_bend_dims(drawing, view, analysis, limit_bottom, steps, folded, final=True)
+        self._finish_bend_dims(drawing, view, analysis, plan, steps)
+        return analysis, plan
+
+    def _finish_bend_dims(self, drawing, view, analysis, plan, steps):
+        """Create the planned dimensions, log a summary and report every bend that was not dimensioned."""
+        if plan is not None:
+            created, mismatched = self._create_bend_dims(drawing, view, analysis, plan, steps)
+            ok = [r for r in analysis["results"] if r["status"] == "ok"]
+            steps.append(f"bend dimensions: {created}/{len(ok)} created and verified, values "
+                         f"{[round(r['value'] * 1000, 2) for r in ok]}, levels "
+                         f"{sorted({p['level'] for p in plan['placements']})}"
+                         + (f", MISMATCH on {mismatched}" if mismatched else ""))
+        elif analysis.get("results") and not analysis.get("error"):
+            steps.append("bend dimensions NOT created: placement could not be planned (see above)")
+        self._report_bends(analysis, plan, steps)
+
+    def _write_bend_probe(self, path, analysis, plan, steps):
+        """Diagnostic JSON next to the drawing: frames, bends, edges, results, tags, placements."""
+        def clean(value):
+            if isinstance(value, dict):
+                return {str(k): clean(v) for k, v in value.items() if k not in ("seg", "entity")}
+            if isinstance(value, (list, tuple, set)):
+                return [clean(v) for v in value]
+            if isinstance(value, float):
+                return round(value, 9)
+            if isinstance(value, (str, int, bool)) or value is None:
+                return value
+            if isinstance(value, Xform):
+                return {"array": [round(v, 12) for v in value.to_array()]}
+            return str(value)
+        data = {"part": self._current_item.get("name"), "convention": self._convention,
+                "analysis": clean(analysis or {}), "plan": clean(plan or {})}
+        try:
+            Path(path).write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
+            steps.append(f"bend probe written: {Path(path).name}")
+        except Exception as exc:
+            steps.append(f"bend probe not written: {exc}")
 
     # ---------------- QTY note ----------------
     def _add_qty_note(self, drawing, item, steps, table_bottom=None, row_h=None):
@@ -1024,7 +1331,27 @@ class SwDrawingExporter:
                     self._move_table(grid, left, top, steps, view)
             else:
                 steps.append("bend table could not be moved or deleted - check its position manually")
-        return bottom, top, table_h / rows
+        self._bend_tags = self._read_tags(grid, steps)
+        return bottom, top, table_h / rows, list(self._bend_tags)
+
+    def _read_tags(self, grid, steps):
+        """Tag texts (A, B, ...) from the bend table's tag column; header row(s) are skipped."""
+        try:
+            cols = int(self._get(grid, "ColumnCount") or 0)
+            rows = int(self._get(grid, "RowCount") or 0)
+            header_row, tag_col = 0, 0
+            for r in range(min(2, rows)):
+                found = next((c for c in range(cols) if "tag" in self._cell(grid, r, c).lower()), None)
+                if found is not None:
+                    header_row, tag_col = r, found
+                    break
+            tags = [self._cell(grid, r, tag_col) for r in range(header_row + 1, rows)]
+            tags = [t for t in tags if t]
+            steps.append(f"bend table tags: {tags}")
+            return tags
+        except Exception as exc:
+            steps.append(f"bend table tags not read: {exc}")
+            return []
 
     # ---------------- public ----------------
     def export_part(self, item, slddrw_path):
@@ -1054,6 +1381,8 @@ class SwDrawingExporter:
 
         part_path = str(Path(item["path"]).resolve())
         configuration = item.get("configuration")
+        self._current_item = item
+        self._bend_tags = []
         model = drawing = flat = None
         opened_by_us = False
         unsuppressed_by_us = False
@@ -1129,12 +1458,12 @@ class SwDrawingExporter:
 
             views = []
             if self.add_folded_views:
-                top_view = self._create_model_view(drawing, model_path, "*Top", width / 2, height * 0.75, steps)
-                front_view = self._create_model_view(drawing, model_path, "*Front", width / 2, height * 0.55, steps)
-                if top_view is not None:
-                    views.append(("top", top_view))
-                if front_view is not None:
-                    views.append(("front", front_view))
+                for i, view_name in enumerate(self.folded_view_names):
+                    label = str(view_name).strip().lstrip("*").strip().lower() or f"view{i + 1}"
+                    v = self._create_model_view(drawing, model_path, view_name,
+                                                width / 2, height * (0.75 - 0.1 * i), steps)
+                    if v is not None:
+                        views.append((label, v))
                 steps.append(f"folded views: {[n for n, _ in views]}")
             views.append(("flat", flat_view))
 
@@ -1146,21 +1475,43 @@ class SwDrawingExporter:
                     table_top = table_info[1]
 
             folded = [(n, v) for n, v in views if n != "flat"]
-            flat_scale = self._layout_views(drawing, folded, flat_view, table_top, steps)
+            analysis = plan = None
+            if self.add_bend_dimensions:
+                # bend values do not depend on the layout, so they are measured once
+                analysis = self._analyze_bends(flat_view, steps, item)
+            pads = self._initial_flat_pads()
+            flat_scale = self._layout_views(drawing, folded, flat_view, table_top, steps, pads)
+            if flat_scale and analysis and not analysis.get("error") and analysis.get("results"):
+                dim_pad = self.layout["dim_pad_mm"] / 1000.0
+                for _ in range(3):  # give the bend dimensions the room they actually need, then re-plan
+                    trial = self._plan_bend_dims(drawing, flat_view, analysis, table_top, [], folded, final=False)
+                    if trial is None:
+                        break
+                    need = {k: v + 0.002 for k, v in trial["needs"].items()}
+                    need["left"] = max(0.0, need["left"] - dim_pad)
+                    need["top"] = max(0.0, need["top"] - dim_pad)
+                    if all(need[k] <= pads[k] + 0.0005 for k in SIDES):
+                        break
+                    pads = {k: max(pads[k], need[k]) for k in SIDES}
+                    steps.append("relayout: room for bend dimensions " +
+                                 ", ".join(f"{k} {v * 1000:.0f} mm" for k, v in pads.items() if v))
+                    flat_scale = self._layout_views(drawing, folded, flat_view, table_top, steps, pads) or flat_scale
+                plan = self._plan_bend_dims(drawing, flat_view, analysis, table_top, steps, folded, final=True)
             if flat_scale:
                 self._set_sheet_scale(drawing, flat_scale, steps)
 
             if self.add_dimensions:
                 for name, v in views:
-                    if name == "top":
-                        self._add_overall_dimensions(drawing, v, steps, "top", True, True, "right")
-                    elif name == "front":
-                        self._add_overall_dimensions(drawing, v, steps, "front", True, True, "right")
-                    else:
+                    if name == "flat":
                         self._add_overall_dimensions(drawing, v, steps, "flat", True, True, "left")
+                    else:
+                        self._add_overall_dimensions(drawing, v, steps, name, True, True, "right")
 
-            if self.add_bend_dimensions:
-                self._add_bend_dimensions(drawing, flat_view, flat_scale, table_top, steps)
+            if analysis is not None:
+                self._finish_bend_dims(drawing, flat_view, analysis, plan, steps)
+                if self.bend_debug_json:
+                    self._write_bend_probe(slddrw_path.with_name(slddrw_path.stem + "_bend_probe.json"),
+                                           analysis, plan, steps)
 
             if self.add_qty_note:
                 self._add_qty_note(drawing, item, steps,

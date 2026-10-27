@@ -39,7 +39,10 @@ SHEET_TEXT_REPLACEMENTS = {
     "{MATERIAL}": "Material",
 }
 
-ADD_FOLDED_VIEWS = True  # Top + Front above the flat pattern
+ADD_FOLDED_VIEWS = True  # folded model views above the flat pattern
+# Folded views and their arrangement: Top above Front, Right to the right of Front.
+# Use ("*Top", "*Front") for the earlier two-view layout.
+FOLDED_VIEWS = ("*Top", "*Front", "*Right")
 LAYOUT = {
     "margin_mm": 10,
     "side_pad_mm": 0,
@@ -56,12 +59,23 @@ LAYOUT = {
     "scale_mode": "fine",
 }
 
-# Bend dimensions: bend line -> nearest parallel outer edge.
+# Bend dimensions: bend line -> nearest parallel edge of the OUTER sheet boundary
+# (holes / cut-outs are never used as reference; bends without a reliable reference are reported).
 ADD_BEND_DIMENSIONS = True
-BEND_DIM_ORDER = "largest_first"  # largest dimensions are placed farther outward
-BEND_DIM_OFFSET_MM = 8
-BEND_DIM_STEP_MM = 7
-BEND_DIM_TEXT_WIDTH_MM = 14
+# Stacking order when dimensions overlap:
+#   "largest_outside"  = smallest values nearest the part, largest farthest out (standard; same as old "largest_first")
+#   "smallest_outside" = the reverse (same as old "smallest_first")
+BEND_DIM_ORDER = "largest_outside"
+BEND_DIM_OFFSET_MM = 8          # gap between the part and the first row of bend dimensions
+BEND_DIM_STEP_MM = 7            # distance between stacked rows
+BEND_DIM_TEXT_WIDTH_MM = 14     # space reserved for one dimension text
+BEND_DIM_TEXT_HEIGHT_MM = 3.5
+BEND_DIM_RIGHT_PAD_MM = 18      # initial room right of the flat pattern (below: LAYOUT["bend_dim_pad_mm"]);
+                                # both grow automatically if the dimensions need more
+BEND_DIM_MERGE_COLLINEAR = True  # collinear bend lines measured to the same edge share one dimension
+BEND_DIM_VERIFY = "flag"        # each dimension is read back from SolidWorks; "flag" = report a mismatch,
+                                # "delete" = also remove the mismatching dimension
+BEND_DEBUG_JSON = True          # write <part>_bend_probe.json next to each drawing (bends, edges, frames, tags)
 ADD_QTY_NOTE = True
 QTY_NOTE_X_MM = None
 QTY_NOTE_Y_MM = None
@@ -76,7 +90,12 @@ BEND_TABLE_TEMPLATE_NAME = None
 BEND_TABLE_RIGHT_MARGIN_MM = 10
 BEND_TABLE_BOTTOM_MM = 66
 BEND_TABLE_REMOVE_WORDS = ("factor", "allowance", "deduction", "length", "thickness")
-SLDDRW_LIMIT = None  # e.g. 1 = test first part only, None = all parts
+# Controlled test: only the first N sheet-metal parts (scan order) and/or the parts named here.
+# While either is set, drawings go to output/flat_drawings_test so production drawings are not overwritten.
+# Production run: SLDDRW_LIMIT = None and SLDDRW_ONLY_PARTS = None.
+SLDDRW_LIMIT = 1
+SLDDRW_ONLY_PARTS = None  # e.g. ("AHU3500-08",) - part names as printed in the scan
+SLDDRW_TEST_FOLDER = "flat_drawings_test"
 
 
 def connect_to_solidworks():
@@ -236,17 +255,30 @@ def export_slddrw_files(sw_app, assembly_path, scan_result, output_folder, input
         bend_dim_order=BEND_DIM_ORDER,
         add_dimensions=ADD_DIMENSIONS,
         dimension_offset_mm=DIMENSION_OFFSET_MM,
+        folded_view_names=FOLDED_VIEWS,
+        bend_dim_right_pad_mm=BEND_DIM_RIGHT_PAD_MM,
+        bend_dim_text_height_mm=BEND_DIM_TEXT_HEIGHT_MM,
+        bend_dim_merge_collinear=BEND_DIM_MERGE_COLLINEAR,
+        bend_dim_verify=BEND_DIM_VERIFY,
+        bend_debug_json=BEND_DEBUG_JSON,
     )
-    folder = output_folder / "flat_drawings"
-    folder.mkdir(parents=True, exist_ok=True)
-    results = {"created": [], "failed": []}
-
     items = scan_result["sheet_metal_parts"]
+    test_mode = bool(SLDDRW_LIMIT or SLDDRW_ONLY_PARTS)
+    if SLDDRW_ONLY_PARTS:
+        wanted = {str(n).strip().lower() for n in SLDDRW_ONLY_PARTS}
+        items = [i for i in items if str(i.get("name", "")).strip().lower() in wanted]
+        if not items:
+            print(f"\nNone of SLDDRW_ONLY_PARTS {list(SLDDRW_ONLY_PARTS)} is a scanned sheet-metal part.")
     if SLDDRW_LIMIT:
         items = items[:int(SLDDRW_LIMIT)]
 
+    folder = output_folder / (SLDDRW_TEST_FOLDER if test_mode else "flat_drawings")
+    folder.mkdir(parents=True, exist_ok=True)
+    results = {"created": [], "failed": []}
+
     print("\n" + "=" * 60)
-    print(f"FLAT PATTERN SLDDRW FILES ({len(items)} parts)")
+    print(f"FLAT PATTERN SLDDRW FILES ({len(items)} parts)"
+          + (f" - TEST MODE -> {folder.name}" if test_mode else ""))
     print("=" * 60)
 
     used_names = set()

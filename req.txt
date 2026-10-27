@@ -14,8 +14,5 @@ python-dateutil==2.9.0.post0
 reportlab==5.0.1
 six==1.17.0
 typing_extensions==4.16.0
-
-
-
-
-    
+# Required by every SolidWorks COM module (main.py exits without it). Windows only.
+pywin32; sys_platform == "win32"

@@ -155,8 +155,10 @@ class SheetMetalDetector:
             return True
         try:
             result = model.ShowConfiguration2(str(configuration))
+            # GetActiveConfiguration returns a Configuration COM object, not a name,
+            # so compare the active configuration's Name instead of str(object).
             return bool(result) or str(
-                self._get(model, "GetActiveConfiguration", "")
+                self._active_config_name(model) or ""
             ) == str(configuration)
         except Exception:
             return False
