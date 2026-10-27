@@ -102,7 +102,7 @@ dimensions put the text just outside the extension lines. Unavoidable overlaps a
 
 ## Tests
 
-`python -m pytest tests` (123 tests, offline; pywin32 is stubbed when absent). Fake SolidWorks objects
+`python -m pytest tests` (133 tests, offline; pywin32 is stubbed when absent). Fake SolidWorks objects
 (`tests/fakesw.py`) model part embedding, sketch frame (rotated/translated/mirrored), view scale/rotation/
 position and the row-vector MathTransform with their own math. **They prove the Python logic only, not
 the behaviour of a real SolidWorks drawing.**
@@ -122,3 +122,21 @@ Assumptions that only a live run can confirm: `ISketchSegment.GetSketch` + `Mode
 flat-pattern bend-line sketch; `Select4` on a bend-line segment + model edge with `SelectData.View` followed by
 `AddDimension2` gives a parallel distance; bend note positions from `IView.GetNotes` are sheet coordinates;
 `GetTwoAdjacentFaces2` / `IFace2.Normal` / `ILoop2.IsOuter` on edges of a flat-pattern view.
+
+## Real run 1 (SolidWorks 2025, AHU22000-D03-01) – findings and fixes
+
+Confirmed by the log:
+* bend measurement chain works on real geometry: outer loop via `ILoop2.IsOuter` (36 edges, face 2.49 m²),
+  frame check passed; scale sanity: 97.7 mm × 22 = 2149 mm, 52.7 mm × 22 = 1159 mm → 2.49 m².
+* `GetVisibleEntities2` types: 1 = edges (64; 36 with vertices, the rest closed hole edges), 2 = vertices, 3 = face.
+* `IView.GetOutline` = geometry + **4.2 mm border per side** (8.4 mm total) on every view and scale.
+* `IMathPoint.MultiplyTransform` failed with `Member not found` (DISP_E_MEMBERNOTFOUND).
+
+Fixed:
+* outline check accepts an equal border in x and y (a real mismatch is still rejected);
+* convention check runs once, tries the pywin32 call variants, names the failing call; if it cannot run,
+  both matrix forms are evaluated and the geometry decides (wrong form → edges far out of the sketch plane);
+  if both fit with different results it stops instead of guessing;
+* overall dimensions never fall back to model coordinates; each one is read back and verified;
+* view sizes for layout use two probe scales so the border is not counted as geometry (was +8 % here);
+* flatness tolerance 2·t + 0.5 mm (robust to an estimated thickness; a wrong frame gives hundreds of mm).

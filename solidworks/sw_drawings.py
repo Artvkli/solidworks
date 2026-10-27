@@ -19,7 +19,7 @@ import pythoncom
 from win32com.client import VARIANT
 
 from .bend_geometry import (Xform, assign_tags, classify_outer, detect_convention, measure_bends,
-                            order_key, plan_placements, same_segment)
+                            order_key, plan_placements, point_segment_distance, same_segment)
 
 SW_DOC_PART = 1
 SW_DOC_DRAWING = 3
@@ -109,6 +109,8 @@ class SwDrawingExporter:
         self.bend_tag_max_distance_mm = bend_tag_max_distance_mm
         self.bend_debug_json = bend_debug_json
         self._convention = None                          # MathTransform convention, verified once per session
+        self._convention_source = None
+        self._convention_check_failed = False
         self._bend_tags = []
         self._current_item = {}
 
@@ -409,11 +411,23 @@ class SwDrawingExporter:
     def _scale_text(scale):
         return f"1:{1 / scale:.0f}" if scale < 1 else f"{scale:g}:1"
 
+    def _unit_size_and_border(self, view):
+        """(width, height) of the view geometry at scale 1, plus the outline border (total, x and y).
+        GetOutline = scale * size + constant border, so two probe scales separate the two."""
+        probes = []
+        for probe in (0.05, 0.1):
+            view.ScaleDecimal = probe
+            o = self._get(view, "GetOutline")
+            probes.append((probe, o[2] - o[0], o[3] - o[1]))
+        (s1, w1, h1), (s2, w2, h2) = probes
+        w, h = (w2 - w1) / (s2 - s1), (h2 - h1) / (s2 - s1)
+        if w <= 0 or h <= 0:  # degenerate reading: fall back to the plain ratio (border counted as geometry)
+            return w2 / s2, h2 / s2, 0.0, 0.0
+        return w, h, max(0.0, w2 - s2 * w), max(0.0, h2 - s2 * h)
+
     def _size_at_unit_scale(self, view):
-        probe = 0.05
-        view.ScaleDecimal = probe
-        o = self._get(view, "GetOutline")
-        return (o[2] - o[0]) / probe, (o[3] - o[1]) / probe
+        w, h, _, _ = self._unit_size_and_border(view)
+        return w, h
 
     def _settle_scale(self, view, scale, box_w, box_h):
         w = h = 0.0
@@ -486,15 +500,18 @@ class SwDrawingExporter:
             limits = {}
             cells = self._folded_cells(folded) if folded else []
             if cells:
-                sizes = [self._size_at_unit_scale(v) for _, v, _, _ in cells]
+                sizes = [self._unit_size_and_border(v) for _, v, _, _ in cells]
                 col_w, row_h = {}, {}
-                for (_, _, c, r), (w, h) in zip(cells, sizes):
+                for (_, _, c, r), (w, h, _bw, _bh) in zip(cells, sizes):
                     col_w[c] = max(col_w.get(c, 0.0), w)
                     row_h[r] = max(row_h.get(r, 0.0), h)
-                limits["folded"] = min((f_in[2] - f_in[0] - hgap * (len(col_w) - 1)) / sum(col_w.values()),
-                                       (f_in[3] - f_in[1] - vgap * (len(row_h) - 1)) / sum(row_h.values()))
-            fw, fh = self._size_at_unit_scale(flat_view)
-            limits["flat"] = min((b_in[2] - b_in[0]) / fw, (b_in[3] - b_in[1]) / fh)
+                border_w = max(s[2] for s in sizes)
+                border_h = max(s[3] for s in sizes)
+                limits["folded"] = min(
+                    (f_in[2] - f_in[0] - hgap * (len(col_w) - 1) - border_w * len(col_w)) / sum(col_w.values()),
+                    (f_in[3] - f_in[1] - vgap * (len(row_h) - 1) - border_h * len(row_h)) / sum(row_h.values()))
+            fw, fh, fbw, fbh = self._unit_size_and_border(flat_view)
+            limits["flat"] = min((b_in[2] - b_in[0] - fbw) / fw, (b_in[3] - b_in[1] - fbh) / fh)
 
             if lay["common_scale"]:
                 common = self._fit_scale(min(limits.values()))
@@ -562,36 +579,60 @@ class SwDrawingExporter:
             pass
 
     # ---------------- coordinate transforms ----------------
-    def _math_point(self, xyz):
-        math_util = self._get(self.sw_app, "GetMathUtility")
-        if math_util is None:
-            raise RuntimeError("MathUtility not available")
-        return math_util.CreatePoint(VARIANT(pythoncom.VT_ARRAY | pythoncom.VT_R8, tuple(float(v) for v in xyz)))
+    def _check_convention(self, com_xform, data, label, steps):
+        """Verify the MathTransform matrix convention ONCE per session by letting SolidWorks transform a probe
+        point (IMathUtility.CreatePoint + IMathPoint.MultiplyTransform). Every call is tried in the forms
+        pywin32 may need, and the failing call is named in the log. Returns the convention or None."""
+        if self._convention or self._convention_check_failed:
+            return self._convention
+        probe = (0.1234, -0.5678, 0.9012)
+        failures = []
+
+        def attempt(stage, *calls):
+            for how, call in calls:
+                try:
+                    value = call()
+                    if value is not None:
+                        return value
+                    failures.append(f"{stage}[{how}]: returned nothing")
+                except Exception as exc:
+                    failures.append(f"{stage}[{how}]: {exc}")
+            raise RuntimeError(stage)
+
+        try:
+            math_util = attempt("GetMathUtility", ("property/method", lambda: self._get(self.sw_app, "GetMathUtility")),
+                                ("call", lambda: self.sw_app.GetMathUtility()))
+            point = attempt("CreatePoint",
+                            ("VARIANT", lambda: math_util.CreatePoint(
+                                VARIANT(pythoncom.VT_ARRAY | pythoncom.VT_R8, probe))),
+                            ("list", lambda: math_util.CreatePoint(list(probe))))
+            moved = attempt("MultiplyTransform", ("MultiplyTransform", lambda: point.MultiplyTransform(com_xform)),
+                            ("IMultiplyTransform", lambda: point.IMultiplyTransform(com_xform)))
+            out = attempt("ArrayData", ("property", lambda: self._get(moved, "ArrayData")))
+        except RuntimeError:
+            self._convention_check_failed = True
+            steps.append(f"{label}: SolidWorks convention check not possible ({'; '.join(failures)}) - "
+                         "the bend geometry will decide between row and column form")
+            return None
+        convention = detect_convention(data, probe, [float(v) for v in out])
+        if convention is None:
+            self._convention_check_failed = True
+            steps.append(f"{label}: MathPoint result matches neither matrix form - geometry will decide")
+            return None
+        self._convention, self._convention_source = convention, "IMathPoint.MultiplyTransform"
+        steps.append(f"transform convention verified with IMathPoint.MultiplyTransform: {convention} vectors")
+        return convention
 
     def _to_xform(self, com_xform, label, steps):
-        """Read a SolidWorks MathTransform into an Xform. The matrix convention is verified once per session by
-        letting SolidWorks transform a probe point (IMathPoint.MultiplyTransform) and comparing the result."""
+        """Read a SolidWorks MathTransform into an Xform using the verified (or documented row) convention."""
         if com_xform is None:
             raise RuntimeError(f"{label} not available")
         data = self._get(com_xform, "ArrayData")
         if not data or len(data) < 13:
             raise RuntimeError(f"{label}: ArrayData not available")
         data = [float(v) for v in data]
-        if self._convention is None:
-            probe = (0.1234, -0.5678, 0.9012)
-            try:
-                out = self._get(self._math_point(probe).MultiplyTransform(com_xform), "ArrayData")
-            except Exception as exc:
-                out = None
-                steps.append(f"{label}: convention check unavailable ({exc}) - using documented row-vector form")
-            if out is None:
-                return Xform.from_array(data, "row")
-            convention = detect_convention(data, probe, [float(v) for v in out])
-            if convention is None:
-                raise RuntimeError(f"{label}: SolidWorks transform result matches no known matrix convention")
-            self._convention = convention
-            steps.append(f"transform convention verified with IMathPoint.MultiplyTransform: {convention} vectors")
-        return Xform.from_array(data, self._convention)
+        convention = self._check_convention(com_xform, data, label, steps) or "row"
+        return Xform.from_array(data, convention)
 
     def _sheet_mapper(self, view, steps, points=None):
         """model xyz -> sheet xy for this view, built from IView.ModelToViewTransform and checked against
@@ -608,9 +649,14 @@ class SwDrawingExporter:
             bx1, by1 = max(p[0] for p in mapped), max(p[1] for p in mapped)
             bw, bh = bx1 - bx0, by1 - by0
             ow, oh = outline[2] - outline[0], outline[3] - outline[1]
-            close = lambda a, b: abs(a - b) <= 0.03 * max(a, b) + 0.002  # noqa: E731
-            if close(bw, ow) and close(bh, oh):
-                status = "matches the view outline"
+            pad_w, pad_h = ow - bw, oh - bh
+            # GetOutline is the geometry plus a constant border on every side (SolidWorks 2025: 8.4 mm in
+            # total, on every view and at every scale). Equal border in x and y = transform confirmed.
+            if (abs(pad_w - pad_h) <= 0.0005 + 0.01 * max(ow, oh)
+                    and -0.001 <= min(pad_w, pad_h) and max(pad_w, pad_h) <= 0.03):
+                border = (pad_w + pad_h) / 4.0
+                status = "matches the view outline" + (f" (outline border {border * 1000:.1f} mm per side)"
+                                                       if border > 0.0002 else "")
             else:
                 kw = ow / bw if bw > 1e-9 else None
                 kh = oh / bh if bh > 1e-9 else None
@@ -675,21 +721,15 @@ class SwDrawingExporter:
         return points
 
     def _vertex_points(self, view, vertices, steps):
-        try:
-            to_sheet = self._view_mapper(view, steps)
-        except Exception as exc:
-            steps.append(f"point transform unavailable ({exc}) - using model coordinates")
-            to_sheet = None
+        """[(sheet x, sheet y, vertex)]. Raises if the view transform is unusable - model coordinates are NOT
+        a valid substitute (the view may be rotated), so no dimension is made from them."""
+        to_sheet = self._view_mapper(view, steps)
         points = []
         for vertex in vertices:
             p = self._get(vertex, "GetPoint")
             if not p:
                 continue
-            xyz = (float(p[0]), float(p[1]), float(p[2]))
-            try:
-                x, y = to_sheet(xyz) if to_sheet else (xyz[0], xyz[1])
-            except Exception:
-                x, y = xyz[0], xyz[1]
+            x, y = to_sheet((float(p[0]), float(p[1]), float(p[2])))
             points.append((x, y, vertex))
         return points
 
@@ -719,7 +759,11 @@ class SwDrawingExporter:
     def _add_overall_dimensions(self, drawing, view, steps, label, length=True, width=True, width_side="right"):
         stage = "vertices"
         try:
-            points = self._vertex_points(view, self._view_vertices(view), steps)
+            try:
+                points = self._vertex_points(view, self._view_vertices(view), steps)
+            except Exception as exc:
+                steps.append(f"dimensions {label}: NOT created - view transform unusable ({exc})")
+                return
             if len(points) < 2:
                 steps.append(f"dimensions {label}: no vertices found")
                 return
@@ -750,7 +794,19 @@ class SwDrawingExporter:
                     continue
                 stage = f"{name}: {func}"
                 dim = getattr(drawing, func)(px, py, 0.0)
-                made.append(f"{name}: {'ok' if dim is not None else 'failed'}")
+                if dim is None:
+                    made.append(f"{name}: failed")
+                    continue
+                axis = 0 if name == "length" else 1
+                scale = float(self._get(view, "ScaleDecimal") or 1.0)
+                expected = abs(b_pt[axis] - a_pt[axis]) / scale
+                actual = self._dimension_value(dim)
+                if actual is None:
+                    made.append(f"{name}: ok ({expected * 1000:.1f} mm, value not readable)")
+                elif abs(actual - expected) <= max(0.0002, 0.002 * expected):
+                    made.append(f"{name}: ok {actual * 1000:.1f} mm verified")
+                else:
+                    made.append(f"{name}: {actual * 1000:.1f} mm - MISMATCH, expected {expected * 1000:.1f} mm")
             drawing.ClearSelection2(True)
             steps.append(f"dimensions {label} -> " + ", ".join(made))
         except Exception as exc:
@@ -823,138 +879,197 @@ class SwDrawingExporter:
             points.append(tuple(float(self._get(pt, c)) for c in ("X", "Y", "Z")))
         return points
 
-    def _bend_frame(self, lines, steps):
-        """Bend lines in the measuring frame (= sketch frame of the first readable bend line).
-
-        GetBendLines returns sketch segments whose points are in their sketch's LOCAL frame. A segment from a
-        different sketch is brought over through model space: sketch_i -> model -> reference sketch.
-        Returns (model_to_frame Xform, [record per bend line]); unreadable lines get an "error" entry.
-        """
-        reference = None
-        records = []
-        for index, seg in enumerate(lines):
+    def _read_bend_data(self, view, steps):
+        """Everything the bend analysis needs from SolidWorks, read once (no coordinate math here)."""
+        raw = {"lines": list(self._get(view, "GetBendLines") or ()), "bends": [], "edges": [], "faces": []}
+        steps.append(f"bend lines in the flat pattern view: {len(raw['lines'])}")
+        if not raw["lines"]:
+            return raw
+        for index, seg in enumerate(raw["lines"]):
             record = {"index": index, "id": f"#{index + 1}", "seg": seg}
             try:
                 sketch = self._get(seg, "GetSketch")
                 if sketch is None:
                     raise RuntimeError("GetSketch returned nothing")
-                model_to_sketch = self._to_xform(self._get(sketch, "ModelToSketchTransform"),
-                                                 "ModelToSketchTransform", steps)
-                pts = self._segment_xyz(seg)
+                com_xform = self._get(sketch, "ModelToSketchTransform")
+                data = self._get(com_xform, "ArrayData")
+                if not data or len(data) < 13:
+                    raise RuntimeError("ModelToSketchTransform.ArrayData not available")
+                record["sketch_data"] = [float(v) for v in data]
+                record["sketch_points"] = self._segment_xyz(seg)
+                self._check_convention(com_xform, record["sketch_data"], "ModelToSketchTransform", steps)
+            except Exception as exc:
+                record["error"] = f"{type(exc).__name__}: {exc}"
+            raw["bends"].append(record)
+        for entity in self._view_edges(view, steps):
+            p, q = self._edge_points(entity)
+            if p is None or q is None:
+                continue  # closed edges (full circles = holes) have no end vertices
+            curve = self._get(entity, "GetCurve")
+            is_line = self._get(curve, "IsLine") if curve is not None else None
+            raw["edges"].append({"entity": entity, "m0": p, "m1": q,
+                                 "is_line": True if is_line is None else bool(is_line)})
+        for record in raw["edges"][:300]:
+            for face in (self._get(record["entity"], "GetTwoAdjacentFaces2") or ()):
+                if face is None:
+                    continue
+                normal, area = self._get(face, "Normal"), self._get(face, "GetArea")
+                try:
+                    if normal and area and math.sqrt(sum(float(c) ** 2 for c in normal)) > 0.5:
+                        raw["faces"].append((float(area), tuple(float(c) for c in normal), face))
+                except Exception:
+                    continue
+        return raw
+
+    def _outer_loop_segments(self, face, model_to_frame, cache):
+        key = id(face)
+        if key not in cache:
+            model_segments = []
+            for loop in (self._get(face, "GetLoops") or ()):
+                if not self._get(loop, "IsOuter"):
+                    continue
+                for edge in (self._get(loop, "GetEdges") or ()):
+                    p, q = self._edge_points(edge)
+                    if p is not None and q is not None:
+                        model_segments.append((p, q))
+            cache[key] = model_segments
+        return [(model_to_frame.apply(p)[:2], model_to_frame.apply(q)[:2]) for p, q in cache[key]]
+
+    def _bend_analysis_for(self, raw, convention, item, steps, loop_cache):
+        """Bend analysis for one MathTransform convention. Raises when the frames are inconsistent."""
+        analysis = {"error": None, "convention": convention, "bends": [], "edges": [], "results": [],
+                    "outer": set(), "outer_info": {}, "bend_count": len(raw["lines"])}
+        # --- bend lines in the measuring frame (= sketch frame of the first readable bend line) ---
+        reference = reference_data = None
+        records = []
+        for src in raw["bends"]:
+            record = {k: v for k, v in src.items() if k not in ("sketch_data", "sketch_points")}
+            if "error" not in src:
+                model_to_sketch = Xform.from_array(src["sketch_data"], convention)
                 if reference is None:
-                    reference = model_to_sketch
-                same = all(abs(a - b) <= 1e-12 for a, b in zip(model_to_sketch.to_array(), reference.to_array()))
+                    reference, reference_data = model_to_sketch, src["sketch_data"]
+                pts = src["sketch_points"]
+                same = all(abs(a - b) <= 1e-12 for a, b in zip(src["sketch_data"], reference_data))
                 if not same:
                     to_frame = model_to_sketch.inverse().then(reference)
                     pts = [to_frame.apply(p) for p in pts]
                 record.update(p0=pts[0][:2], p1=pts[1][:2], z=(pts[0][2], pts[1][2]), own_sketch=not same)
-            except Exception as exc:
-                record["error"] = f"{type(exc).__name__}: {exc}"
             records.append(record)
         if reference is None:
             raise RuntimeError("no bend line has a readable sketch transform (ISketch.ModelToSketchTransform)")
-        return reference, records
+        model_to_frame = reference
+        analysis["model_to_frame"], analysis["bends"] = model_to_frame, records
+        bad = [r for r in records if "error" in r]
+        if bad:
+            steps.append("bend lines unreadable (reported, not dimensioned): "
+                         + ", ".join(f"{r['id']} ({r['error']})" for r in bad))
 
-    def _outer_loop_hint(self, edge_records, model_to_frame, steps):
-        """Outer boundary straight from SolidWorks: the largest planar face parallel to the sheet, its loop
-        with ILoop2.IsOuter() = True. Returns [(p0, p1)] in the frame, or None."""
-        best = None
-        for record in edge_records[:300]:
-            faces = self._get(record["entity"], "GetTwoAdjacentFaces2")
-            for face in (faces or ()):
-                if face is None:
-                    continue
-                normal = self._get(face, "Normal")
-                area = self._get(face, "GetArea")
-                try:
-                    if not normal or not area or abs(model_to_frame.normal_z(normal)) < 0.999:
-                        continue
-                    if best is None or float(area) > best[0] * (1 + 1e-9):
-                        best = (float(area), face)
-                except Exception:
-                    continue
-        if best is None:
+        # --- edges in the frame ---
+        edges, zs = [], []
+        for src in raw["edges"]:
+            f0, f1 = model_to_frame.apply(src["m0"]), model_to_frame.apply(src["m1"])
+            zs += [f0[2], f1[2]]  # checked on ALL edges, before any filtering
+            record = dict(src, id=len(edges), f0=f0, f1=f1, p0=f0[:2], p1=f1[:2])
+            if math.hypot(f1[0] - f0[0], f1[1] - f0[1]) < 1e-6:
+                continue  # edge across the thickness: a point in the sheet plane
+            if any(same_segment(record["p0"], record["p1"], e["p0"], e["p1"], 1e-5) for e in edges):
+                continue  # same outline edge on the other face of the sheet
+            edges.append(record)
+        analysis["edges"] = edges
+        steps.append(f"sheet edges in the bend frame: {len(edges)}")
+        if not edges:
+            raise RuntimeError("no visible edges with readable end points")
+
+        # the frame must be the sheet plane: every edge end point lies within the sheet thickness of it
+        thickness = float((item or {}).get("thickness") or 0.0) / 1000.0
+        allowed = (2.0 * thickness + 0.0005) if thickness > 0 else 0.01
+        spread = max(zs) - min(zs)
+        analysis["frame_check"] = {"z_spread_mm": round(spread * 1000, 4), "allowed_mm": round(allowed * 1000, 4)}
+        if spread > allowed:
+            raise RuntimeError(f"edges are not in the bend-sketch plane (spread {spread * 1000:.2f} mm > "
+                               f"{allowed * 1000:.2f} mm) - coordinate frames do not match")
+
+        # --- outer boundary: SolidWorks' outer loop of the largest face parallel to the sheet ---
+        hint = None
+        faces = [f for f in raw["faces"] if abs(model_to_frame.normal_z(f[1])) >= 0.999]
+        if faces:
+            area, _normal, face = max(faces, key=lambda f: f[0])
+            hint = self._outer_loop_segments(face, model_to_frame, loop_cache) or None
+            steps.append(f"outer boundary: face of {area * 1e6:.0f} mm2, outer loop with {len(hint or ())} edge(s)")
+        else:
             steps.append("outer boundary: no sheet face found through the API - using the edge loops")
-            return None
-        segments = []
-        for loop in (self._get(best[1], "GetLoops") or ()):
-            if not self._get(loop, "IsOuter"):
-                continue
-            for edge in (self._get(loop, "GetEdges") or ()):
-                p, q = self._edge_points(edge)
-                if p is not None and q is not None:
-                    segments.append((model_to_frame.apply(p)[:2], model_to_frame.apply(q)[:2]))
-        steps.append(f"outer boundary: face of {best[0] * 1e6:.0f} mm2, outer loop with {len(segments)} edge(s)")
-        return segments or None
+        outer, info = classify_outer([(e["p0"], e["p1"]) for e in edges], hint)
+        analysis["outer"], analysis["outer_info"] = outer, info
+        steps.append(f"outer boundary: {len(outer)} edge(s) via {info['method']}"
+                     + (f" - WARNING: {info['warning']}" if info.get("warning") else ""))
+        if not outer:
+            raise RuntimeError("outer boundary of the flat pattern could not be determined")
+
+        valid = [r for r in records if "error" not in r]
+        results = measure_bends([{"id": r["id"], "p0": r["p0"], "p1": r["p1"]} for r in valid],
+                                edges, outer, info.get("polygon"), merge_collinear=self.bend_dim_merge_collinear)
+        for r in bad:
+            results.append({"id": r["id"], "status": "invalid", "reason": r["error"], "value": None})
+        analysis["results"] = results
+        outside = [r for r in results if r["status"] == "outside_boundary"]
+        if valid and len(outside) * 2 > len(valid):
+            raise RuntimeError(f"{len(outside)} of {len(valid)} bend lines fall outside the outer boundary - "
+                               "bend-line and edge coordinates do not match")
+        # bend lines normally end on the sheet boundary: count end points that touch an edge
+        touch = max(0.0005, 2 * thickness)
+        analysis["endpoints_on_edges"] = sum(
+            1 for r in valid for p in (r["p0"], r["p1"])
+            if min(point_segment_distance(p, e["p0"], e["p1"]) for e in edges) <= touch)
+        return analysis
+
+    @staticmethod
+    def _result_signature(analysis):
+        return [(r["id"], r["status"], round(r["value"], 7) if r.get("value") is not None else None)
+                for r in analysis["results"]]
 
     def _analyze_bends(self, view, steps, item=None):
-        """Measure every bend line to its outer reference edge. Never raises: problems go to analysis['error']."""
+        """Measure every bend line to its outer reference edge. Never raises: problems go to analysis['error'].
+
+        If SolidWorks could not confirm the MathTransform convention, both conventions are evaluated and the
+        geometry decides (edges must lie in the sketch plane, bend lines inside the boundary and ending on it)."""
         analysis = {"error": None, "bends": [], "edges": [], "results": [], "outer": set(), "outer_info": {}}
         try:
-            lines = list(self._get(view, "GetBendLines") or ())
-            analysis["bend_count"] = len(lines)
-            steps.append(f"bend lines in the flat pattern view: {len(lines)}")
-            if not lines:
+            raw = self._read_bend_data(view, steps)
+            analysis["bend_count"] = len(raw["lines"])
+            if not raw["lines"]:
                 return analysis
-
-            model_to_frame, records = self._bend_frame(lines, steps)
-            analysis["model_to_frame"] = model_to_frame
-            analysis["bends"] = records
-            bad = [r for r in records if "error" in r]
-            if bad:
-                steps.append("bend lines unreadable (reported, not dimensioned): "
-                             + ", ".join(f"{r['id']} ({r['error']})" for r in bad))
-
-            edges, zs = [], []
-            for entity in self._view_edges(view, steps):
-                p, q = self._edge_points(entity)
-                if p is None or q is None:
-                    continue
-                curve = self._get(entity, "GetCurve")
-                is_line = self._get(curve, "IsLine") if curve is not None else None
-                f0, f1 = model_to_frame.apply(p), model_to_frame.apply(q)
-                zs += [f0[2], f1[2]]  # checked on ALL edges, before any filtering
-                record = {"id": len(edges), "entity": entity, "m0": p, "m1": q, "f0": f0, "f1": f1,
-                          "p0": f0[:2], "p1": f1[:2], "is_line": True if is_line is None else bool(is_line)}
-                if math.hypot(f1[0] - f0[0], f1[1] - f0[1]) < 1e-6:
-                    continue  # edge across the thickness: a point in the sheet plane
-                if any(same_segment(record["p0"], record["p1"], e["p0"], e["p1"], 1e-5) for e in edges):
-                    continue  # same outline edge on the other face of the sheet
-                edges.append(record)
-            analysis["edges"] = edges
-            steps.append(f"sheet edges in the bend frame: {len(edges)}")
-            if not edges:
-                raise RuntimeError("no visible edges with readable end points")
-
-            # the frame must be the sheet plane: every edge end point lies within the sheet thickness of it
-            thickness = float((item or {}).get("thickness") or 0.0) / 1000.0
-            allowed = (1.5 * thickness + 0.0002) if thickness > 0 else 0.01
-            spread = max(zs) - min(zs)
-            analysis["frame_check"] = {"z_spread_mm": round(spread * 1000, 4), "allowed_mm": round(allowed * 1000, 4)}
-            if spread > allowed:
-                raise RuntimeError(f"edges are not in the bend-sketch plane (spread {spread * 1000:.2f} mm > "
-                                   f"{allowed * 1000:.2f} mm) - coordinate frames do not match")
-
-            hint = self._outer_loop_hint(edges, model_to_frame, steps)
-            outer, info = classify_outer([(e["p0"], e["p1"]) for e in edges], hint)
-            analysis["outer"], analysis["outer_info"] = outer, info
-            steps.append(f"outer boundary: {len(outer)} edge(s) via {info['method']}"
-                         + (f" - WARNING: {info['warning']}" if info.get("warning") else ""))
-            if not outer:
-                raise RuntimeError("outer boundary of the flat pattern could not be determined")
-
-            valid = [r for r in records if "error" not in r]
-            results = measure_bends([{"id": r["id"], "p0": r["p0"], "p1": r["p1"]} for r in valid],
-                                    edges, outer, info.get("polygon"),
-                                    merge_collinear=self.bend_dim_merge_collinear)
-            for r in bad:
-                results.append({"id": r["id"], "status": "invalid", "reason": r["error"], "value": None})
-            analysis["results"] = results
-
-            outside = [r for r in results if r["status"] == "outside_boundary"]
-            if valid and len(outside) * 2 > len(valid):
-                raise RuntimeError(f"{len(outside)} of {len(valid)} bend lines fall outside the outer boundary - "
-                                   "bend-line and edge coordinates do not match; no bend dimensions created")
+            conventions = [self._convention] if self._convention else ["row", "column"]
+            outcomes, loop_cache = [], {}
+            for convention in conventions:
+                sub = []
+                try:
+                    outcomes.append((convention, self._bend_analysis_for(raw, convention, item, sub, loop_cache), sub, None))
+                except Exception as exc:
+                    outcomes.append((convention, None, sub, exc))
+            good = [o for o in outcomes if o[1] is not None]
+            if not good:
+                convention, _, sub, exc = outcomes[0]
+                steps.extend(sub)
+                raise exc
+            chosen = good[0]
+            if len(conventions) == 2:
+                if len(good) == 2:
+                    if self._result_signature(good[0][1]) == self._result_signature(good[1][1]):
+                        steps.append("matrix convention: both forms give identical bend results")
+                    else:
+                        scores = [g[1]["endpoints_on_edges"] for g in good]
+                        if scores[0] == scores[1]:
+                            raise RuntimeError("matrix convention ambiguous: row and column forms both fit the "
+                                               "geometry but give different bend results - not guessing")
+                        chosen = good[scores.index(max(scores))]
+                        self._convention, self._convention_source = chosen[0], "geometry (bend frame)"
+                else:
+                    self._convention, self._convention_source = chosen[0], "geometry (bend frame)"
+                    rejected = next(o for o in outcomes if o[1] is None)
+                    steps.append(f"matrix convention from geometry: {chosen[0]} vectors "
+                                 f"({rejected[0]} rejected: {rejected[3]})")
+            steps.extend(chosen[2])
+            analysis = chosen[1]
         except Exception as exc:
             analysis["error"] = f"{type(exc).__name__}: {exc}"
             steps.append(f"bend dimensions failed: {analysis['error']}")

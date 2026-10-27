@@ -70,11 +70,25 @@ class FakeMathUtility:
         return FakeMathPoint(_val(data))
 
 
+class _BrokenMathPoint:
+    def MultiplyTransform(self, xform):
+        raise Exception(-2147352573, "Member not found.", None, None)
+
+    IMultiplyTransform = MultiplyTransform
+
+
+class BrokenMathUtility:
+    """Reproduces the real run: IMathPoint.MultiplyTransform fails with DISP_E_MEMBERNOTFOUND."""
+    def CreatePoint(self, data):
+        return _BrokenMathPoint()
+
+
 # ---------------------------------------------------------------- part geometry
 class FlatPart:
     """Flat sheet in local (u, v): outer polygon, holes, bend lines (in metres)."""
 
-    def __init__(self, outer, bends, holes=(), thickness=0.002, arc_segments=(), tags=None):
+    def __init__(self, outer, bends, holes=(), thickness=0.002, arc_segments=(), tags=None, round_holes=0):
+        self.round_holes = round_holes          # number of full-circle hole edges (no vertices) to add
         self.outer = [tuple(p) for p in outer]
         self.holes = [[tuple(p) for p in h] for h in holes]
         self.bends = [(tuple(a), tuple(b)) for a, b in bends]
@@ -287,7 +301,7 @@ class FakeView:
     """A drawing view of a FlatPart (flat pattern) or of a plain rectangle (folded model view)."""
 
     def __init__(self, world, part, emb=None, scale=1.0, angle_deg=0.0, position=(0.2, 0.15),
-                 includes_position=True, name="Flat", flat=True, unreadable_bends=()):
+                 includes_position=True, name="Flat", flat=True, unreadable_bends=(), outline_border=0.0042):
         self.world, self.part, self.emb = world, part, emb or Embedding()
         self.ScaleDecimal, self.Angle = scale, math.radians(angle_deg)
         self._pos = tuple(position)
@@ -295,6 +309,7 @@ class FakeView:
         self.name, self.flat = name, flat
         self.ShowSheetMetalBendNotes = False
         self.table = None
+        self.outline_border = outline_border   # GetOutline = geometry + this on every side (real SW 2025: 4.2 mm)
         self._build(unreadable_bends)
 
     # geometry -> topology
@@ -323,6 +338,10 @@ class FakeView:
                 self.edges.append(FakeEdge(w, top_v[i], bot_v[i], True, [side]))  # thickness edge
             loops_top.append(FakeLoop(top_edges, loop_idx == 0))
             loops_bottom.append(FakeLoop(bot_edges, loop_idx == 0))
+        for _ in range(p.round_holes):  # full circles: no start/end vertex, curve is not a line
+            circle = FakeEdge(w, None, None, False, [self.top_face])
+            self.edges.append(circle)
+            loops_top.append(FakeLoop([circle], False))
         self.top_face._loops, self.bottom_face._loops = loops_top, loops_bottom
         sketch = FakeSketch(e.model_to_sketch())
         self.bend_segments = [
@@ -357,7 +376,14 @@ class FakeView:
 
     def GetOutline(self):
         pts = [self.sheet_of_local(*q) for q in self.part.outer]
-        return (min(x for x, _ in pts), min(y for _, y in pts), max(x for x, _ in pts), max(y for _, y in pts))
+        b = self.outline_border
+        return (min(x for x, _ in pts) - b, min(y for _, y in pts) - b,
+                max(x for x, _ in pts) + b, max(y for _, y in pts) + b)
+
+    def geometry_box(self):
+        o = self.GetOutline()
+        b = self.outline_border
+        return (o[0] + b, o[1] + b, o[2] - b, o[3] - b)
 
     @property
     def Position(self):
@@ -615,7 +641,8 @@ class FakeModel:
 
 
 class FakeApp:
-    def __init__(self, part, emb=None, box=(0.12, 0.05, 0.04)):
+    def __init__(self, part, emb=None, box=(0.12, 0.05, 0.04), math_broken=False):
+        self.math_broken = math_broken
         self.world = World()
         self.part, self.emb, self.box = part, emb or Embedding(), box
         self.drawings = []
@@ -638,7 +665,7 @@ class FakeApp:
         return None
 
     def GetMathUtility(self):
-        return FakeMathUtility()
+        return BrokenMathUtility() if self.math_broken else FakeMathUtility()
 
     def GetExecutablePath(self):
         return "/nonexistent/sldworks.exe"

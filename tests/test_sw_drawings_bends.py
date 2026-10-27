@@ -79,12 +79,13 @@ def test_values_independent_of_sketch_and_view_orientation(sketch_angle, mirrore
     assert analysis["error"] is None, steps
     assert sorted(round(r["value"] / MM, 6) for r in analysis["results"]) == [15.0, 25.0]
     assert sorted(round(d.value / MM, 6) for d in bend_dims(app)) == [15.0, 25.0]
-    # every text point lies outside the part, near it (placement uses the correct sheet frame)
+    # every text point lies outside the part outline, near it (placement uses the correct sheet frame)
+    from solidworks.bend_geometry import point_in_polygon
+    part_on_sheet = [view.sheet_of_local(*q) for q in PLATE.outer]
     o = view.GetOutline()
     for p in plan["placements"]:
         x, y = p["text_point"]
-        inside = o[0] < x < o[2] and o[1] < y < o[3]
-        assert not inside
+        assert not point_in_polygon((x, y), part_on_sheet)
         assert o[0] - 0.08 < x < o[2] + 0.08 and o[1] - 0.08 < y < o[3] + 0.08
 
 
@@ -141,11 +142,11 @@ def test_column_convention_solidworks_is_detected():
     original = type(view).ModelToViewTransform.fget
     type(view).ModelToViewTransform = property(lambda self: ColumnXform(original(self)))
     try:
-        for seg in view.bend_segments:
-            seg._sketch.ModelToSketchTransform = ColumnXform(seg._sketch.ModelToSketchTransform)
+        for sketch in {id(s._sketch): s._sketch for s in view.bend_segments}.values():  # each sketch once
+            sketch.ModelToSketchTransform = ColumnXform(sketch.ModelToSketchTransform)
         steps = []
         analysis, plan = exporter._add_bend_dimensions(drawing, view, 0.5, 0.0, steps)
-        assert exporter._convention == "column"
+        assert exporter._convention == "column" and exporter._convention_source == "IMathPoint.MultiplyTransform"
         assert sorted(round(r["value"] / MM, 6) for r in analysis["results"]) == [15.0, 25.0]
         assert not any("MISMATCH" in s for s in steps)
     finally:
