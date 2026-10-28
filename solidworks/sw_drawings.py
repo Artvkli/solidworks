@@ -1526,37 +1526,6 @@ class SwDrawingExporter:
 
     # ---------------- bend dimensions: tags + placement ----------------
     @staticmethod
-    def _assign_tags_global(sheet_lines, notes, tag_names):
-        """One tag per bend line, chosen so that the sum of tag-to-bend-line distances is smallest."""
-        pos = {}
-        for text, p in notes:
-            if text in tag_names:
-                pos.setdefault(text, p)
-        names = [t for t in tag_names if t in pos]
-        bids = list(sheet_lines)
-        result = {}
-        if names and bids:
-            cost = {(t, b): point_segment_distance(pos[t], *sheet_lines[b]) for t in names for b in bids}
-            if len(names) <= 8 and len(bids) <= 8:
-                best = None
-                if len(names) <= len(bids):
-                    for perm in itertools.permutations(bids, len(names)):
-                        c = sum(cost[(t, b)] for t, b in zip(names, perm))
-                        if best is None or c < best[0]:
-                            best = (c, dict(zip(perm, names)))
-                else:
-                    for perm in itertools.permutations(names, len(bids)):
-                        c = sum(cost[(t, b)] for t, b in zip(perm, bids))
-                        if best is None or c < best[0]:
-                            best = (c, dict(zip(bids, perm)))
-                result = best[1]
-            else:
-                for _c, t, b in sorted((c, t, b) for (t, b), c in cost.items()):
-                    if b not in result and t not in result.values():
-                        result[b] = t
-        return result, [t for t in tag_names if t not in result.values()]
-
-    @staticmethod
     def _pair_leftover_tags(tags, unassigned, sheet_lines, notes):
         """Tags the normal pairing left out -> nearest bend line that has no tag yet (no distance limit)."""
         pos = {}
@@ -1645,13 +1614,6 @@ class SwDrawingExporter:
             tags, unassigned, ambiguous = assign_tags(sheet_lines, notes, tag_names,
                                                       self.bend_tag_max_distance_mm / 1000.0)
             tags, unassigned = dict(tags), list(unassigned or [])
-            if ambiguous or unassigned:
-                # tags midway between bend lines: pair ALL tags at once with the smallest total distance
-                tags, unassigned = self._assign_tags_global(sheet_lines, notes, tag_names)
-                if final:
-                    steps.append(f"tags paired together by smallest total distance (ambiguous before: "
-                                 f"{sorted(ambiguous.values()) if isinstance(ambiguous, dict) else ambiguous})")
-                ambiguous = {}
             late = self._pair_leftover_tags(tags, unassigned, sheet_lines, notes)
             solid = self._bends_from_tag_lines(analysis, to_sheet, tags, unassigned, sheet_lines, notes)
             if final and (late or solid):
@@ -1763,58 +1725,6 @@ class SwDrawingExporter:
         ok2, _ = self._select_entity(view, edge_entity, True, sel)
         count = self._selected_count(drawing)
         return ok1 and ok2 and (count is None or count >= 2)
-
-    def _dimension_by_value(self, drawing, bend_line, edge_line, corner, func, px, py, expected):
-        """Last resort: pick the bend line and the reference by position WITHOUT checking what was picked;
-        create the dimension and keep it only if its value is the expected bend dimension.
-        Returns (display, value, number of picks tried) or (None, None, tried)."""
-        nothing = VARIANT(pythoncom.VT_DISPATCH, None)
-        ext = drawing.Extension
-
-        def at(line, f):
-            return (line[0][0] + f * (line[1][0] - line[0][0]), line[0][1] + f * (line[1][1] - line[0][1]))
-
-        def pick(x, y, types, append):
-            for t in types:
-                try:
-                    if ext.SelectByID2("", t, x, y, 0.0, append, 0, nothing, 0):
-                        return True
-                except Exception:
-                    pass
-            return False
-
-        bend_pts = [at(bend_line, f) for f in (0.4, 0.6, 0.25, 0.75, 0.1, 0.9)]
-        if corner:
-            ref_pts, ref_types = [edge_line[0]], ("VERTEX", "EDGE", "")
-        else:
-            ref_pts, ref_types = [at(edge_line, f) for f in (0.5, 0.3, 0.7, 0.1, 0.9)], ("EDGE", "SILHOUETTE", "VERTEX", "")
-        funcs = [func] + (["AddDimension2"] if func != "AddDimension2" else [])
-        tried = 0
-        for bx, by in bend_pts:
-            for ex, ey in ref_pts:
-                for f in funcs:
-                    drawing.ClearSelection2(True)
-                    if not pick(bx, by, ("EXTSKETCHSEGMENT", "SKETCHSEGMENT", ""), False):
-                        break
-                    if not pick(ex, ey, ref_types, True):
-                        continue
-                    tried += 1
-                    try:
-                        display = getattr(drawing, f)(px, py, 0.0)
-                    except Exception:
-                        display = None
-                    if display is None:
-                        continue
-                    actual = self._dimension_value(display)
-                    if actual is not None and abs(actual - expected) <= DIM_VALUE_TOL:
-                        drawing.ClearSelection2(True)
-                        return display, actual, tried
-                    self._delete_annotation(drawing, display)
-                    if tried >= 40:
-                        drawing.ClearSelection2(True)
-                        return None, None, tried
-        drawing.ClearSelection2(True)
-        return None, None, tried
 
     def _select_bend_and_corner(self, drawing, view, bend_seg, edge_entity, which, sel):
         """Bend line + one end point (vertex) of the reference edge: a perpendicular dimension then measures
@@ -1981,17 +1891,6 @@ class SwDrawingExporter:
                     steps.append(f"{label}: MISMATCH {actual * 1000:.2f} mm and value could not be overridden - "
                                  "check manually; " + "; ".join(tried))
                 break
-            if not r["created"] and bend_line and edge_line:
-                display, actual, n = self._dimension_by_value(drawing, bend_line, edge_line, r.get("vertex") is not None,
-                                                              func, px, py, expected)
-                if display is not None:
-                    r["created"], r["solidworks_value"] = True, actual
-                    r["display"], r["side"] = display, p["side"]
-                    created += 1
-                    steps.append(f"{label} -> {p['side']} level {p['level']}, verified by its value "
-                                 f"(position pick {n})")
-                else:
-                    tried.append(f"value-checked picks: {n} tried, none measured {expected * 1000:.2f} mm")
             if not r["created"]:
                 mismatched.append(r["id"])
                 steps.append(f"{label}: NOT dimensioned - " + "; ".join(tried))
