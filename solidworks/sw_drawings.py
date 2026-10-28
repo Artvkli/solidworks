@@ -1188,6 +1188,39 @@ class SwDrawingExporter:
                 edge_id, dist, group = found
                 r.update(status="ok", edge=edge_id, value=dist,
                          note=f"measured to the nearest parallel {group} edge (was {r['status']}: {r.get('reason')})")
+                continue
+            corner = self._flange_corner(rec[r["id"]]["p0"], rec[r["id"]]["p1"], edges, outer)
+            if corner is not None:
+                edge_id, end, dist = corner
+                r.update(status="ok", edge=edge_id, vertex=end, value=dist,
+                         note=f"no parallel outer edge - measured to the outer corner of the flange "
+                              f"(was {r['status']}: {r.get('reason')})")
+
+    @staticmethod
+    def _flange_corner(p0, p1, edges, outer):
+        """(edge id, 0/1 end, distance) of the outer corner farthest from the bend line on the flange side
+        (= the side that reaches less far). Used when no outer edge is parallel to the bend line."""
+        bx, by = p1[0] - p0[0], p1[1] - p0[1]
+        bl = math.hypot(bx, by)
+        if bl < 1e-9:
+            return None
+        ux, uy = bx / bl, by / bl
+        sides = {1: None, -1: None}
+        for e in edges:
+            if e["id"] not in outer:
+                continue
+            for end, q in ((0, e["p0"]), (1, e["p1"])):
+                t = ux * (q[0] - p0[0]) + uy * (q[1] - p0[1])
+                if t < -0.25 * bl or t > 1.25 * bl:        # only corners alongside this bend line
+                    continue
+                d = ux * (q[1] - p0[1]) - uy * (q[0] - p0[0])
+                if abs(d) < 1e-5:
+                    continue
+                side = 1 if d > 0 else -1
+                if sides[side] is None or abs(d) > sides[side][2]:
+                    sides[side] = (e["id"], end, abs(d))
+        found = [v for v in sides.values() if v is not None]
+        return min(found, key=lambda v: v[2]) if found else None
 
     def _bend_analysis_for(self, raw, convention, item, steps, loop_cache):
         """Bend analysis for one MathTransform convention. Raises when the frames are inconsistent."""
@@ -1492,6 +1525,73 @@ class SwDrawingExporter:
                         else f"STILL OVERLAPPING {residual} - check manually"))
 
     # ---------------- bend dimensions: tags + placement ----------------
+    @staticmethod
+    def _pair_leftover_tags(tags, unassigned, sheet_lines, notes):
+        """Tags the normal pairing left out -> nearest bend line that has no tag yet (no distance limit)."""
+        pos = {}
+        for text, p in notes:
+            pos.setdefault(text, p)
+        pairs = sorted((point_segment_distance(pos[t], a, b), t, bid)
+                       for t in unassigned if t in pos
+                       for bid, (a, b) in sheet_lines.items() if bid not in tags)
+        paired = []
+        for _d, t, bid in pairs:
+            if t in unassigned and bid not in tags:
+                tags[bid] = t
+                unassigned.remove(t)
+                paired.append(t)
+        return paired
+
+    def _bends_from_tag_lines(self, analysis, to_sheet, tags, unassigned, sheet_lines, notes):
+        """A tag of the bend table with no bend line in the view: the straight line (not on the outer boundary)
+        nearest to the tag is used as its bend line and measured to the outer edge like any other bend."""
+        pos = {}
+        for text, p in notes:
+            pos.setdefault(text, p)
+        edges, outer = analysis["edges"], analysis["outer"]
+        known = {r["id"] for r in analysis["results"]}
+        used = []
+        for t in list(unassigned):
+            bid = f"tag {t}"
+            if bid not in known:
+                if t not in pos:
+                    continue
+                best = None
+                for e in edges:
+                    if e["id"] in outer or not e.get("is_line", True):
+                        continue
+                    a, b = to_sheet(e["m0"]), to_sheet(e["m1"])
+                    d = point_segment_distance(pos[t], a, b)
+                    if best is None or d < best[0]:
+                        best = (d, e)
+                if best is None or best[0] > 0.03:
+                    continue
+                e = best[1]
+                result = {"id": bid, "status": "none", "value": None, "reason": "solid line next to the tag"}
+                found = self._nearest_parallel_edge(e["p0"], e["p1"], edges, outer)
+                if found is not None:
+                    result.update(status="ok", edge=found[0], value=found[1],
+                                  note=f"no bend line for tag {t} - solid line next to the tag measured to the "
+                                       f"nearest parallel {found[2]} edge")
+                else:
+                    corner = self._flange_corner(e["p0"], e["p1"], edges, outer)
+                    if corner is None:
+                        continue
+                    result.update(status="ok", edge=corner[0], vertex=corner[1], value=corner[2],
+                                  note=f"no bend line for tag {t} - solid line next to the tag measured to the "
+                                       "outer corner of the flange")
+                analysis["bends"].append({"id": bid, "seg": e["entity"], "p0": e["p0"], "p1": e["p1"],
+                                          "z": (e["f0"][2], e["f1"][2]), "from_edge": True})
+                analysis["results"].append(result)
+                known.add(bid)
+                sheet_lines[bid] = (to_sheet(e["m0"]), to_sheet(e["m1"]))
+            if bid not in sheet_lines:
+                continue
+            tags[bid] = t
+            unassigned.remove(t)
+            used.append(t)
+        return used
+
     def _plan_bend_dims(self, drawing, view, analysis, table_top, steps, folded=(), final=True):
         """Map the measured bends to the sheet, pair bend tags, and plan text positions.
         Returns the plan dict or None (reason logged)."""
@@ -1513,6 +1613,13 @@ class SwDrawingExporter:
             notes = self._view_notes(view)
             tags, unassigned, ambiguous = assign_tags(sheet_lines, notes, tag_names,
                                                       self.bend_tag_max_distance_mm / 1000.0)
+            tags, unassigned = dict(tags), list(unassigned or [])
+            late = self._pair_leftover_tags(tags, unassigned, sheet_lines, notes)
+            solid = self._bends_from_tag_lines(analysis, to_sheet, tags, unassigned, sheet_lines, notes)
+            if final and (late or solid):
+                steps.append("tag completion: "
+                             + (f"paired to the nearest free bend line {late}; " if late else "")
+                             + (f"no bend line - solid line next to the tag used {solid}" if solid else ""))
 
             mm = 0.001
             width, height = self._sheet_size(drawing)
@@ -1538,7 +1645,13 @@ class SwDrawingExporter:
             for r in ok:
                 b0, b1 = sheet_lines[r["id"]]
                 e = edges[r["edge"]]
-                dims.append({"key": r["id"], "b0": b0, "b1": b1, "e0": to_sheet(e["m0"]), "e1": to_sheet(e["m1"])})
+                if r.get("vertex") is not None:          # corner reference: short line through the corner
+                    q = to_sheet(e["m0"] if r["vertex"] == 0 else e["m1"])
+                    bl = math.hypot(b1[0] - b0[0], b1[1] - b0[1]) or 1.0
+                    e0, e1 = q, (q[0] + (b1[0] - b0[0]) / bl * mm, q[1] + (b1[1] - b0[1]) / bl * mm)
+                else:
+                    e0, e1 = to_sheet(e["m0"]), to_sheet(e["m1"])
+                dims.append({"key": r["id"], "b0": b0, "b1": b1, "e0": e0, "e1": e1})
             bounds = (self.layout["margin_mm"] * mm, table_top, width - self.layout["margin_mm"] * mm,
                       height - self.layout["margin_mm"] * mm) if final else None
             placements, needs = plan_placements(
@@ -1610,6 +1723,18 @@ class SwDrawingExporter:
         drawing.ClearSelection2(True)
         ok1, _ = self._select_entity(view, bend_seg, False, sel)
         ok2, _ = self._select_entity(view, edge_entity, True, sel)
+        count = self._selected_count(drawing)
+        return ok1 and ok2 and (count is None or count >= 2)
+
+    def _select_bend_and_corner(self, drawing, view, bend_seg, edge_entity, which, sel):
+        """Bend line + one end point (vertex) of the reference edge: a perpendicular dimension then measures
+        exactly the bend-line-to-edge distance."""
+        vertex = self._get(edge_entity, "GetStartVertex" if which == 0 else "GetEndVertex")
+        if vertex is None:
+            return False
+        drawing.ClearSelection2(True)
+        ok1, _ = self._select_entity(view, bend_seg, False, sel)
+        ok2, _ = self._select_vertex(view, vertex, True, sel)
         count = self._selected_count(drawing)
         return ok1 and ok2 and (count is None or count >= 2)
 
@@ -1705,9 +1830,13 @@ class SwDrawingExporter:
 
             func = self._perpendicular_dim_function(bend_line) if bend_line else "AddDimension2"
             funcs = [func] + (["AddDimension2"] if func != "AddDimension2" else [])
-            attempts = [("entities", f) for f in funcs]
-            if bend_line and edge_line:
-                attempts += [("position", f) for f in funcs]
+            if r.get("vertex") is not None:              # reference is an outer corner
+                attempts = [(f"corner{r['vertex']}", f) for f in funcs]
+            else:
+                attempts = [("entities", f) for f in funcs]
+                if bend_line and edge_line:
+                    attempts += [("position", f) for f in funcs]
+                attempts += [("corner0", func), ("corner1", func)]   # bend line -> end point of the outer edge
 
             r["created"], tried = False, []
             for i, (how, f) in enumerate(attempts):
@@ -1715,6 +1844,9 @@ class SwDrawingExporter:
                 try:
                     if how == "entities":
                         ok = self._select_pair_by_entities(drawing, view, bend["seg"], edge["entity"], sel)
+                    elif how.startswith("corner"):
+                        ok = self._select_bend_and_corner(drawing, view, bend["seg"], edge["entity"],
+                                                          int(how[-1]), sel)
                     else:
                         ok = self._select_pair_by_position(drawing, bend, edge, bend_line, edge_line)
                     if not ok:
@@ -1814,8 +1946,17 @@ class SwDrawingExporter:
         if plan is not None and self._bend_tags:
             done = {plan["tags"].get(r["id"]) for r in analysis.get("results", []) if r.get("created")}
             missing = [t for t in self._bend_tags if t not in done]
+            why = []
+            for t in missing:
+                bid = next((b for b, x in plan["tags"].items() if x == t), None)
+                if bid is None:
+                    why.append(f"{t}: no bend line or solid line found next to the tag")
+                else:
+                    r = next((x for x in analysis["results"] if x["id"] == bid), {})
+                    why.append(f"{t}: bend {bid} " + ("dimension could not be created" if r.get("status") == "ok"
+                                                       else f"{r.get('status')} - {r.get('reason')}"))
             steps.append("tags with a dimension: " + (f"all {len(self._bend_tags)}" if not missing else
-                         f"{len(self._bend_tags) - len(missing)}/{len(self._bend_tags)} - MISSING {missing}"))
+                         f"{len(self._bend_tags) - len(missing)}/{len(self._bend_tags)} - MISSING: " + "; ".join(why)))
 
     def _write_bend_probe(self, path, analysis, plan, steps):
         """Diagnostic JSON next to the drawing: frames, bends, edges, results, tags, placements."""
