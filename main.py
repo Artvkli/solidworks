@@ -61,6 +61,11 @@ LAYOUT = {
     "bend_dim_pad_mm": 18,
     "auto_rotate_flat": True,
     "scale_mode": "fine",
+    "max_scale": 2.0,
+    "folded_weight": 1.5,
+    "folded_ratio": 0.6,         # بیشتر = Top/Front/Right بزرگ‌تر، فلت کوچک‌تر
+    "folded_arrange": "auto",    # "standard" = همیشه همان چیدمان قدیمی
+    "folded_rotate": True,       # False = هیچ نمایی چرخانده نشود
 }
 
 # Bend dimensions: bend line -> nearest parallel edge of the OUTER sheet boundary
