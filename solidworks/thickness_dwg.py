@@ -4,6 +4,7 @@ from pathlib import Path
 DXF_FOLDER_NAME = "_parts_dxf"
 
 
+
 class ThicknessDwgBuilder:
     """
     Puts the flat patterns of all sheet metal parts of the same thickness
@@ -114,6 +115,24 @@ class ThicknessDwgBuilder:
 
         return qty_text, str(item["name"])
 
+    @staticmethod
+    def _geometry_layout(doc):
+        """(layout, name) of the space that holds the part geometry: model space first, otherwise the first
+        paper space (layout) with geometry. (None, reason) if the DXF is empty."""
+        from ezdxf import bbox
+
+        found = []
+        for layout in [doc.modelspace()] + [l for l in doc.layouts if l.name != "Model"]:
+            entities = [e for e in layout if e.dxftype() not in ("VIEWPORT", "TEXT", "MTEXT")]
+            if not entities:
+                found.append(f"{layout.name}: 0")
+                continue
+            box = bbox.extents(entities)
+            if box.has_data and (box.size.x > 0 or box.size.y > 0):
+                return layout, "model space" if layout.name == "Model" else f"paper space '{layout.name}'"
+            found.append(f"{layout.name}: {len(entities)} without size")
+        return None, "no geometry (" + ", ".join(found) + ")"
+
     def _merge(self, entries, out_dxf):
         import ezdxf
         from ezdxf import bbox
@@ -133,6 +152,7 @@ class ThicknessDwgBuilder:
         row_height = 0.0
         placed = 0
         skipped = []
+        report = []
         units_set = False
 
         for entry in entries:
@@ -141,7 +161,12 @@ class ThicknessDwgBuilder:
 
             for copy_index in range(copies):
                 source = ezdxf.readfile(str(entry["dxf"]))
-                source_msp = source.modelspace()
+                source_msp, where = self._geometry_layout(source)
+                if source_msp is None:
+                    skipped.append(f"{item['name']} ({where})")
+                    break
+                if where != "model space":
+                    report.append(f"{item['name']}: geometry taken from {where}")
 
                 if not units_set:
                     try:
@@ -150,9 +175,10 @@ class ThicknessDwgBuilder:
                         pass
                     units_set = True
 
-                box = bbox.extents(source_msp)
+                entities = [e for e in source_msp if e.dxftype() != "VIEWPORT"]
+                box = bbox.extents(entities)
                 if not box.has_data:
-                    skipped.append(item["name"])
+                    skipped.append(f"{item['name']} (no size)")
                     break
 
                 width = box.size.x
@@ -173,13 +199,21 @@ class ThicknessDwgBuilder:
                 dx = cursor_x - box.extmin.x
                 dy = (cursor_y + label_area) - box.extmin.y
 
-                entities = list(source_msp)
+                moved = []
                 for entity in entities:
-                    entity.translate(dx, dy, 0)
+                    try:
+                        entity.translate(dx, dy, 0)
+                        moved.append(entity)
+                    except Exception:
+                        pass               # entity types that cannot be moved are left out
 
+                before = len(target_msp)
                 importer = Importer(source, target)
-                importer.import_entities(entities, target_msp)
+                importer.import_entities(moved, target_msp)
                 importer.finalize()
+                if len(target_msp) == before:
+                    skipped.append(f"{item['name']} (import gave nothing)")
+                    break
 
                 # QTY directly under the part, the part name below it
                 target_msp.add_text(
@@ -203,7 +237,14 @@ class ThicknessDwgBuilder:
                 cursor_x += cell_width + self.gap
                 placed += 1
 
+        try:
+            from ezdxf import zoom
+            zoom.extents(target_msp, factor=1.05)   # the file opens zoomed to all parts
+        except Exception:
+            pass
         target.saveas(str(out_dxf))
+        for line in report:
+            print(f"    {line}")
         return placed, skipped
 
     # =====================================================
@@ -329,8 +370,9 @@ class ThicknessDwgBuilder:
                     f"(DXF only: {message})"
                 )
 
+            print(f"    parts placed in the drawing: {placed} of {len(entries)}")
             if skipped:
-                print(f"    empty drawings skipped: {', '.join(skipped)}")
+                print(f"    NOT placed: {'; '.join(skipped)}")
 
             files.append(
                 {
