@@ -852,6 +852,7 @@ class SwDrawingExporter:
             points = self._visible_model_points(view)
         outline = self._get(view, "GetOutline")
         k, dx, dy, status = 1.0, 0.0, 0.0, "not checked (no vertices or outline)"
+        to_sheet_ok = False
         if points and outline:
             mapped = [mv.apply(p)[:2] for p in points]
             bx0, by0 = min(p[0] for p in mapped), min(p[1] for p in mapped)
@@ -859,7 +860,15 @@ class SwDrawingExporter:
             bw, bh = bx1 - bx0, by1 - by0
             ow, oh = outline[2] - outline[0], outline[3] - outline[1]
             pad_w, pad_h = ow - bw, oh - bh
-            if (abs(pad_w - pad_h) <= 0.0005 + 0.01 * max(ow, oh)
+            inside = (bx0 >= outline[0] - 0.001 and by0 >= outline[1] - 0.001
+                      and bx1 <= outline[2] + 0.001 and by1 <= outline[3] + 0.001)
+            if inside and -0.001 <= min(pad_w, pad_h) and max(pad_w, pad_h) <= 0.03:
+                status = "inside the view outline (arcs / hidden edges make the outline larger)"
+                if abs(pad_w - pad_h) <= 0.0005 + 0.01 * max(ow, oh):
+                    status = "matches the view outline" + (f" (outline border {(pad_w + pad_h) / 4 * 1000:.1f} mm "
+                                                           "per side)" if (pad_w + pad_h) > 0.0008 else "")
+                to_sheet_ok = True
+            elif (abs(pad_w - pad_h) <= 0.0005 + 0.01 * max(ow, oh)
                     and -0.001 <= min(pad_w, pad_h) and max(pad_w, pad_h) <= 0.03):
                 border = (pad_w + pad_h) / 4.0
                 status = "matches the view outline" + (f" (outline border {border * 1000:.1f} mm per side)"
@@ -870,13 +879,15 @@ class SwDrawingExporter:
                 if kw and kh and abs(kw - kh) <= 0.03 * max(kw, kh):
                     k = (kw + kh) / 2.0
                     status = f"scale corrected by {k:.6g} to match the view outline"
+                elif -0.001 <= min(pad_w, pad_h) and max(pad_w, pad_h) <= 0.03:
+                    status = "smaller than the view outline (arcs / hidden edges) - centred on it"
                 else:
                     raise RuntimeError(
                         f"drawing-view transform does not match the view outline (mapped {bw * 1000:.1f} x "
                         f"{bh * 1000:.1f} mm, outline {ow * 1000:.1f} x {oh * 1000:.1f} mm)")
             cx, cy = k * (bx0 + bx1) / 2.0, k * (by0 + by1) / 2.0
             ox, oy = (outline[0] + outline[2]) / 2.0, (outline[1] + outline[3]) / 2.0
-            if abs(ox - cx) > 0.002 + 0.03 * ow or abs(oy - cy) > 0.002 + 0.03 * oh:
+            if not to_sheet_ok and (abs(ox - cx) > 0.002 + 0.03 * ow or abs(oy - cy) > 0.002 + 0.03 * oh):
                 dx, dy = ox - cx, oy - cy
                 status += f"; position corrected by ({dx * 1000:.1f}, {dy * 1000:.1f}) mm"
 
@@ -1678,7 +1689,13 @@ class SwDrawingExporter:
 
             outer_ids = analysis["outer"] or set(range(len(edges)))
             part_points = [to_sheet(edges[i][k]) for i in outer_ids for k in ("m0", "m1")]
-            ok = sorted((r for r in analysis["results"] if r["status"] == "ok"), key=order_key(self.bend_dim_order))
+            ok = [r for r in analysis["results"] if r["status"] == "ok"]
+            if tag_names:                                 # only bends that have a tag in the bend table
+                untagged = [r["id"] for r in ok if r["id"] not in tags]
+                ok = [r for r in ok if r["id"] in tags]
+                if final and untagged:
+                    steps.append(f"bends without a tag are not dimensioned: {untagged}")
+            ok = sorted(ok, key=order_key(self.bend_dim_order))
             dims = []
             for r in ok:
                 b0, b1 = sheet_lines[r["id"]]
@@ -1764,10 +1781,9 @@ class SwDrawingExporter:
         count = self._selected_count(drawing)
         return ok1 and ok2 and (count is None or count >= 2)
 
-    def _dimension_by_value(self, drawing, bend_line, edge_line, corner, func, px, py, expected):
-        """Last resort: pick the bend line and the reference by position WITHOUT checking what was picked;
-        create the dimension and keep it only if its value is the expected bend dimension.
-        Returns (display, value, number of picks tried) or (None, None, tried)."""
+    def _dimension_loose(self, drawing, bend, bend_line, edge_line, corner, func, px, py):
+        """Pick the bend line (checked if possible) and the reference edge / corner at its position (not checked)
+        and create exactly ONE dimension. Returns the display dimension or None. Nothing is left behind on failure."""
         nothing = VARIANT(pythoncom.VT_DISPATCH, None)
         ext = drawing.Extension
 
@@ -1783,38 +1799,38 @@ class SwDrawingExporter:
                     pass
             return False
 
-        bend_pts = [at(bend_line, f) for f in (0.4, 0.6, 0.25, 0.75, 0.1, 0.9)]
-        if corner:
-            ref_pts, ref_types = [edge_line[0]], ("VERTEX", "EDGE", "")
-        else:
-            ref_pts, ref_types = [at(edge_line, f) for f in (0.5, 0.3, 0.7, 0.1, 0.9)], ("EDGE", "SILHOUETTE", "VERTEX", "")
-        funcs = [func] + (["AddDimension2"] if func != "AddDimension2" else [])
-        tried = 0
-        for bx, by in bend_pts:
+        try:
+            bend_xyz = self._segment_xyz(bend["seg"])
+        except Exception:
+            bend_xyz = None
+        bend_pt = None
+        for f in (0.4, 0.6, 0.25, 0.75):                 # prefer a pick that really is this bend line
+            drawing.ClearSelection2(True)
+            x, y = at(bend_line, f)
+            if pick(x, y, ("EXTSKETCHSEGMENT", "SKETCHSEGMENT"), False) and (
+                    bend_xyz is None or self._is_bend_line(self._selected_object(drawing, 1), bend_xyz)):
+                bend_pt = (x, y)
+                break
+        if bend_pt is None:
+            bend_pt = at(bend_line, 0.4)
+        ref_pts = [edge_line[0]] if corner else [at(edge_line, f) for f in (0.5, 0.3, 0.7)]
+        ref_types = ("VERTEX", "EDGE") if corner else ("EDGE", "SILHOUETTE")
+        for f in [func] + (["AddDimension2"] if func != "AddDimension2" else []):
             for ex, ey in ref_pts:
-                for f in funcs:
+                drawing.ClearSelection2(True)
+                if not pick(bend_pt[0], bend_pt[1], ("EXTSKETCHSEGMENT", "SKETCHSEGMENT", ""), False):
+                    break
+                if not pick(ex, ey, ref_types, True):
+                    continue
+                try:
+                    display = getattr(drawing, f)(px, py, 0.0)
+                except Exception:
+                    display = None
+                if display is not None:
                     drawing.ClearSelection2(True)
-                    if not pick(bx, by, ("EXTSKETCHSEGMENT", "SKETCHSEGMENT", ""), False):
-                        break
-                    if not pick(ex, ey, ref_types, True):
-                        continue
-                    tried += 1
-                    try:
-                        display = getattr(drawing, f)(px, py, 0.0)
-                    except Exception:
-                        display = None
-                    if display is None:
-                        continue
-                    actual = self._dimension_value(display)
-                    if actual is not None and abs(actual - expected) <= DIM_VALUE_TOL:
-                        drawing.ClearSelection2(True)
-                        return display, actual, tried
-                    self._delete_annotation(drawing, display)
-                    if tried >= 40:
-                        drawing.ClearSelection2(True)
-                        return None, None, tried
+                    return display
         drawing.ClearSelection2(True)
-        return None, None, tried
+        return None
 
     def _select_bend_and_corner(self, drawing, view, bend_seg, edge_entity, which, sel):
         """Bend line + one end point (vertex) of the reference edge: a perpendicular dimension then measures
@@ -1982,16 +1998,28 @@ class SwDrawingExporter:
                                  "check manually; " + "; ".join(tried))
                 break
             if not r["created"] and bend_line and edge_line:
-                display, actual, n = self._dimension_by_value(drawing, bend_line, edge_line, r.get("vertex") is not None,
-                                                              func, px, py, expected)
-                if display is not None:
+                # ONE dimension from the bend line to the edge at its position; wrong value -> number overridden
+                display = self._dimension_loose(drawing, bend, bend_line, edge_line, r.get("vertex") is not None,
+                                                func, px, py)
+                if display is None:
+                    tried.append("position pick without check: no dimension created")
+                else:
+                    actual = self._dimension_value(display)
                     r["created"], r["solidworks_value"] = True, actual
                     r["display"], r["side"] = display, p["side"]
-                    created += 1
-                    steps.append(f"{label} -> {p['side']} level {p['level']}, verified by its value "
-                                 f"(position pick {n})")
-                else:
-                    tried.append(f"value-checked picks: {n} tried, none measured {expected * 1000:.2f} mm")
+                    if actual is not None and abs(actual - expected) <= DIM_VALUE_TOL:
+                        created += 1
+                        steps.append(f"{label} -> {p['side']} level {p['level']}, verified (position pick)")
+                    else:
+                        how_fixed = self._override_dimension(display, expected)
+                        if how_fixed:
+                            created += 1
+                            r["overridden"] = True
+                            steps.append(f"{label} -> {p['side']} level {p['level']}, {how_fixed} (SolidWorks "
+                                         f"measured {'?' if actual is None else f'{actual * 1000:.2f}'} mm; "
+                                         "check the extension lines)")
+                        else:
+                            steps.append(f"{label}: MISMATCH and value could not be overridden - check manually")
             if not r["created"]:
                 mismatched.append(r["id"])
                 steps.append(f"{label}: NOT dimensioned - " + "; ".join(tried))
