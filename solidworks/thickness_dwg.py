@@ -86,7 +86,7 @@ class ThicknessDwgBuilder:
                 ok, message = False, f"error: {e}"
 
             if ok:
-                print(f"{label} -> OK")
+                print(f"{label} -> OK ({message})")
                 exported.append({"item": item, "dxf": dxf_path})
             else:
                 print(f"{label} -> FAILED: {message}")

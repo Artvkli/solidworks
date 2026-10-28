@@ -200,7 +200,36 @@ class DwgExporter:
             current = self._call(current, "GetNextFeature")
         return None, None
 
-    def _export_to_dwg2(self, model, output_path):
+    @staticmethod
+    def _geometry_count(path):
+        """Number of drawable entities in the DXF (model space + paper space, blocks expanded).
+        None = cannot be checked (ezdxf missing / not a DXF)."""
+        if Path(path).suffix.lower() != ".dxf":
+            return None
+        try:
+            import ezdxf
+            from ezdxf import bbox
+        except ImportError:
+            return None
+        try:
+            doc = ezdxf.readfile(str(path))
+        except Exception:
+            return 0
+        count = 0
+        for layout in doc.layouts:                       # model space + every paper space
+            try:
+                box = bbox.extents(layout)
+                if box.has_data and (box.size.x > 0 or box.size.y > 0):
+                    count += sum(1 for e in layout if e.dxftype() not in ("TEXT", "MTEXT", "VIEWPORT"))
+            except Exception:
+                continue
+        return count
+
+    def _has_geometry(self, path):
+        n = self._geometry_count(path)
+        return self._written(path) and (n is None or n > 0), n
+
+    def _export_to_dwg2(self, model, output_path, options=SHEET_METAL_OPTIONS):
         alignment = VARIANT(
             pythoncom.VT_ARRAY | pythoncom.VT_R8,
             (0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0),
@@ -217,17 +246,44 @@ class DwgExporter:
                     alignment,
                     False,
                     False,
-                    SHEET_METAL_OPTIONS,
+                    options,
                     views,
                 )
-                if bool(result) and self._written(output_path):
-                    return True, f"ExportToDWG2 returned {result}"
+                ok, n = self._has_geometry(output_path)
+                if bool(result) and ok:
+                    return True, f"ExportToDWG2 (options {options}) -> {n if n is not None else '?'} entities"
                 attempts.append(
-                    f"returned {result!r}, file={self._written(output_path)}"
+                    f"options {options}: returned {result!r}, file={self._written(output_path)}, entities={n}"
                 )
             except Exception as exc:
                 attempts.append(f"{type(exc).__name__}: {exc}")
         return False, "ExportToDWG2 failed: " + " | ".join(attempts)
+
+    def _export_unsuppressed(self, model, output_path, flat_pattern):
+        """ExportToDWG2 again with the Flat-Pattern unsuppressed (a suppressed flat pattern can give an
+        empty DXF), also with geometry-only options. The suppression state is restored afterwards."""
+        was_suppressed = bool(self._get(flat_pattern, "IsSuppressed", False))
+        try:
+            if was_suppressed:
+                try:
+                    flat_pattern.SetSuppression2(SW_UNSUPPRESS, SW_THIS_CONFIGURATION, None)
+                    model.ForceRebuild3(False)
+                except Exception as exc:
+                    return False, f"could not unsuppress Flat-Pattern: {exc}"
+            messages = []
+            for options in (SHEET_METAL_OPTIONS, 1):
+                ok, message = self._export_to_dwg2(model, output_path, options)
+                if ok:
+                    return True, ("unsuppressed, " if was_suppressed else "") + message
+                messages.append(message)
+            return False, " | ".join(messages)
+        finally:
+            if was_suppressed:
+                try:
+                    flat_pattern.SetSuppression2(SW_SUPPRESS, SW_THIS_CONFIGURATION, None)
+                    model.ForceRebuild3(False)
+                except Exception:
+                    pass
 
     def _export_flat_pattern_fallback(self, model, output_path, flat_pattern):
         if flat_pattern is None:
@@ -244,11 +300,12 @@ class DwgExporter:
                     return False, f"could not unsuppress Flat-Pattern: {exc}"
             try:
                 result = model.ExportFlatPatternView(str(output_path), 0)
-                if self._written(output_path):
-                    return True, f"ExportFlatPatternView returned {result}"
+                ok, n = self._has_geometry(output_path)
+                if ok:
+                    return True, f"ExportFlatPatternView -> {n if n is not None else '?'} entities"
                 return (
                     False,
-                    f"ExportFlatPatternView returned {result!r} but created no file",
+                    f"ExportFlatPatternView returned {result!r}, file={self._written(output_path)}, entities={n}",
                 )
             except Exception as exc:
                 return False, f"ExportFlatPatternView exception: {exc}"
@@ -330,6 +387,9 @@ class DwgExporter:
 
             ok, message = self._export_to_dwg2(model, output_path)
             diagnostics["primary_export"] = message
+            if not ok and flat_pattern is not None:
+                ok, message = self._export_unsuppressed(model, output_path, flat_pattern)
+                diagnostics["retry_unsuppressed"] = message
             if not ok:
                 fallback_ok, fallback_message = self._export_flat_pattern_fallback(
                     model, output_path, flat_pattern
@@ -372,4 +432,3 @@ class DwgExporter:
             return True
         except Exception:
             return False
-    
