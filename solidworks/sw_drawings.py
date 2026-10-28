@@ -1185,6 +1185,18 @@ class SwDrawingExporter:
         are measured to the nearest parallel edge."""
         by_id = {r["id"]: r for r in results}
         rec = {r["id"]: r for r in records if "error" not in r}
+        for r in results:   # a reference edge that runs along only a small part of the bend line (relief notch)
+            if r["status"] != "ok" or r.get("edge") is None or r.get("vertex") is not None or r["id"] not in rec:
+                continue
+            b = rec[r["id"]]
+            if self._overlap_fraction(b["p0"], b["p1"], edges[r["edge"]]) >= 0.3:
+                continue
+            ref = self._reference_edge(b["p0"], b["p1"], edges, outer)
+            if ref is not None and ref[0] != r["edge"]:
+                old = r["value"]
+                r.update(edge=ref[0], value=ref[1],
+                         note=f"reference was a short edge (relief / notch, {old * 1000:.2f} mm) -> outer edge "
+                              f"along the bend line ({ref[1] * 1000:.2f} mm)")
         for r in results:
             if r["status"] in ("merged", "duplicate"):
                 src = by_id.get(r.get("merged_into"))
@@ -1194,7 +1206,9 @@ class SwDrawingExporter:
         for r in results:
             if r["status"] == "ok" or r["id"] not in rec:
                 continue
-            found = self._nearest_parallel_edge(rec[r["id"]]["p0"], rec[r["id"]]["p1"], edges, outer)
+            found = self._reference_edge(rec[r["id"]]["p0"], rec[r["id"]]["p1"], edges, outer)
+            found = (found + ("outer",)) if found is not None else \
+                self._nearest_parallel_edge(rec[r["id"]]["p0"], rec[r["id"]]["p1"], edges, outer)
             if found is not None:
                 edge_id, dist, group = found
                 r.update(status="ok", edge=edge_id, value=dist,
@@ -1206,6 +1220,43 @@ class SwDrawingExporter:
                 r.update(status="ok", edge=edge_id, vertex=end, value=dist,
                          note=f"no parallel outer edge - measured to the outer corner of the flange "
                               f"(was {r['status']}: {r.get('reason')})")
+
+    @staticmethod
+    def _overlap_fraction(p0, p1, e):
+        """Part of the bend line p0-p1 (0..1) that edge e runs alongside."""
+        bx, by = p1[0] - p0[0], p1[1] - p0[1]
+        bl = math.hypot(bx, by)
+        if bl < 1e-9:
+            return 0.0
+        ux, uy = bx / bl, by / bl
+        t0 = ux * (e["p0"][0] - p0[0]) + uy * (e["p0"][1] - p0[1])
+        t1 = ux * (e["p1"][0] - p0[0]) + uy * (e["p1"][1] - p0[1])
+        return max(0.0, min(max(t0, t1), bl) - max(min(t0, t1), 0.0)) / bl
+
+    @classmethod
+    def _reference_edge(cls, p0, p1, edges, outer, min_overlap=0.3):
+        """(edge id, distance) of the nearest OUTER edge parallel to the bend line that runs along at least
+        min_overlap of it - so short relief / notch edges at the ends are never the reference."""
+        bx, by = p1[0] - p0[0], p1[1] - p0[1]
+        bl = math.hypot(bx, by)
+        if bl < 1e-9:
+            return None
+        ux, uy = bx / bl, by / bl
+        best = None
+        for e in edges:
+            if e["id"] not in outer or not e.get("is_line", True):
+                continue
+            ex, ey = e["p1"][0] - e["p0"][0], e["p1"][1] - e["p0"][1]
+            el = math.hypot(ex, ey)
+            if el < 1e-6 or abs(ux * ey - uy * ex) / el > 1e-3:
+                continue
+            mx, my = (e["p0"][0] + e["p1"][0]) / 2.0, (e["p0"][1] + e["p1"][1]) / 2.0
+            d = abs(ux * (my - p0[1]) - uy * (mx - p0[0]))
+            if d < 1e-5 or cls._overlap_fraction(p0, p1, e) < min_overlap:
+                continue
+            if best is None or d < best[1]:
+                best = (e["id"], d)
+        return best
 
     @staticmethod
     def _flange_corner(p0, p1, edges, outer):
@@ -1506,8 +1557,8 @@ class SwDrawingExporter:
                 length = math.hypot(x1 - x0, y1 - y0) or 1.0
                 nx, ny = -(y1 - y0) / length, (x1 - x0) / length
                 step = max(w, h) + 1 * mm
-                for f in (0.5, 0.35, 0.65, 0.2, 0.8, 0.1, 0.9):
-                    for o in (0.0, step, -step, 2 * step, -2 * step):
+                for f in (0.5, 0.35, 0.65, 0.2, 0.8, 0.1, 0.9, 0.05, 0.95):
+                    for o in (0.0, 0.3 * step, -0.3 * step):     # the tag never leaves its own bend line
                         yield (x0 + f * (x1 - x0) + nx * o - cx, y0 + f * (y1 - y0) + ny * o - cy)
             elif it["kind"] == "note":
                 for r in (2, 4, 6, 9, 12, 16):
@@ -1518,7 +1569,8 @@ class SwDrawingExporter:
                     yield (k * (w + 1 * mm), 0.0) if it["slide"] == "x" else (0.0, k * (h + 1 * mm))
 
         movable = [it for it in items if it["kind"] == "note" or it.get("slide")]
-        movable.sort(key=lambda it: 0 if it["text"] in tag_line else 1 if it["kind"] == "note" else 2)
+        # other notes (Fixed Face ...) make room first, then dimension texts, tags last
+        movable.sort(key=lambda it: 2 if it["text"] in tag_line else 0 if it["kind"] == "note" else 1)
         moved = []
         for it in movable:
             if free(it["box"], it):
@@ -2010,6 +2062,15 @@ class SwDrawingExporter:
                     if actual is not None and abs(actual - expected) <= DIM_VALUE_TOL:
                         created += 1
                         steps.append(f"{label} -> {p['side']} level {p['level']}, verified (position pick)")
+                    elif (actual is None or abs(actual - expected) > 0.5 * expected) and \
+                            self._delete_annotation(drawing, display):
+                        r["created"] = False
+                        r.pop("display", None)
+                        tried.append(f"position pick measured {'?' if actual is None else f'{actual * 1000:.2f}'} mm "
+                                     "(wrong entity) -> removed")
+                        mismatched.append(r["id"])
+                        steps.append(f"{label}: NOT dimensioned - " + "; ".join(tried))
+                        continue
                     else:
                         how_fixed = self._override_dimension(display, expected)
                         if how_fixed:
@@ -2027,15 +2088,27 @@ class SwDrawingExporter:
         return created, mismatched
 
     def _delete_annotation(self, drawing, display):
-        try:
-            nothing = VARIANT(pythoncom.VT_DISPATCH, None)
-            annotation = self._get(display, "GetAnnotation")
-            drawing.ClearSelection2(True)
-            if annotation is not None and annotation.Select3(False, nothing):
-                drawing.Extension.DeleteSelection2(6)
-                return True
-        except Exception:
-            pass
+        nothing = VARIANT(pythoncom.VT_DISPATCH, None)
+        annotation = self._get(display, "GetAnnotation")
+        if annotation is None:
+            return False
+        for select in (lambda: annotation.Select3(False, nothing), lambda: annotation.Select3(False, None),
+                       lambda: annotation.Select(False)):
+            try:
+                drawing.ClearSelection2(True)
+                if not select():
+                    continue
+                for delete in (lambda: drawing.Extension.DeleteSelection2(6), lambda: drawing.Extension.DeleteSelection2(0),
+                               lambda: drawing.EditDelete()):
+                    try:
+                        if delete() is not False:
+                            drawing.ClearSelection2(True)
+                            return True
+                    except Exception:
+                        continue
+            except Exception:
+                continue
+        drawing.ClearSelection2(True)
         return False
 
     def _report_bends(self, analysis, plan, steps):
