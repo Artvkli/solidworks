@@ -12,6 +12,7 @@ Layout: every part is scaled by its own size (small parts get a larger scale), n
   notes and bend dimension texts on the flat pattern until no text touches another one.
 """
 import gc
+import os
 import itertools
 import json
 import math
@@ -225,6 +226,94 @@ class SwDrawingExporter:
                 return current
             current = self._get(current, "GetNextFeature")
         return None
+
+    def _sheet_metal_bodies(self, model):
+        try:
+            bodies = list(model.GetBodies2(0, False) or ())
+        except Exception:
+            return None, None
+        sm = 0
+        for b in bodies:
+            try:
+                sm += 1 if b.IsSheetMetal() else 0
+            except Exception:
+                pass
+        return len(bodies), sm
+
+    def _flat_pattern_count(self, model):
+        n, current = 0, self._get(model, "FirstFeature")
+        for _ in range(100000):
+            if current is None:
+                break
+            if str(self._get(current, "GetTypeName2") or "").lower() in ("flatpattern", "templateflatpattern"):
+                n += 1
+            current = self._get(current, "GetNextFeature")
+        return n
+
+    def _read_only(self, model, part_path):
+        flag = self._get(model, "IsOpenedReadOnly")
+        try:
+            attr = not os.access(part_path, os.W_OK)
+        except Exception:
+            attr = None
+        return bool(flag), attr
+
+    def _part_diagnostics(self, model, part_path):
+        bodies, sm = self._sheet_metal_bodies(model)
+        ro_open, ro_file = self._read_only(model, part_path)
+        configs = list(self._get(model, "GetConfigurationNames") or ())
+        return (f"solid bodies {bodies}, sheet-metal bodies {sm}, flat-pattern features "
+                f"{self._flat_pattern_count(model)}, opened read-only {ro_open}, file read-only {ro_file}, "
+                f"configurations {configs}")
+
+    def _flat_view_reason(self, model, part_path):
+        """Plain reason for a failed flat pattern view, for the summary."""
+        bodies, sm = self._sheet_metal_bodies(model)
+        ro_open, ro_file = self._read_only(model, part_path)
+        if ro_open or ro_file:
+            return ("the part is READ-ONLY (" + ("file attribute / open elsewhere" if ro_file else "opened read-only")
+                    + "): SolidWorks cannot add the flat-pattern configuration - make it writable and run again")
+        if sm and sm > 1:
+            return (f"MULTIBODY sheet metal ({sm} sheet-metal bodies): SolidWorks makes no flat view for the whole "
+                    "part - split the bodies into separate parts or make the view manually")
+        if self._flat_pattern_count(model) > 1:
+            return "several Flat-Pattern features: check in SolidWorks which flat pattern is valid"
+        return "SolidWorks gave no reason - open the part, unsuppress Flat-Pattern and check for errors"
+
+    def _make_writable(self, model, steps):
+        """A part opened read-only cannot get its SM-FLAT-PATTERN configuration: try to switch it to writable."""
+        if not self._get(model, "IsOpenedReadOnly"):
+            return False
+        try:
+            model.SetReadOnlyState(False)
+            ok = not self._get(model, "IsOpenedReadOnly")
+            steps.append("part was opened read-only -> " + ("switched to writable" if ok else "could NOT be made writable"))
+            return ok
+        except Exception as exc:
+            steps.append(f"part is read-only and could not be made writable: {exc}")
+            return False
+
+    def _unsuppress(self, model, flat, steps):
+        """Unsuppress the Flat-Pattern and CHECK that it worked (this configuration, then all configurations,
+        then select + EditUnsuppress2)."""
+        nothing = VARIANT(pythoncom.VT_DISPATCH, None)
+        tries = (("this configuration", lambda: flat.SetSuppression2(SW_UNSUPPRESS, SW_THIS_CONFIGURATION, nothing)),
+                 ("all configurations", lambda: flat.SetSuppression2(SW_UNSUPPRESS, 2, nothing)),
+                 ("select + EditUnsuppress2", lambda: (flat.Select2(False, 0), model.EditUnsuppress2())))
+        done = []
+        for label, call in tries:
+            try:
+                call()
+                model.ForceRebuild3(True)
+            except Exception as exc:
+                done.append(f"{label}: {exc}")
+                continue
+            if not self._get(flat, "IsSuppressed", True):
+                steps.append(f"flat pattern unsuppressed ({label})")
+                return True
+            done.append(f"{label}: still suppressed")
+        steps.append("flat pattern could NOT be unsuppressed - " + "; ".join(done))
+        return False
 
     def _describe_flat(self, flat):
         return (f"flat feature: {self._get(flat, 'Name')} ({self._get(flat, 'GetTypeName2')}), "
@@ -2569,20 +2658,20 @@ class SwDrawingExporter:
             # ---- views ----
             flat_view, method = self._create_flat_view(drawing, model_path, active_cfg,
                                                        width / 2, height / 3, steps, rounds=1)
+            if flat_view is None:
+                steps.append("flat view failed - part check: " + self._part_diagnostics(model, part_path))
+                if self._make_writable(model, steps):
+                    flat_view, method = self._create_flat_view(drawing, model_path, active_cfg,
+                                                               width / 2, height / 3, steps, rounds=1)
             if flat_view is None and bool(self._get(flat, "IsSuppressed", False)):
-                try:
-                    flat.SetSuppression2(SW_UNSUPPRESS, SW_THIS_CONFIGURATION, None)
+                if self._unsuppress(model, flat, steps):
                     unsuppressed_by_us = True
-                    model.ForceRebuild3(True)
-                    steps.append("flat pattern unsuppressed (retry)")
-                except Exception as exc:
-                    steps.append(f"could not unsuppress flat pattern: {exc}")
                 flat_view, method = self._create_flat_view(drawing, model_path, active_cfg,
                                                            width / 2, height / 3, steps, rounds=2)
             if flat_view is None:
                 steps.append(self._describe_flat(flat))
                 steps.append(self._flat_error_code(flat))
-                return False, "could not create the flat pattern view", steps
+                return False, "could not create the flat pattern view - " + self._flat_view_reason(model, part_path), steps
             steps.append(f"flat view created ({method})")
 
             views = []
